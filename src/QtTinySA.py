@@ -48,6 +48,7 @@ from modules.exporters import WWBExporter, WSMExporter
 from modules.graphs import SurfaceGraph, PhaseNoiseGraph, SpectrumGraph, PolarGraph
 from modules.devices import USBdevice, Worker, WorkerSignals
 from modules.utility import resource_path
+from modules.fcc_test import FCCWizard
 
 # Defaults to non local configuration/data dirs - needed for packaging
 if system() == "Linux":
@@ -1292,14 +1293,15 @@ def sd_file_save(device, file_name, folder, single):
     signals.progress.connect(sd_save_progress)
     signals.progress.emit(0)
     SD = device.listSD()
-    for i in range(len(SD.splitlines())):
+    sd_lines = SD.splitlines()
+    for i in range(len(sd_lines)):
         if not single:
-            file_name = SD.splitlines()[i].split(" ")[0]
+            file_name = sd_lines[i].split(" ")[0]
         if file_name != '.Trash-1000':
             with open(os.path.join(folder, file_name), "wb") as file:
                 data = device.readSD(file_name)
                 file.write(data)
-            signals.progress.emit(int(100 * (i+1)/len(SD.splitlines())))
+            signals.progress.emit(int(100 * (i+1)/len(sd_lines)))
             if single:
                 signals.progress.emit(100)
                 break
@@ -1325,11 +1327,11 @@ def locate_db(dbName):
         return personalDir
 
     # 3. if not, check if database file exists in the app directory
-        file_path = resource_path(dbName)
-        if os.path.isfile(file_path):
-            shutil.copy(file_path, personalDir)
-            logging.info(f'{dbName} copied from {file_path} to {personalDir}')
-            return personalDir
+    file_path = resource_path(dbName)
+    if os.path.isfile(file_path):
+        shutil.copy(file_path, personalDir)
+        logging.info(f'{dbName} copied from {file_path} to {personalDir}')
+        return personalDir
 
     # 4. If not, then look in current working folder & where the python file is stored/linked from
     workingDirs = [os.path.dirname(__file__), os.path.dirname(os.path.realpath(__file__)), os.getcwd()]
@@ -1360,7 +1362,7 @@ def connect(dbFile, con, target):
 def disconnect(db):
     db.close()
     logging.debug(f'Database {db.databaseName()} open: {db.isOpen()}')
-    QSqlDatabase.removeDatabase(db.databaseName())
+    QSqlDatabase.removeDatabase(db.connectionName())
 
 
 def checkVersion(db, target, dbFile):
@@ -1380,9 +1382,13 @@ def checkVersion(db, target, dbFile):
             personalDir = platformdirs.user_config_dir(appname=app.applicationName(), appauthor=False)
             fileName = personalDir + "/frequencies_" + str(target) + ".csv"
             impex.exportData(fileName)
-            logging.info(f'Renaming file {db.databaseName()} to {db.databaseName()}.{str(existing)}')
-            disconnect(db)
-            os.rename(db.databaseName(), db.databaseName() + '.' + str(existing))
+            dbName = db.databaseName()
+            logging.info(f'Renaming file {dbName} to {dbName}.{str(existing)}')
+            # Close rather than disconnect: the connection is re-opened on the
+            # replacement file below, and Windows will not rename a file that
+            # still has an open handle.
+            db.close()
+            os.rename(dbName, dbName + '.' + str(existing))
 
             locate_db(dbFile)  # this ought to return the same path as when it was run earlier in connect()
             db.open()  # the database connection has not changed, only the file, so can re-open it with the new file
@@ -1617,6 +1623,7 @@ def connectPassive():
     QtTSA.actionPhNoise.triggered.connect(phasenoise.ui.show)
     QtTSA.actionFading.triggered.connect(fading.ui.show)
     QtTSA.actionPattern.triggered.connect(pattern.ui.show)
+    QtTSA.actionFCCTest.triggered.connect(fccWizard.start)
 
     # phase noise
     phasenoise.ui.centre.clicked.connect(tinySA.centreTone)
@@ -1658,6 +1665,7 @@ phasenoise = CustomDialogue(resource_path('phasenoise.ui'))
 fading = CustomDialogue(resource_path('fading.ui'))
 pattern = CustomDialogue(resource_path('pattern.ui'))
 offset = CustomDialogue(resource_path('offset.ui'))
+fccTest = CustomDialogue(resource_path('fcc_test.ui'))
 
 # Markers
 multiplot = pyqtgraph.GraphicsLayout()  # for plotting marker signal level over time
@@ -1854,6 +1862,10 @@ tinySA = Analyser()
 usbCheck = QtCore.QTimer()
 usbCheck.timeout.connect(usbInstr.probe)
 usbCheck.start(500)
+
+# The wizard pauses usbCheck while its device is unplugged, so it needs the timer
+fccWizard = FCCWizard(fccTest.ui, usbInstr, QtTSA)
+fccWizard.usbCheck = usbCheck
 
 tinySA.setGraphs()
 tinySA.setGUI()
