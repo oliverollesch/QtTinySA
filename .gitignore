@@ -7,3 +7,5 @@ dist/
 firmware_possible_issue.txt
 /executables
 /venv
+.repowise/
+.vscode/
