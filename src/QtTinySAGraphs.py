@@ -6,6 +6,7 @@ Created on Wed Nov 26 15:42:02 2025
 @author: ian
 """
 import logging
+import os
 import numpy as np
 from PySide6.QtCore import QObject, Qt
 from PySide6.QtGui import QLinearGradient
@@ -13,7 +14,7 @@ from PySide6.QtGraphs import QSurface3DSeries, QSurfaceDataProxy, QGraphsTheme
 from PySide6.QtGraphsWidgets import Q3DSurfaceWidgetItem
 
 logging.basicConfig(format="%(message)s", level=logging.INFO)
-PN_AT_1152MHZ = np.loadtxt("1152_baseline.txt")
+PN_AT_1152MHZ = np.loadtxt(os.path.join(os.path.dirname(__file__), "1152_baseline.txt"))
 
 
 class SurfaceGraph(QObject):

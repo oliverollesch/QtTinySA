@@ -1,0 +1,706 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>FCCTest</class>
+ <widget class="QDialog" name="FCCTest">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>960</width>
+    <height>720</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>FCC Near-Field Test</string>
+  </property>
+  <layout class="QVBoxLayout" name="mainLayout">
+   <item>
+    <widget class="QLabel" name="stepHeader">
+     <property name="text">
+      <string>Step 1 of 7 — Checklist</string>
+     </property>
+     <property name="styleSheet">
+      <string>font-size: 14pt; font-weight: bold;</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QStackedWidget" name="wizardStack">
+     <!-- Page 0: Checklist -->
+     <widget class="QWidget" name="pageChecklist">
+      <layout class="QVBoxLayout" name="checklistLayout">
+       <item>
+        <widget class="QLabel" name="checklistIntro">
+         <property name="text">
+          <string>Confirm the setup before starting. Take a photo of the IDC setup for repeatability.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkPhoto">
+         <property name="text">
+          <string>Setup photo taken (device placement, wire orientation documented)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkDutCharged">
+         <property name="text">
+          <string>DUT and battery are charged / connected</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkTinyCharged">
+         <property name="text">
+          <string>TinySA has enough charge</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkPlacement">
+         <property name="text">
+          <string>Device and probe placement / wire orientation fixed (tape recommended)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QFormLayout" name="metaForm">
+         <item row="0" column="0">
+          <widget class="QLabel" name="lblRunLabel">
+           <property name="text">
+            <string>Run label</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QLineEdit" name="runLabel">
+           <property name="placeholderText">
+            <string>Ambient / Glass_BareBoard / Glass_TxWire_10cm</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="lblDut">
+           <property name="text">
+            <string>DUT name</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QLineEdit" name="dutName"/>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="lblDistance">
+           <property name="text">
+            <string>Probe distance (cm)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QDoubleSpinBox" name="distanceCm">
+           <property name="decimals">
+            <number>1</number>
+           </property>
+           <property name="minimum">
+            <double>0.5</double>
+           </property>
+           <property name="maximum">
+            <double>30.0</double>
+           </property>
+           <property name="value">
+            <double>2.0</double>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="0">
+          <widget class="QLabel" name="lblNotes">
+           <property name="text">
+            <string>Notes</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1">
+          <widget class="QPlainTextEdit" name="notes">
+           <property name="maximumHeight">
+            <number>80</number>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="ambientRun">
+         <property name="text">
+          <string>This is an Ambient (baseline) run — DUT OFF</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="checklistSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 1: Arm -->
+     <widget class="QWidget" name="pageArm">
+      <layout class="QVBoxLayout" name="armLayout">
+       <item>
+        <widget class="QLabel" name="armIntro">
+         <property name="text">
+          <string>Instrument settings per FCC near-field doc: Ultra mode (serial: ultra on; PIN 4321 is for on-device unlock only), span 15 MHz–1 GHz, RBW 30 kHz, Max Hold. Buffer is cleared (calc off) before each arm so runs do not mix. Stop the main Run/Stop sweep before Arming.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="armSettingsPreview">
+         <property name="text">
+          <string>ultra on | calc off | sweep 15e6–1e9 | rbw 30 | attenuate 0 | lna off | spur auto | calc maxh</string>
+         </property>
+         <property name="styleSheet">
+          <string>font-family: monospace; background: #222; color: #0f0; padding: 8px;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QFormLayout" name="armForm">
+         <item row="0" column="0">
+          <widget class="QLabel" name="lblProbePath">
+           <property name="text">
+            <string>Probe / conversion</string>
+           </property>
+          </widget>
+         </item>
+         <item row="0" column="1">
+          <widget class="QComboBox" name="probePath">
+           <item>
+            <property name="text">
+             <string>TekBox E5 (−40 dB amp)</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Schwarzbeck AF 20</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Schwarzbeck AF 47</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item row="1" column="0">
+          <widget class="QLabel" name="lblAmpGain">
+           <property name="text">
+            <string>Amp gain (dB)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="1" column="1">
+          <widget class="QDoubleSpinBox" name="ampGainDb">
+           <property name="decimals">
+            <number>1</number>
+           </property>
+           <property name="minimum">
+            <double>0.0</double>
+           </property>
+           <property name="maximum">
+            <double>60.0</double>
+           </property>
+           <property name="value">
+            <double>40.0</double>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="0">
+          <widget class="QLabel" name="lblCarrier">
+           <property name="text">
+            <string>Carrier (MHz) for harmonic marks</string>
+           </property>
+          </widget>
+         </item>
+         <item row="2" column="1">
+          <widget class="QDoubleSpinBox" name="carrierMhz">
+           <property name="decimals">
+            <number>1</number>
+           </property>
+           <property name="minimum">
+            <double>1.0</double>
+           </property>
+           <property name="maximum">
+            <double>100.0</double>
+           </property>
+           <property name="value">
+            <double>20.0</double>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="0">
+          <widget class="QLabel" name="lblHold">
+           <property name="text">
+            <string>Hold time (minutes)</string>
+           </property>
+          </widget>
+         </item>
+         <item row="3" column="1">
+          <widget class="QSpinBox" name="holdMinutes">
+           <property name="minimum">
+            <number>1</number>
+           </property>
+           <property name="maximum">
+            <number>15</number>
+           </property>
+           <property name="value">
+            <number>3</number>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="armBtnRow">
+         <item>
+          <widget class="QPushButton" name="btnMeasureSweep">
+           <property name="text">
+            <string>Measure sweep time</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnArm">
+           <property name="text">
+            <string>Arm Max Hold</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="armBtnSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="armStatus">
+         <property name="text">
+          <string>Not armed yet.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="armSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 2: Unplug -->
+     <widget class="QWidget" name="pageUnplug">
+      <layout class="QVBoxLayout" name="unplugLayout">
+       <item>
+        <widget class="QLabel" name="unplugIntro">
+         <property name="text">
+          <string>Disconnect the TinySA USB cable from the laptop now.
+Leave the TinySA powered on and sweeping in Max Hold.
+Do not touch the DUT / probe setup.</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string>font-size: 13pt;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="unplugStatus">
+         <property name="text">
+          <string>Waiting for USB disconnect…</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="styleSheet">
+          <string>font-size: 12pt; color: orange;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="unplugSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 3: Hold -->
+     <widget class="QWidget" name="pageHold">
+      <layout class="QVBoxLayout" name="holdLayout">
+       <item>
+        <widget class="QLabel" name="holdIntro">
+         <property name="text">
+          <string>Max Hold running on the TinySA. Leave the setup undisturbed.</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="countdownLabel">
+         <property name="text">
+          <string>03:00</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="styleSheet">
+          <string>font-size: 48pt; font-weight: bold;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QProgressBar" name="holdProgress">
+         <property name="minimum">
+          <number>0</number>
+         </property>
+         <property name="maximum">
+          <number>100</number>
+         </property>
+         <property name="value">
+          <number>0</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="holdBtnRow">
+         <item>
+          <spacer name="holdLeft">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnAbortHold">
+           <property name="text">
+            <string>Abort hold</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="holdRight">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <spacer name="holdSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 4: Replug -->
+     <widget class="QWidget" name="pageReplug">
+      <layout class="QVBoxLayout" name="replugLayout">
+       <item>
+        <widget class="QLabel" name="replugIntro">
+         <property name="text">
+          <string>Hold complete. On the TinySA: PAUSE / freeze the display.
+Then reconnect the USB cable to the laptop.</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string>font-size: 13pt;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="replugStatus">
+         <property name="text">
+          <string>Waiting for USB reconnect…</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="styleSheet">
+          <string>font-size: 12pt; color: orange;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="replugSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 5: Dump -->
+     <widget class="QWidget" name="pageDump">
+      <layout class="QVBoxLayout" name="dumpLayout">
+       <item>
+        <widget class="QLabel" name="dumpIntro">
+         <property name="text">
+          <string>Dumping max-hold trace from TinySA…</string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="dumpStatus">
+         <property name="text">
+          <string></string>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string>font-size: 12pt;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="dumpSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 6: Results -->
+     <widget class="QWidget" name="pageResults">
+      <layout class="QHBoxLayout" name="resultsLayout">
+       <item>
+        <layout class="QVBoxLayout" name="resultsLeft">
+         <item>
+          <widget class="PlotWidget" name="fccPlot" native="true">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+             <horstretch>1</horstretch>
+             <verstretch>1</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>500</width>
+             <height>400</height>
+            </size>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="plotNote">
+           <property name="text">
+            <string>Note: FCC Class B line is the 3 m far-field limit; near-field probe data is for relative peak identification only.</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QVBoxLayout" name="resultsRight">
+         <item>
+          <widget class="QLabel" name="lblRuns">
+           <property name="text">
+            <string>Session runs</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QListWidget" name="runList">
+           <property name="minimumWidth">
+            <number>200</number>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnNewRun">
+           <property name="text">
+            <string>New Run</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnExportExcel">
+           <property name="text">
+            <string>Export Excel</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnSavePng">
+           <property name="text">
+            <string>Save PNG</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="resultsRightSpacer">
+           <property name="orientation">
+            <enum>Qt::Vertical</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>20</width>
+             <height>40</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="navLayout">
+     <item>
+      <widget class="QPushButton" name="btnBack">
+       <property name="text">
+        <string>Back</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="navSpacer">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnCancel">
+       <property name="text">
+        <string>Cancel</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnNext">
+       <property name="text">
+        <string>Next</string>
+       </property>
+       <property name="default">
+        <bool>true</bool>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>PlotWidget</class>
+   <extends>QWidget</extends>
+   <header location="global">pyqtgraph</header>
+   <container>1</container>
+  </customwidget>
+ </customwidgets>
+ <resources/>
+ <connections/>
+</ui>

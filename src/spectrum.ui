@@ -2205,6 +2205,7 @@ and Colours</string>
     <addaction name="actionPhNoise"/>
     <addaction name="actionFading"/>
     <addaction name="actionPattern"/>
+    <addaction name="actionFCCTest"/>
    </widget>
    <addaction name="menuFile"/>
    <addaction name="menuSettings"/>
@@ -2282,6 +2283,11 @@ and Colours</string>
   <action name="actionPattern">
    <property name="text">
     <string>Antenna Pattern</string>
+   </property>
+  </action>
+  <action name="actionFCCTest">
+   <property name="text">
+    <string>FCC Near-Field Test</string>
    </property>
   </action>
   <action name="actionCorrection">

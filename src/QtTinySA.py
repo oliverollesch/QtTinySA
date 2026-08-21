@@ -48,6 +48,7 @@ from io import BytesIO
 from QtTinyExporters import WWBExporter, WSMExporter
 
 from QtTinySAGraphs import SurfaceGraph
+from fcc_test import FCCWizard
 
 # Defaults to non local configuration/data dirs - needed for packaging
 if system() == "Linux":
@@ -68,8 +69,8 @@ WSMExporter.register()
 # From https://github.com/Hagtronics/tinySA-Ultra-Phase-Noise
 SHAPE_FACTOR = {0.2: 3.4, 1: -0.6, 3: -0.53, 10: 0, 30: 0, 100: 0, 300: 0, 600: 0, 850: 0}
 # tinySA typical phase noise
-PN_AT_10MHZ = np.loadtxt("10_baseline.txt")
-PN_AT_1152MHZ = np.loadtxt("1152_baseline.txt")
+PN_AT_10MHZ = np.loadtxt(os.path.join(basedir, "10_baseline.txt"))
+PN_AT_1152MHZ = np.loadtxt(os.path.join(basedir, "1152_baseline.txt"))
 
 # classes ##############################################################################
 
@@ -756,7 +757,9 @@ class Analyser:
     def saveFile(self, saveSingle=True):
         filebrowse.ui.saveProgress.setValue(0)
         SD = self.listSD()
-        for i in range(len(SD.splitlines())):
+        sd_lines = SD.splitlines()
+        n_lines = len(sd_lines)
+        for i in range(n_lines):
             if not self.directory:  # have not already saved a file, or ask for folder was checked
                 self.directory = QFileDialog.getExistingDirectory(caption="Select folder to save SD card file")
             if not self.directory:
@@ -764,11 +767,11 @@ class Analyser:
             if saveSingle:
                 fileName = filebrowse.ui.listWidget.currentItem().text()  # the file selected in the list widget
             else:
-                fileName = SD.splitlines()[i].split(" ")[0]
+                fileName = sd_lines[i].split(" ")[0]
             with open(os.path.join(self.directory, fileName), "wb") as file:
                 data = self.readSD(fileName)
                 file.write(data)
-            filebrowse.ui.saveProgress.setValue(int(100 * (i+1)/len(SD.splitlines())))
+            filebrowse.ui.saveProgress.setValue(int(100 * (i+1)/n_lines))
             filebrowse.ui.downloadInfo.setText(self.directory)  # show the path where the file was saved
             if filebrowse.ui.askForPath.isChecked():
                 self.directory = None
@@ -1695,10 +1698,7 @@ def writeSweep(timeStamp, frequencies, readings):
     dBm = np.transpose(np.round(array, decimals=2))  # transpose columns and rows
     fileName = str(timeStamp + '_RBW' + QtTSA.rbw_box.currentText() + '.csv')
     with open(fileName, "w", newline='') as fileOutput:
-        output = csv.writer(fileOutput)
-        for rowNumber in range(0, np.shape(dBm)[0]):
-            fields = [dBm[rowNumber, columnNumber] for columnNumber in range(0, np.shape(dBm)[1])]
-            output.writerow(fields)
+        csv.writer(fileOutput).writerows(dBm.tolist())
 
 
 def getPath(dbName):
@@ -1719,11 +1719,11 @@ def getPath(dbName):
         return personalDir
 
     # 3. if not, check if database file exists in the app directory
-        file_path = app_dir(dbName)
-        if os.path.isfile(file_path):
-            shutil.copy(file_path, personalDir)
-            logging.info(f'{dbName} copied from {app_dir} to {personalDir}')
-            return personalDir
+    file_path = app_dir(dbName)
+    if file_path and os.path.isfile(file_path):
+        shutil.copy(file_path, personalDir)
+        logging.info(f'{dbName} copied from {app_dir} to {personalDir}')
+        return personalDir
 
     # 4. If not, then look in current working folder & where the python file is stored/linked from
     workingDirs = [os.path.dirname(__file__), os.path.dirname(os.path.realpath(__file__)), os.getcwd()]
@@ -1733,7 +1733,7 @@ def getPath(dbName):
             logging.info(f'{dbName} copied from {directory} to {personalDir}')
             return personalDir
 
-    raise FileNotFoundError("Unable to find the database {self.dbName}")
+    raise FileNotFoundError(f"Unable to find the database {dbName}")
 
 
 def app_dir(filename):
@@ -2077,6 +2077,7 @@ def connectPassive():
     QtTSA.actionPhNoise.triggered.connect(phasenoise.ui.show)
     QtTSA.actionFading.triggered.connect(fading.ui.show)
     QtTSA.actionPattern.triggered.connect(pattern.ui.show)
+    QtTSA.actionFCCTest.triggered.connect(fccWizard.start)
 
     # phase noise
     phasenoise.ui.centre.clicked.connect(centreToMarker)
@@ -2109,7 +2110,7 @@ app = QtWidgets.QApplication([])
 app.setApplicationName('QtTinySA')
 app.setApplicationVersion(' v1.2.4')
 
-QtTSA = loader.load("spectrum.ui", None)
+QtTSA = loader.load(app_dir("spectrum.ui"), None)
 presetFreqs = CustomDialogue(app_dir('bands.ui'))
 settings = CustomDialogue(app_dir('settings.ui'))
 filebrowse = CustomDialogue(app_dir('filebrowse.ui'))
@@ -2117,6 +2118,8 @@ phasenoise = CustomDialogue(app_dir('phasenoise.ui'))
 fading = CustomDialogue(app_dir('fading.ui'))
 pattern = CustomDialogue(app_dir('pattern.ui'))
 offset = CustomDialogue(app_dir('offset.ui'))
+fccTest = CustomDialogue(app_dir('fcc_test.ui'))
+fccWizard = FCCWizard(fccTest.ui, tinySA, QtTSA)
 
 # Markers
 multiplot = pyqtgraph.GraphicsLayout()  # for plotting marker signal level over time
@@ -2336,6 +2339,7 @@ tinySA.setGUI()
 usbCheck = QtCore.QTimer()
 usbCheck.timeout.connect(tinySA.isConnected)
 usbCheck.start(500)  # check again every 500mS
+fccWizard.usbCheck = usbCheck
 
 ###############################################################################
 # run the application until the user closes it
