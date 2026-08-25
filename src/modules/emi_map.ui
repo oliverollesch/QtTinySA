@@ -1,0 +1,705 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>EMIMap</class>
+ <widget class="QDialog" name="EMIMap">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>960</width>
+    <height>760</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>EMI Near-Field Map</string>
+  </property>
+  <layout class="QVBoxLayout" name="mainLayout">
+   <item>
+    <widget class="QLabel" name="stepHeader">
+     <property name="text">
+      <string>Step 1 of 4 — Setup</string>
+     </property>
+     <property name="styleSheet">
+      <string>font-size: 14pt; font-weight: bold;</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QStackedWidget" name="wizardStack">
+     <!-- Page 0: Setup -->
+     <widget class="QWidget" name="pageSetup">
+      <layout class="QVBoxLayout" name="setupLayout">
+       <item>
+        <widget class="QLabel" name="setupIntro">
+         <property name="text">
+          <string>Mount the H-field probe on the X carriage and put the DUT on a non-conductive spacer. The scan moves X and Y only: probe height is set by hand and Z is never commanded.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="grpPrinter">
+         <property name="title">
+          <string>Printer</string>
+         </property>
+         <layout class="QFormLayout" name="printerForm">
+          <item row="0" column="0">
+           <widget class="QLabel" name="lblPrinterPort">
+            <property name="text">
+             <string>Serial port</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QComboBox" name="printerPort">
+            <property name="editable">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="lblPrinterBaud">
+            <property name="text">
+             <string>Baud</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QSpinBox" name="printerBaud">
+            <property name="minimum">
+             <number>9600</number>
+            </property>
+            <property name="maximum">
+             <number>1000000</number>
+            </property>
+            <property name="singleStep">
+             <number>1200</number>
+            </property>
+            <property name="value">
+             <number>115200</number>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="0">
+           <widget class="QLabel" name="lblSettle">
+            <property name="text">
+             <string>Settle after move (ms)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="1">
+           <widget class="QSpinBox" name="settleMs">
+            <property name="maximum">
+             <number>5000</number>
+            </property>
+            <property name="singleStep">
+             <number>50</number>
+            </property>
+            <property name="value">
+             <number>200</number>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="grpArea">
+         <property name="title">
+          <string>Scan area (mm from the origin you set on the next page)</string>
+         </property>
+         <layout class="QFormLayout" name="areaForm">
+          <item row="0" column="0">
+           <widget class="QLabel" name="lblWidth">
+            <property name="text">
+             <string>Width (+X)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QDoubleSpinBox" name="widthMm">
+            <property name="decimals">
+             <number>1</number>
+            </property>
+            <property name="maximum">
+             <double>220.0</double>
+            </property>
+            <property name="value">
+             <double>100.0</double>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="lblHeight">
+            <property name="text">
+             <string>Height (+Y)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QDoubleSpinBox" name="heightMm">
+            <property name="decimals">
+             <number>1</number>
+            </property>
+            <property name="maximum">
+             <double>220.0</double>
+            </property>
+            <property name="value">
+             <double>100.0</double>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="0">
+           <widget class="QLabel" name="lblStep">
+            <property name="text">
+             <string>Grid step</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="1">
+           <widget class="QDoubleSpinBox" name="stepMm">
+            <property name="decimals">
+             <number>2</number>
+            </property>
+            <property name="minimum">
+             <double>0.1</double>
+            </property>
+            <property name="maximum">
+             <double>50.0</double>
+            </property>
+            <property name="value">
+             <double>2.0</double>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="lblGridInfo">
+            <property name="text">
+             <string>Grid</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QLabel" name="gridInfo">
+            <property name="text">
+             <string>51 x 51 points</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="grpMeasurement">
+         <property name="title">
+          <string>Measurement</string>
+         </property>
+         <layout class="QFormLayout" name="measurementForm">
+          <item row="0" column="0">
+           <widget class="QLabel" name="lblCentre">
+            <property name="text">
+             <string>Centre (MHz)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QDoubleSpinBox" name="centreMhz">
+            <property name="decimals">
+             <number>3</number>
+            </property>
+            <property name="minimum">
+             <double>0.1</double>
+            </property>
+            <property name="maximum">
+             <double>6000.0</double>
+            </property>
+            <property name="value">
+             <double>20.0</double>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="lblSpan">
+            <property name="text">
+             <string>Span (MHz)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QDoubleSpinBox" name="spanMhz">
+            <property name="decimals">
+             <number>3</number>
+            </property>
+            <property name="minimum">
+             <double>0.01</double>
+            </property>
+            <property name="maximum">
+             <double>1000.0</double>
+            </property>
+            <property name="value">
+             <double>2.0</double>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="0">
+           <widget class="QLabel" name="lblPoints">
+            <property name="text">
+             <string>Points</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="1">
+           <widget class="QSpinBox" name="points">
+            <property name="minimum">
+             <number>2</number>
+            </property>
+            <property name="maximum">
+             <number>450</number>
+            </property>
+            <property name="value">
+             <number>101</number>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="lblSamples">
+            <property name="text">
+             <string>Sweeps per point</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QSpinBox" name="samplesPerXy">
+            <property name="minimum">
+             <number>1</number>
+            </property>
+            <property name="maximum">
+             <number>20</number>
+            </property>
+            <property name="value">
+             <number>3</number>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="0">
+           <widget class="QLabel" name="lblMetric">
+            <property name="text">
+             <string>Metric</string>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="1">
+           <!-- Not named "metric": QWidget.metric() would shadow the child widget -->
+           <widget class="QComboBox" name="metricBox">
+            <item>
+             <property name="text">
+              <string>peak</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>mean_power</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>linear_sum</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+          <item row="5" column="0">
+           <widget class="QLabel" name="lblRbw">
+            <property name="text">
+             <string>RBW (kHz, 0 = auto)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="5" column="1">
+           <widget class="QDoubleSpinBox" name="rbwKhz">
+            <property name="decimals">
+             <number>1</number>
+            </property>
+            <property name="maximum">
+             <double>850.0</double>
+            </property>
+            <property name="value">
+             <double>0.0</double>
+            </property>
+           </widget>
+          </item>
+          <item row="6" column="0">
+           <widget class="QLabel" name="lblAtten">
+            <property name="text">
+             <string>Attenuation (dB, -1 = auto)</string>
+            </property>
+           </widget>
+          </item>
+          <item row="6" column="1">
+           <widget class="QSpinBox" name="attenDb">
+            <property name="minimum">
+             <number>-1</number>
+            </property>
+            <property name="maximum">
+             <number>31</number>
+            </property>
+            <property name="value">
+             <number>-1</number>
+            </property>
+           </widget>
+          </item>
+          <item row="7" column="0">
+           <widget class="QLabel" name="lblSpur">
+            <property name="text">
+             <string>Spur reduction</string>
+            </property>
+           </widget>
+          </item>
+          <item row="7" column="1">
+           <widget class="QComboBox" name="spur">
+            <item>
+             <property name="text">
+              <string>auto</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>on</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>off</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+          <item row="8" column="1">
+           <widget class="QCheckBox" name="lna">
+            <property name="text">
+             <string>LNA on (tinySA Ultra only; bypasses the attenuator)</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="grpOutput">
+         <property name="title">
+          <string>Output</string>
+         </property>
+         <layout class="QFormLayout" name="outputForm">
+          <item row="0" column="0">
+           <widget class="QLabel" name="lblLabel">
+            <property name="text">
+             <string>Run label</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QLineEdit" name="runLabel">
+            <property name="placeholderText">
+             <string>BoardRevA_20MHz</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="lblFolder">
+            <property name="text">
+             <string>Scan folder</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <layout class="QHBoxLayout" name="folderLayout">
+            <item>
+             <widget class="QLineEdit" name="outputRoot"/>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnBrowse">
+              <property name="text">
+               <string>Browse…</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item row="2" column="1">
+           <widget class="QCheckBox" name="chkBackground">
+            <property name="text">
+             <string>Measure a DUT-off background pass first, then repeat the same grid</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="lblBackgroundMode">
+            <property name="text">
+             <string>Background maths</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QComboBox" name="backgroundMode">
+            <item>
+             <property name="text">
+              <string>delta_db</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>linear_subtract</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <spacer name="setupSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>10</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 1: Origin -->
+     <widget class="QWidget" name="pageOrigin">
+      <layout class="QVBoxLayout" name="originLayout">
+       <item>
+        <widget class="QLabel" name="originIntro">
+         <property name="text">
+          <string>Jog the probe over the LOWER-LEFT corner of the area you want to map and set the probe height by hand. That position becomes X0 Y0.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="travelWarning">
+         <property name="text">
+          <string>The probe will move.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string>font-size: 12pt; font-weight: bold; color: #b30000; border: 2px solid #b30000; padding: 10px;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkTravelClear">
+         <property name="text">
+          <string>I have verified the full travel area is clear</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="btnSetOrigin">
+         <property name="text">
+          <string>Set origin here (G92 X0 Y0)</string>
+         </property>
+         <property name="enabled">
+          <bool>false</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="originStatus">
+         <property name="text">
+          <string>Origin not set.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="originSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>10</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 2: Scan -->
+     <widget class="QWidget" name="pageScan">
+      <layout class="QVBoxLayout" name="scanLayout">
+       <item>
+        <layout class="QHBoxLayout" name="scanControls">
+         <item>
+          <widget class="QPushButton" name="btnStartScan">
+           <property name="text">
+            <string>Start scan</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnContinueDut">
+           <property name="text">
+            <string>DUT is ON — continue</string>
+           </property>
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnAbortScan">
+           <property name="text">
+            <string>Abort</string>
+           </property>
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QProgressBar" name="scanProgress">
+         <property name="value">
+          <number>0</number>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="scanStatus">
+         <property name="text">
+          <string>Idle.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="PlotWidget" name="emiPlot" native="true">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>1</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 3: Results -->
+     <widget class="QWidget" name="pageResults">
+      <layout class="QVBoxLayout" name="resultsLayout">
+       <item>
+        <widget class="QLabel" name="resultsIntro">
+         <property name="text">
+          <string>Files written by this scan:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPlainTextEdit" name="resultsText">
+         <property name="readOnly">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="resultsButtons">
+         <item>
+          <widget class="QPushButton" name="btnOpenFolder">
+           <property name="text">
+            <string>Open scan folder</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="resultsSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="navLayout">
+     <item>
+      <widget class="QPushButton" name="btnBack">
+       <property name="text">
+        <string>Back</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="navSpacer">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnCancel">
+       <property name="text">
+        <string>Close</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnNext">
+       <property name="text">
+        <string>Next</string>
+       </property>
+       <property name="default">
+        <bool>true</bool>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>PlotWidget</class>
+   <extends>QWidget</extends>
+   <header location="global">pyqtgraph</header>
+   <container>1</container>
+  </customwidget>
+ </customwidgets>
+ <resources/>
+ <connections/>
+</ui>

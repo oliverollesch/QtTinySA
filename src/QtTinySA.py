@@ -9,6 +9,9 @@
 # nuitka-project: --include-data-file=QtTSAprefs.db=./
 # nuitka-project: --include-data-files=./modules/*baseline.txt=modules/
 # nuitka-project: --include-data-files=./modules/*.ui=modules/
+# The EMI map engine lives outside this tree, so a standalone build has to be
+# told about it; the sys.path shim in emi_map.py only covers source checkouts.
+# nuitka-project: --include-package=EMI_Mapper
 # nuitka-project: --nofollow-import-to=tkinter,pandas,setuptools,tk,wheel,zipp,pyyaml
 # nuitka-project: --nofollow-import-to=packaging,altgraph,mkl,fortran,matlab
 # nuitka-project: --mode=standalone
@@ -49,6 +52,7 @@ from modules.graphs import SurfaceGraph, PhaseNoiseGraph, SpectrumGraph, PolarGr
 from modules.devices import USBdevice, Worker, WorkerSignals
 from modules.utility import resource_path
 from modules.fcc_test import FCCWizard
+from modules.emi_map import EMIMapWizard
 
 # Defaults to non local configuration/data dirs - needed for packaging
 if system() == "Linux":
@@ -1624,6 +1628,7 @@ def connectPassive():
     QtTSA.actionFading.triggered.connect(fading.ui.show)
     QtTSA.actionPattern.triggered.connect(pattern.ui.show)
     QtTSA.actionFCCTest.triggered.connect(fccWizard.start)
+    QtTSA.actionEMIMap.triggered.connect(emiMapWizard.start)
 
     # phase noise
     phasenoise.ui.centre.clicked.connect(tinySA.centreTone)
@@ -1666,6 +1671,7 @@ fading = CustomDialogue(resource_path('fading.ui'))
 pattern = CustomDialogue(resource_path('pattern.ui'))
 offset = CustomDialogue(resource_path('offset.ui'))
 fccTest = CustomDialogue(resource_path('fcc_test.ui'))
+emiMap = CustomDialogue(resource_path('emi_map.ui'))
 
 # Markers
 multiplot = pyqtgraph.GraphicsLayout()  # for plotting marker signal level over time
@@ -1866,6 +1872,8 @@ usbCheck.start(500)
 # The wizard pauses usbCheck while its device is unplugged, so it needs the timer
 fccWizard = FCCWizard(fccTest.ui, usbInstr, QtTSA)
 fccWizard.usbCheck = usbCheck
+
+emiMapWizard = EMIMapWizard(emiMap.ui, usbInstr, QtTSA)
 
 tinySA.setGraphs()
 tinySA.setGUI()

@@ -2328,6 +2328,7 @@ and Colours</string>
     <addaction name="actionFading"/>
     <addaction name="actionPattern"/>
     <addaction name="actionFCCTest"/>
+    <addaction name="actionEMIMap"/>
    </widget>
    <widget class="QMenu" name="menuFile">
     <property name="title">
@@ -2419,6 +2420,11 @@ and Colours</string>
   <action name="actionFCCTest">
    <property name="text">
     <string>FCC Near-Field Test</string>
+   </property>
+  </action>
+  <action name="actionEMIMap">
+   <property name="text">
+    <string>EMI Near-Field Map</string>
    </property>
   </action>
   <action name="actionCorrection">
