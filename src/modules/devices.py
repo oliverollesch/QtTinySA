@@ -21,6 +21,23 @@ from platform import system
 
 threadpool = QThreadPool()
 
+# scanraw option 3 (auto-repeat, ends each sweep with '}{') needs 1.4.177+.
+_SCANRAW_REPEAT_BUILD = 177
+
+
+def scanraw_auto_repeat_supported(firmware) -> bool:
+    """True when firmware can loop scanraw without a new command each sweep.
+
+    Tiny.test() stores the suffix after the last underscore, e.g.
+    ``v1.4-156-g4eb315d`` from ``tinySA4_v1.4-156-g4eb315d``.
+    """
+    if not firmware:
+        return False
+    for part in str(firmware).lstrip("vV").split("-"):
+        if part.isdigit() and int(part) >= 100:
+            return int(part) >= _SCANRAW_REPEAT_BUILD
+    return False
+
 class USBdevice(QObject):
     stopped = Signal(bool)
     update_info = Signal(str, int, int, str)
@@ -354,8 +371,14 @@ class Tiny(QObject):
         # logging.debug(f'elapsed time = {self.runTimer.nsecsElapsed()/1e6:.3f}mS')  # debug
 
         updateTimer.start()  # used to trigger the signal that sends measurements to updateGUI()
+        # Option 3 auto-repeat is 1.4.177+; older builds (this Ultra is 1.4-156)
+        # do a single sweep and return '}' + prompt, which looks like a desync.
+        repeat = bool(loop) and scanraw_auto_repeat_supported(self.firmware)
+        logging.debug(
+            f'scanraw auto-repeat={repeat} firmware={self.firmware!r}'
+        )
         while self.sweeping:
-            if loop:
+            if repeat:
                 command = f'scanraw {int(startF)} {int(stopF)} {int(points)} 3\r'
             else:
                 command = f'scanraw {int(startF)} {int(stopF)} {int(points)} 1\r'
@@ -363,7 +386,7 @@ class Tiny(QObject):
             self.usb.timeout = 1  # should be from self.sweepTimeout(frequencies)
 
             # firmware versions before 4.177 don't support auto-repeating scanraw so command must be sent each sweep
-            if firstRun or not loop:
+            if firstRun or not repeat:
                 try:
                     self.usb.write(command.encode())
                     self.usb.read_until(command.encode() + b'\n{')  # skip command echo
@@ -413,14 +436,33 @@ class Tiny(QObject):
                     buffer = np.roll(buffer, 1, axis=0)
                     buffer[0] = levl
                     
-                    if loop:
-                        if self.usb.read(2) != b'}{':  # the end of scan marker character is '}{'
+                    if repeat:
+                        marker = self.usb.read(2)
+                        if marker == b'}{':  # next auto-repeat sweep is already starting
+                            firstRun = False
+                        elif marker.startswith(b'}'):
+                            logging.info(
+                                'scanraw auto-repeat not available; falling back to single sweeps'
+                            )
+                            repeat = False
+                            firstRun = True
+                            self.usb.read_until(b'ch> ')
+                        else:
                             logging.info('QtTinySA display is out of sync with tinySA frequency')
                             self.signals.error.emit(None, 'QtTinySA display out of sync', 'Ok', 'Critical')
                             self.sweeping = False
                             self.usb.reset_input_buffer()
                             break
-                        firstRun = False
+                    else:
+                        closing = self.usb.read(1)
+                        if closing != b'}':
+                            logging.info('QtTinySA display is out of sync with tinySA frequency')
+                            self.signals.error.emit(None, 'QtTinySA display out of sync', 'Ok', 'Critical')
+                            self.sweeping = False
+                            self.usb.reset_input_buffer()
+                            break
+                        self.usb.read_until(b'ch> ')
+                        firstRun = True
                 timeElapsed = updateTimer.nsecsElapsed()  # how long this batch of measurements has been running, nS
                 if timeElapsed/1e6 > interval:  # GUI update interval mS
                     # send the measurement data to router() in the Analyser class
