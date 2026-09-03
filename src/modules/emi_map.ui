@@ -6,21 +6,42 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>960</width>
+    <width>1100</width>
     <height>760</height>
    </rect>
   </property>
   <property name="windowTitle">
    <string>EMI Near-Field Map</string>
   </property>
-  <layout class="QVBoxLayout" name="mainLayout">
+  <property name="sizeGripEnabled">
+   <bool>true</bool>
+  </property>
+  <layout class="QVBoxLayout" name="mainLayout" stretch="0,1,0">
+   <property name="spacing">
+    <number>4</number>
+   </property>
+   <property name="topMargin">
+    <number>8</number>
+   </property>
+   <property name="bottomMargin">
+    <number>8</number>
+   </property>
    <item>
     <widget class="QLabel" name="stepHeader">
      <property name="text">
       <string>Step 1 of 4 — Setup</string>
      </property>
+     <property name="alignment">
+      <set>Qt::AlignLeading|Qt::AlignTop</set>
+     </property>
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+       <horstretch>0</horstretch>
+       <verstretch>0</verstretch>
+      </sizepolicy>
+     </property>
      <property name="styleSheet">
-      <string>font-size: 14pt; font-weight: bold;</string>
+      <string>font-size: 14pt; font-weight: bold; padding-bottom: 2px;</string>
      </property>
     </widget>
    </item>
@@ -28,7 +49,32 @@
     <widget class="QStackedWidget" name="wizardStack">
      <!-- Page 0: Setup -->
      <widget class="QWidget" name="pageSetup">
-      <layout class="QVBoxLayout" name="setupLayout">
+      <layout class="QVBoxLayout" name="setupPageLayout">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QScrollArea" name="setupScroll">
+         <property name="widgetResizable">
+          <bool>true</bool>
+         </property>
+         <property name="frameShape">
+          <enum>QFrame::NoFrame</enum>
+         </property>
+         <property name="horizontalScrollBarPolicy">
+          <enum>Qt::ScrollBarAlwaysOff</enum>
+         </property>
+         <widget class="QWidget" name="setupInner">
+          <layout class="QVBoxLayout" name="setupLayout">
        <item>
         <widget class="QLabel" name="setupIntro">
          <property name="text">
@@ -38,6 +84,41 @@
           <bool>true</bool>
          </property>
         </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="modeLayout">
+         <item>
+          <widget class="QLabel" name="lblScanMode">
+           <property name="text">
+            <string>Scan mode</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="scanMode">
+           <item>
+            <property name="text">
+             <string>PCB aligned</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Rectangle</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="modeHint">
+           <property name="text">
+            <string>PCB aligned: import the board, home X/Y, click two landmarks, then scan. Rectangle: mark a corner as X0 Y0 and scan a box. Next tells you which path you are on.</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
        </item>
        <item>
         <widget class="QGroupBox" name="grpPrinter">
@@ -471,15 +552,657 @@
          </property>
         </spacer>
        </item>
+          </layout>
+         </widget>
+        </widget>
+       </item>
       </layout>
      </widget>
-     <!-- Page 1: Origin -->
+     <!-- Page 1: Board (PCB aligned mode only) -->
+     <widget class="QWidget" name="pageBoard">
+      <layout class="QVBoxLayout" name="boardLayout">
+       <item>
+        <widget class="QLabel" name="boardIntro">
+         <property name="text">
+          <string>Import the ODB++ job for this board. The outline decides which grid cells are measured: cells off the board or inside a cutout are never driven to and stay empty in the map.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="boardFileLayout">
+         <item>
+          <widget class="QLineEdit" name="boardPath">
+           <property name="readOnly">
+            <bool>true</bool>
+           </property>
+           <property name="placeholderText">
+            <string>No board imported</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnImportBoard">
+           <property name="text">
+            <string>Import ODB++…</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="lblBoardSide">
+           <property name="text">
+            <string>Side</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="boardSide">
+           <item>
+            <property name="text">
+             <string>top</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>bottom</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="boardInfo">
+         <property name="text">
+          <string>No board imported.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPlainTextEdit" name="boardWarnings">
+         <property name="readOnly">
+          <bool>true</bool>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>70</height>
+          </size>
+         </property>
+         <property name="placeholderText">
+          <string>Import warnings appear here.</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="PlotWidget" name="boardPlot" native="true">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>1</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 2: Register (PCB aligned mode only) -->
+     <widget class="QWidget" name="pageRegister">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+        <horstretch>0</horstretch>
+        <verstretch>1</verstretch>
+       </sizepolicy>
+      </property>
+      <layout class="QVBoxLayout" name="registerLayout" stretch="0,0,1">
+       <property name="spacing">
+        <number>4</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QLabel" name="registerIntro">
+         <property name="text">
+          <string>Home X/Y. Click a point, jog or move the probe onto it, then Record. Two opposite landmarks, or load a saved profile and confirm it.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignLeading|Qt::AlignTop</set>
+         </property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="homeRow">
+         <item>
+          <widget class="QCheckBox" name="chkHomeClear">
+           <property name="text">
+            <string>X/Y path clear for homing</string>
+           </property>
+           <property name="toolTip">
+            <string>X/Y carriage path is clear for homing</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnHomeXy">
+           <property name="text">
+            <string>Home X/Y</string>
+           </property>
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="posLabel">
+           <property name="text">
+            <string>Not homed.</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QSplitter" name="registerSplit">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="childrenCollapsible">
+          <bool>false</bool>
+         </property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>1</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
+         </property>
+         <widget class="QScrollArea" name="registerScroll">
+           <property name="widgetResizable">
+            <bool>true</bool>
+           </property>
+           <property name="frameShape">
+            <enum>QFrame::StyledPanel</enum>
+           </property>
+           <property name="horizontalScrollBarPolicy">
+            <enum>Qt::ScrollBarAlwaysOff</enum>
+           </property>
+           <property name="verticalScrollBarPolicy">
+            <enum>Qt::ScrollBarAsNeeded</enum>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>400</width>
+             <height>0</height>
+            </size>
+           </property>
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+             <horstretch>0</horstretch>
+             <verstretch>1</verstretch>
+            </sizepolicy>
+           </property>
+           <widget class="QWidget" name="registerInner">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Preferred" vsizetype="Minimum">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <layout class="QVBoxLayout" name="registerLeft">
+             <property name="spacing">
+              <number>6</number>
+             </property>
+             <property name="sizeConstraint">
+              <enum>QLayout::SetMinimumSize</enum>
+             </property>
+           <item>
+            <widget class="QGroupBox" name="grpJog">
+             <property name="title">
+              <string>Jog the probe</string>
+             </property>
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+             <layout class="QGridLayout" name="jogLayout">
+              <property name="spacing">
+               <number>4</number>
+              </property>
+              <item row="0" column="1">
+               <widget class="QPushButton" name="btnJogYPlus">
+                <property name="text">
+                 <string>+Y</string>
+                </property>
+               </widget>
+              </item>
+              <item row="1" column="0">
+               <widget class="QPushButton" name="btnJogXMinus">
+                <property name="text">
+                 <string>-X</string>
+                </property>
+               </widget>
+              </item>
+              <item row="1" column="1">
+               <widget class="QDoubleSpinBox" name="jogStep">
+                <property name="decimals">
+                 <number>2</number>
+                </property>
+                <property name="minimum">
+                 <double>0.01</double>
+                </property>
+                <property name="maximum">
+                 <double>50.0</double>
+                </property>
+                <property name="value">
+                 <double>1.0</double>
+                </property>
+                <property name="suffix">
+                 <string> mm</string>
+                </property>
+               </widget>
+              </item>
+              <item row="1" column="2">
+               <widget class="QPushButton" name="btnJogXPlus">
+                <property name="text">
+                 <string>+X</string>
+                </property>
+               </widget>
+              </item>
+              <item row="2" column="1">
+               <widget class="QPushButton" name="btnJogYMinus">
+                <property name="text">
+                 <string>-Y</string>
+                </property>
+               </widget>
+              </item>
+              <item row="3" column="0" colspan="3">
+               <layout class="QHBoxLayout" name="jogPresets">
+                <item>
+                 <widget class="QPushButton" name="btnStep10">
+                  <property name="text">
+                   <string>10</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Set the jog step to 10 mm</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="btnStep1">
+                  <property name="text">
+                   <string>1</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Set the jog step to 1 mm</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="btnStep01">
+                  <property name="text">
+                   <string>0.1</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Set the jog step to 0.1 mm</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="btnStep005">
+                  <property name="text">
+                   <string>0.05</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Set the jog step to 0.05 mm</string>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
+             </layout>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="targetRow">
+             <item>
+              <widget class="QCheckBox" name="chkSnapLandmark">
+               <property name="text">
+                <string>Snap to landmarks</string>
+               </property>
+               <property name="checked">
+                <bool>true</bool>
+               </property>
+               <property name="toolTip">
+                <string>On: clicks snap to corners and outline vertices. Off: the exact point you clicked, anywhere on the board.</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="btnMoveHere">
+               <property name="text">
+                <string>Move here</string>
+               </property>
+               <property name="enabled">
+                <bool>false</bool>
+               </property>
+               <property name="toolTip">
+                <string>Drive the probe to the selected point using the current alignment. Clicking the plot only selects; nothing moves until this is pressed.</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="btnConfirmAlignment">
+               <property name="text">
+                <string>Confirm</string>
+               </property>
+               <property name="enabled">
+                <bool>false</bool>
+               </property>
+               <property name="toolTip">
+                <string>Confirm that the probe is standing on the selected feature. Required after loading a profile, before a scan. Only available immediately after Move here, and invalidated by any jog.</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QLabel" name="targetLabel">
+             <property name="text">
+              <string>No point selected.</string>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="landmarkButtons">
+             <item>
+              <widget class="QPushButton" name="btnRecordLandmark">
+               <property name="text">
+                <string>Record</string>
+               </property>
+               <property name="toolTip">
+                <string>Record the selected board point at the probe's current machine position.</string>
+               </property>
+               <property name="enabled">
+                <bool>false</bool>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="btnRemoveLandmark">
+               <property name="text">
+                <string>Remove</string>
+               </property>
+               <property name="toolTip">
+                <string>Drop the highlighted landmark, keeping the rest. Use the Error column to find the one that is on the wrong feature.</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="btnClearLandmarks">
+               <property name="text">
+                <string>Clear</string>
+               </property>
+               <property name="toolTip">
+                <string>Clear every recorded landmark and the current alignment.</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QTableWidget" name="landmarkTable">
+             <property name="maximumSize">
+              <size>
+               <width>16777215</width>
+               <height>96</height>
+              </size>
+             </property>
+             <column>
+              <property name="text">
+               <string>Board X</string>
+              </property>
+             </column>
+             <column>
+              <property name="text">
+               <string>Board Y</string>
+              </property>
+             </column>
+             <column>
+              <property name="text">
+               <string>Machine X</string>
+              </property>
+             </column>
+             <column>
+              <property name="text">
+               <string>Machine Y</string>
+              </property>
+             </column>
+             <column>
+              <property name="text">
+               <string>Error</string>
+              </property>
+             </column>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="regStatus">
+             <property name="text">
+              <string>Registration: no landmarks recorded.</string>
+             </property>
+             <property name="styleSheet">
+              <string>font-family: Consolas, Menlo, monospace;</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QLabel" name="landmarkHint">
+             <property name="text">
+              <string/>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
+             </property>
+             <property name="styleSheet">
+              <string>color: #0b6; font-weight: bold;</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QGroupBox" name="grpProfile">
+             <property name="title">
+              <string>Saved profile</string>
+             </property>
+             <layout class="QVBoxLayout" name="profileLayout">
+              <property name="spacing">
+               <number>4</number>
+              </property>
+              <item>
+               <widget class="QLabel" name="profileIntro">
+                <property name="text">
+                 <string>Load a previous alignment, then verify it on the board before scanning.</string>
+                </property>
+                <property name="wordWrap">
+                 <bool>true</bool>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <layout class="QHBoxLayout" name="identityForm">
+                <item>
+                 <widget class="QLineEdit" name="fixtureId">
+                  <property name="placeholderText">
+                   <string>Fixture</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Fixture identifier, e.g. Ender bed fixture A</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QLineEdit" name="machineId">
+                  <property name="placeholderText">
+                   <string>Machine</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Machine identifier, e.g. ender3-01</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QLineEdit" name="probeSetupId">
+                  <property name="placeholderText">
+                   <string>Probe</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Probe setup identifier, e.g. loop-6mm-holder-v2</string>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="chkBoardSeated">
+                <property name="text">
+                 <string>Board seated as saved</string>
+                </property>
+                <property name="toolTip">
+                 <string>Board is seated in the same position and orientation as when the profile was saved</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="chkOrientationLocked">
+                <property name="text">
+                 <string>Fixture holds orientation</string>
+                </property>
+                <property name="toolTip">
+                 <string>PCB orientation is mechanically constrained by a fixture or hard stop. Allows one verification point instead of two. One point pins translation but cannot detect rotation about that point.</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <layout class="QHBoxLayout" name="profileRow">
+                <item>
+                 <widget class="QComboBox" name="fixtureProfile"/>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="btnLoadProfile">
+                  <property name="text">
+                   <string>Load</string>
+                  </property>
+                  <property name="enabled">
+                   <bool>false</bool>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
+              <item>
+               <layout class="QHBoxLayout" name="profileActions">
+                <item>
+                 <widget class="QPushButton" name="btnUpdateOffset">
+                  <property name="text">
+                   <string>Update offset</string>
+                  </property>
+                  <property name="enabled">
+                   <bool>false</bool>
+                  </property>
+                  <property name="toolTip">
+                   <string>After fine jogging onto the selected point, shift the whole alignment by the error you just corrected.</string>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
+              <item>
+               <layout class="QHBoxLayout" name="profileSaveRow">
+                <item>
+                 <widget class="QPushButton" name="btnSaveAsProfile">
+                  <property name="text">
+                   <string>Save as new</string>
+                  </property>
+                  <property name="enabled">
+                   <bool>false</bool>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="btnUpdateProfile">
+                  <property name="text">
+                   <string>Update profile</string>
+                  </property>
+                  <property name="enabled">
+                   <bool>false</bool>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
+              <item>
+               <widget class="QLabel" name="profileStatus">
+                <property name="text">
+                 <string>No profile loaded.</string>
+                </property>
+                <property name="wordWrap">
+                 <bool>true</bool>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </widget>
+           </item>
+            </layout>
+           </widget>
+          </widget>
+         <widget class="PlotWidget" name="regPlot" native="true">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+             <horstretch>1</horstretch>
+             <verstretch>1</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>360</width>
+             <height>280</height>
+            </size>
+           </property>
+          </widget>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <!-- Page 3: Origin (Rectangle mode only) -->
      <widget class="QWidget" name="pageOrigin">
       <layout class="QVBoxLayout" name="originLayout">
        <item>
         <widget class="QLabel" name="originIntro">
          <property name="text">
-          <string>Jog the probe over the LOWER-LEFT corner of the area you want to map and set the probe height by hand. That position becomes X0 Y0.</string>
+          <string>This page is Rectangle mode only. It names the current probe position X0 Y0; the scan then moves +X and +Y from here. It does not import a PCB.
+
+To scan a board: Back, set Scan mode to PCB aligned, then Next. That path is Setup → import ODB++ → home X/Y and register two landmarks → Scan.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -541,15 +1264,38 @@
        </item>
       </layout>
      </widget>
-     <!-- Page 2: Scan -->
+     <!-- Page 4: Scan -->
      <widget class="QWidget" name="pageScan">
       <layout class="QVBoxLayout" name="scanLayout">
+       <item>
+        <widget class="QLabel" name="scanIntro">
+         <property name="text">
+          <string>Confirm the probe height and PCB travel are clear, then Start scan.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkTravelClearBoard">
+         <property name="text">
+          <string>Probe height and PCB travel are clear</string>
+         </property>
+         <property name="toolTip">
+          <string>Required before a PCB-aligned scan. The probe will traverse the whole board; Z is never commanded.</string>
+         </property>
+        </widget>
+       </item>
        <item>
         <layout class="QHBoxLayout" name="scanControls">
          <item>
           <widget class="QPushButton" name="btnStartScan">
            <property name="text">
             <string>Start scan</string>
+           </property>
+           <property name="toolTip">
+            <string>Start the scan</string>
            </property>
           </widget>
          </item>
@@ -604,20 +1350,63 @@
        </item>
       </layout>
      </widget>
-     <!-- Page 3: Results -->
+     <!-- Page 5: Results -->
      <widget class="QWidget" name="pageResults">
-      <layout class="QVBoxLayout" name="resultsLayout">
+      <layout class="QVBoxLayout" name="resultsLayout" stretch="0,0,1,0">
+       <property name="spacing">
+        <number>8</number>
+       </property>
        <item>
-        <widget class="QLabel" name="resultsIntro">
+        <widget class="QLabel" name="resultsBanner">
          <property name="text">
-          <string>Files written by this scan:</string>
+          <string>Scan complete.</string>
+         </property>
+         <property name="styleSheet">
+          <string>font-size: 13pt; font-weight: bold; color: #0a7a32;</string>
          </property>
         </widget>
        </item>
        <item>
-        <widget class="QPlainTextEdit" name="resultsText">
-         <property name="readOnly">
+        <widget class="QLabel" name="resultsSummary">
+         <property name="text">
+          <string>No scan has been run in this session.</string>
+         </property>
+         <property name="wordWrap">
           <bool>true</bool>
+         </property>
+         <property name="textInteractionFlags">
+          <set>Qt::TextSelectableByMouse</set>
+         </property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="boardImage">
+         <property name="text">
+          <string/>
+         </property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>1</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="minimumSize">
+          <size>
+           <width>320</width>
+           <height>240</height>
+          </size>
+         </property>
+         <property name="alignment">
+          <set>Qt::AlignCenter</set>
+         </property>
+         <property name="styleSheet">
+          <string>background: #f4f4f4;</string>
          </property>
         </widget>
        </item>
@@ -627,6 +1416,16 @@
           <widget class="QPushButton" name="btnOpenFolder">
            <property name="text">
             <string>Open scan folder</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnOpenOverlay">
+           <property name="text">
+            <string>Open PCB overlay</string>
+           </property>
+           <property name="enabled">
+            <bool>false</bool>
            </property>
           </widget>
          </item>
