@@ -7,7 +7,8 @@ EMI_Mapper package; this module is only Qt glue plus serial-ownership handling.
 Two modes share the wizard.  Rectangle maps a plain area from an origin the
 operator sets by hand with G92, and never homes.  PCB aligned homes X and Y,
 imports an ODB++ board, registers it to the machine from landmarks the operator
-jogs to, and clips the grid to the board outline.  Neither mode commands Z.
+jogs to, and clips the grid to the board outline.  Z is setup-only: the scan
+loop never commands it.
 """
 
 from __future__ import annotations
@@ -49,6 +50,14 @@ PRINTER_BOOT_S = 2.0
 PRINTER_GREET_S = 8.0
 
 DIALOG_TITLE = "EMI Near-Field Map"
+
+# TinySA Ultra has no firmware overload USB command. Cube preflight will
+# refuse unless the operator acknowledges the RF chain on the Scan page.
+RF_CHAIN_CONFIRM_HINT = (
+    "This TinySA firmware has no overload flag. Confirm the RF chain "
+    "(probe, TBWA2, attenuation) is set correctly, then tick the box. "
+    "This does not claim overload was ruled out."
+)
 
 STEP_TITLES = ["Setup", "Board", "Register", "Rectangle origin", "Scan", "Results"]
 
@@ -129,21 +138,27 @@ def _load_engine():
     from EMI_Mapper import board as engine_board
     from EMI_Mapper import config as engine_config
     from EMI_Mapper import fixture_profiles as engine_profiles
+    from EMI_Mapper import geometry as engine_geometry
+    from EMI_Mapper import height as engine_height
     from EMI_Mapper import odbpp as engine_odbpp
     from EMI_Mapper import overlay as engine_overlay
     from EMI_Mapper import printer as engine_printer
     from EMI_Mapper import registration as engine_registration
     from EMI_Mapper import scanner as engine_scanner
+    from EMI_Mapper import selection as engine_selection
 
     return (
         engine_board,
         engine_config,
+        engine_height,
         engine_odbpp,
         engine_overlay,
         engine_printer,
         engine_profiles,
         engine_registration,
         engine_scanner,
+        engine_geometry,
+        engine_selection,
     )
 
 
@@ -151,35 +166,30 @@ try:
     (
         engine_board,
         engine_config,
+        engine_height,
         engine_odbpp,
         engine_overlay,
         engine_printer,
         engine_profiles,
         engine_registration,
         engine_scanner,
+        engine_geometry,
+        engine_selection,
     ) = _load_engine()
     ENGINE_ERROR = ""
 except Exception as exc:  # pragma: no cover - depends on deployment layout
-    engine_board = engine_config = engine_odbpp = engine_overlay = None
+    engine_board = engine_config = engine_height = engine_odbpp = engine_overlay = None
     engine_printer = engine_profiles = engine_registration = engine_scanner = None
+    engine_geometry = engine_selection = None
     ENGINE_ERROR = str(exc)
     logging.info(f"EMI map engine unavailable: {exc}")
 
-
-def _board_bounds(view, step_mm):
-    """The board's bounding box snapped outwards onto the step grid.
-
-    Snapping outwards keeps the requested span an exact multiple of the step and
-    covers the whole profile.  Matches MapperSession's default bounds so the GUI
-    and the MCP tools clip the same board to the same cells.
-    """
-    x0, y0, x1, y1 = view.bbox_mm
-    return (
-        math.floor(x0 / step_mm) * step_mm,
-        math.ceil(x1 / step_mm) * step_mm,
-        math.floor(y0 / step_mm) * step_mm,
-        math.ceil(y1 / step_mm) * step_mm,
-    )
+from modules.board_selection_widget import (  # noqa: E402
+    BoardSelectorDialog,
+    ScanSelectionEditor,
+    board_bounds as _board_bounds,
+    polyline_batch as _polyline_batch,
+)
 
 
 def _spread_mm(points):
@@ -189,29 +199,6 @@ def _spread_mm(points):
     coords = np.asarray(points, dtype=float)
     deltas = coords[:, None, :] - coords[None, :, :]
     return float(np.hypot(deltas[..., 0], deltas[..., 1]).max())
-
-
-def _polyline_batch(arrays, close=False):
-    """Flatten many polylines into one x/y/connect triple for a single curve item.
-
-    The reference board carries 2947 strokes; one plot item each makes the
-    canvas unusable, while one item with a connect mask draws in a single pass.
-    """
-    xs, ys, connect = [], [], []
-    for points in arrays:
-        polyline = np.asarray(points, dtype=float)
-        if polyline.ndim != 2 or len(polyline) < 2:
-            continue
-        if close and not np.array_equal(polyline[0], polyline[-1]):
-            polyline = np.vstack([polyline, polyline[:1]])
-        xs.append(polyline[:, 0])
-        ys.append(polyline[:, 1])
-        flags = np.ones(len(polyline), dtype=np.uint8)
-        flags[-1] = 0  # lift the pen between polylines
-        connect.append(flags)
-    if not xs:
-        return None
-    return np.concatenate(xs), np.concatenate(ys), np.concatenate(connect)
 
 
 class _MapSerial:
@@ -328,7 +315,8 @@ class ScanWorker(QtCore.QObject):
     status = QtCore.Signal(str)
     point = QtCore.Signal(dict)
     row = QtCore.Signal(dict)
-    prompt = QtCore.Signal()
+    prompt = QtCore.Signal(str)
+    spectrum = QtCore.Signal(dict)
     succeeded = QtCore.Signal(object)
     failed = QtCore.Signal(str)
     # A Marlin reboot is reported separately from the failure text: the GUI has
@@ -337,7 +325,13 @@ class ScanWorker(QtCore.QObject):
     ended = QtCore.Signal()
 
     def __init__(
-        self, config, tinysa_transport, printer_transport, plan=None, provenance=None
+        self,
+        config,
+        tinysa_transport,
+        printer_transport,
+        plan=None,
+        provenance=None,
+        height=None,
     ):
         super().__init__()
         self.config = config
@@ -345,6 +339,7 @@ class ScanWorker(QtCore.QObject):
         self.printer_transport = printer_transport
         self.plan = plan
         self.provenance = provenance
+        self.height = height
         self._abort = threading.Event()
         self._continue = threading.Event()
 
@@ -355,12 +350,23 @@ class ScanWorker(QtCore.QObject):
     def resume(self):
         self._continue.set()
 
-    def _prompt_dut_on(self):
+    def _prompt_dut(self, message: str):
         self._continue.clear()
-        self.prompt.emit()
+        self.prompt.emit(message)
         while not self._continue.wait(0.1):
             if self._abort.is_set():
                 raise engine_scanner.ScanAborted("cancelled at the DUT prompt")
+
+    def _prompt_dut_off(self):
+        self._prompt_dut(
+            "Turn the DUT OFF for the ambient pass, then continue. "
+            "Leave it off until this pass finishes."
+        )
+
+    def _prompt_dut_on(self):
+        self._prompt_dut(
+            "Ambient pass complete. Turn the DUT ON without moving it, then continue."
+        )
 
     @QtCore.Slot()
     def run(self):
@@ -369,7 +375,9 @@ class ScanWorker(QtCore.QObject):
                 on_point=self.point.emit,
                 on_row=self.row.emit,
                 on_status=self.status.emit,
+                on_spectrum=self.spectrum.emit,
                 should_abort=self._abort.is_set,
+                prompt_dut_off=self._prompt_dut_off,
                 prompt_dut_on=self._prompt_dut_on,
             )
             result = engine_scanner.run_scan(
@@ -379,6 +387,7 @@ class ScanWorker(QtCore.QObject):
                 printer_transport=self.printer_transport,
                 plan=self.plan,
                 provenance=self.provenance,
+                height=self.height,
             )
             self.succeeded.emit(result)
         except engine_scanner.ScanAborted:
@@ -484,14 +493,56 @@ def results_overview(result) -> str:
     peak = _peak_line(result)
     if peak:
         lines.append(peak)
+    characterization_line = _characterization_overview_line(result)
+    if characterization_line:
+        lines.append(characterization_line)
     if alignment:
         lines.append(f"Alignment: {alignment}")
+    height_line = _height_overview_line(snapshot.get("height") or {})
+    if height_line:
+        lines.append(height_line)
     if when:
         lines.append(f"Time: {when}")
     lines.append(f"Folder: {folder}")
     if names:
         lines.append("Wrote: " + ", ".join(names))
     return "\n".join(lines)
+
+
+def _height_overview_line(height: dict) -> str:
+    """Agreed scan plane from the frozen snapshot, if one was recorded."""
+    requested = height.get("requested_height_above_pcb_mm")
+    if requested is None:
+        return ""
+    line = f"Probe height: {requested:g} mm above PCB"
+    source = height.get("source") or height.get("height_source")
+    if source == "operator_override":
+        line += " (operator override)"
+    elif source == "cad+clearance":
+        line += " (CAD + clearance)"
+    reported = height.get("reported_height_above_pcb_mm")
+    if reported is not None:
+        line += f", reported {reported:g} mm"
+    return line
+
+
+def _characterization_overview_line(result) -> str:
+    characterized = getattr(result, "characterization", None) or {}
+    quantity = characterized.get("output_quantity")
+    if not quantity:
+        return ""
+    peak_key = f"characterized_peak_{quantity}"
+    values = np.asarray(characterized.get(peak_key, []), dtype=float)
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        peak = "no valid characterized bins"
+    else:
+        peak = f"peak {float(finite.max()):g} {characterized.get('output_units', '')}"
+    mode = characterized.get("receiver_processing_mode", "unknown")
+    return (
+        f"Manufacturer characterization: {peak}, receiver mode {mode}. "
+        "Diagnostic only; not EMC compliance."
+    )
 
 
 def _peak_line(result) -> str:
@@ -558,7 +609,11 @@ class EMIMapWizard(QtCore.QObject):
         self._registration = None
         self._fit_error = ""
         self._plan = None
+        self._selector = ScanSelectionEditor()
         self._machine_xy = None
+        self._pcb_surface_z = None
+        self._height_override_mm = None
+        self._last_commanded_scan_z = None
 
         # Verification of a loaded profile, tracked against two revisions
         # rather than a flag.  A bare boolean lets the operator move to a
@@ -580,11 +635,29 @@ class EMIMapWizard(QtCore.QObject):
         self._board_trace = None
         self._results_pixmap = None
         self._scan_gate = None
+        self._cube_data = None
+        self._cube_picks = []
+        self._cube_animate = None
+        self._saved_single_span = None
+        self._live_spectrum = None
+        self._live_spectrum_curve = None
 
         self._wire_ui()
+        self._install_cube_controls()
+        self._apply_simple_survey_defaults()
         self._setup_plot()
         self._setup_board_plots()
         self._update_travel_warning()
+        self._refresh_height_ui()
+        self._update_characterization_ui()
+
+    @property
+    def _scan_selection(self):
+        return self._selector.selection
+
+    @_scan_selection.setter
+    def _scan_selection(self, value):
+        self._selector.selection = value
 
     # ------------------------------------------------------------------ UI
     def _wire_ui(self):
@@ -608,11 +681,31 @@ class EMIMapWizard(QtCore.QObject):
         u.wizardStack.currentChanged.connect(self._on_page_changed)
         u.scanMode.currentTextChanged.connect(self._on_mode_changed)
         u.printerPort.currentTextChanged.connect(self._on_printer_port_changed)
+        u.chkCharacterization.stateChanged.connect(self._update_characterization_ui)
+        u.probeModel.currentTextChanged.connect(self._update_characterization_ui)
+        u.amplifierModel.currentTextChanged.connect(self._update_characterization_ui)
+        u.chkBackground.stateChanged.connect(self._update_characterization_ui)
+        u.backgroundMode.currentTextChanged.connect(self._update_characterization_ui)
 
         u.btnImportBoard.clicked.connect(self._import_board)
-        u.boardSide.currentTextChanged.connect(self._apply_board_side)
+        u.boardSide.currentTextChanged.connect(self._apply_board_view)
+        u.btnRotateCcw.clicked.connect(partial(self._rotate_board, 90))
+        u.btnRotateCw.clicked.connect(partial(self._rotate_board, -90))
+        u.btnScanEntireBoard.clicked.connect(self._scan_entire_board)
+        u.radioSelectPoint.toggled.connect(self._on_point_tool_toggled)
+        u.radioSelectRect.toggled.connect(self._on_rect_tool_toggled)
+        u.btnUndoSelection.clicked.connect(self._undo_scan_selection)
+        u.btnClearSelection.clicked.connect(self._clear_scan_selection)
+        u.btnOpenBoardSelector.clicked.connect(self._open_board_selector)
+        for radio in (u.radioSelectPoint, u.radioSelectRect):
+            setter = getattr(radio, "setAutoExclusive", None)
+            if callable(setter):
+                setter(False)
         u.chkHomeClear.stateChanged.connect(self._update_nav)
         u.chkTravelClearBoard.stateChanged.connect(self._update_nav)
+        rf_confirmed = getattr(u, "chkRfConfirmed", None)
+        if rf_confirmed is not None:
+            rf_confirmed.stateChanged.connect(self._update_nav)
         u.btnHomeXy.clicked.connect(self._home_xy_clicked)
         u.btnRecordLandmark.clicked.connect(self._record_landmark)
         u.btnRemoveLandmark.clicked.connect(self._remove_landmark)
@@ -638,10 +731,339 @@ class EMIMapWizard(QtCore.QObject):
         u.btnUpdateProfile.clicked.connect(self._update_profile)
         u.chkBoardSeated.stateChanged.connect(self._update_nav)
         u.chkOrientationLocked.stateChanged.connect(self._on_orientation_lock_changed)
+        u.chkAllowSetupZ.stateChanged.connect(self._refresh_height_ui)
+        u.chkHeightOverride.stateChanged.connect(self._refresh_height_ui)
+        u.btnApplyHeightOverride.clicked.connect(self._apply_height_override)
+        u.btnSetPcbSurface.clicked.connect(self._set_pcb_surface)
+        u.btnJogZUp.clicked.connect(partial(self._jog_z, 1))
+        u.btnJogZDown.clicked.connect(partial(self._jog_z, -1))
+        u.btnMoveToScanHeight.clicked.connect(self._move_to_scan_height)
+        u.btnBoardReseated.clicked.connect(self._confirm_board_reseated)
 
         # The dialog can be dismissed with the window chrome as well as Close
         u.rejected.connect(self._cleanup)
         self._layout_register_page()
+
+    def _install_cube_controls(self):
+        """Add cube preset and Results sliders without a new wizard page."""
+        u = self.ui
+
+        def _attach_check(name, label, group_name, on_toggled=None):
+            if getattr(u, name, None) is not None:
+                return
+            group = getattr(u, group_name, None)
+            layout = group.layout() if group is not None and callable(getattr(group, "layout", None)) else None
+            if isinstance(layout, QtWidgets.QFormLayout):
+                box = QtWidgets.QCheckBox(label)
+                box.setObjectName(name)
+                layout.addRow(box)
+                if on_toggled is not None:
+                    box.toggled.connect(on_toggled)
+                setattr(u, name, box)
+                return
+            box = type("CubeCheck", (), {})()
+            box._checked = False
+            box.isChecked = lambda: box._checked
+            box.setChecked = lambda checked, b=box: setattr(b, "_checked", bool(checked))
+            if on_toggled is not None:
+                original = box.setChecked
+
+                def _set(checked, b=box, cb=on_toggled):
+                    original(checked)
+                    cb(b._checked)
+
+                box.setChecked = _set
+            setattr(u, name, box)
+
+        _attach_check(
+            "chkSpectrumCube",
+            "Spectrum cube (E5, 1–50 MHz)",
+            "grpMeasurement",
+            self._on_cube_preset_toggled,
+        )
+        _attach_check(
+            "chkAdvanced",
+            "Advanced measurement settings",
+            "grpMeasurement",
+            self._on_advanced_toggled,
+        )
+        _attach_check(
+            "chkPhysicalTbwa2",
+            "TBWA2 is physically connected",
+            "grpCharacterization",
+        )
+        _attach_check(
+            "chkRfConfirmed",
+            "RF chain reviewed (no firmware overload flag)",
+            "grpMeasurement",
+        )
+        amp_label = getattr(u, "lblAmplifierSurvey", None)
+        if amp_label is None:
+            group = getattr(u, "grpMeasurement", None)
+            layout = group.layout() if group is not None else None
+            if isinstance(layout, QtWidgets.QFormLayout):
+                amp_label = QtWidgets.QLabel("Amplifier: TBWA2-40 (40 dB)")
+                amp_label.setObjectName("lblAmplifierSurvey")
+                layout.addRow(amp_label)
+                u.lblAmplifierSurvey = amp_label
+            else:
+                class _AmpLabel:
+                    def __init__(self):
+                        self._text = "Amplifier: TBWA2-40 (40 dB)"
+
+                    def text(self):
+                        return self._text
+
+                    def setText(self, text):
+                        self._text = text
+
+                u.lblAmplifierSurvey = _AmpLabel()
+        amp = getattr(u, "amplifierModel", None)
+        changed = getattr(amp, "currentTextChanged", None) if amp is not None else None
+        if changed is not None and callable(getattr(changed, "connect", None)):
+            changed.connect(self._refresh_amplifier_label)
+        self._refresh_amplifier_label()
+        hold = getattr(u, "backgroundHoldSweeps", None)
+        if hold is None:
+            group = getattr(u, "grpMeasurement", None)
+            layout = group.layout() if group is not None else None
+            if isinstance(layout, QtWidgets.QFormLayout):
+                spin = QtWidgets.QSpinBox()
+                spin.setObjectName("backgroundHoldSweeps")
+                spin.setRange(1, 200)
+                spin.setValue(8)
+                layout.addRow("Stationary background sweeps", spin)
+                u.backgroundHoldSweeps = spin
+            else:
+                class _HoldSweeps:
+                    def value(self):
+                        return 8
+
+                    def setValue(self, *_a, **_k):
+                        return None
+
+                u.backgroundHoldSweeps = _HoldSweeps()
+        results = getattr(u, "resultsLayout", None)
+        if results is None or getattr(u, "cubeFreqSlider", None) is not None:
+            self._set_advanced_visible(False)
+            return
+        if not isinstance(results, QtWidgets.QVBoxLayout):
+            self._set_advanced_visible(False)
+            return
+        controls = QtWidgets.QHBoxLayout()
+        u.cubeMapKind = QtWidgets.QComboBox()
+        u.cubeMapKind.addItems(
+            [
+                "band_max",
+                "single_frequency",
+                "sum_of_measured_bin_powers",
+                "dB_above_stationary_reference",
+            ]
+        )
+        u.cubeQuantity = QtWidgets.QComboBox()
+        u.cubeQuantity.addItems(["raw_dbm", "characterized"])
+        u.cubeFreqSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        u.cubeBandwidthMhz = QtWidgets.QDoubleSpinBox()
+        u.cubeBandwidthMhz.setRange(0.0, 100.0)
+        u.cubeBandwidthMhz.setValue(0.0)
+        u.cubeFreqLabel = QtWidgets.QLabel("Frequency")
+        controls.addWidget(QtWidgets.QLabel("Map"))
+        controls.addWidget(u.cubeMapKind)
+        controls.addWidget(u.cubeQuantity)
+        controls.addWidget(u.cubeFreqLabel)
+        controls.addWidget(u.cubeFreqSlider, 1)
+        controls.addWidget(QtWidgets.QLabel("BW MHz"))
+        controls.addWidget(u.cubeBandwidthMhz)
+        u.cubeAnimate = QtWidgets.QCheckBox("Animate")
+        u.cubeSpectrumLabel = QtWidgets.QLabel("Click a cell for its spectrum")
+        u.cubeSpectrumLabel.setWordWrap(True)
+        controls.addWidget(u.cubeAnimate)
+        results.insertLayout(2, controls)
+        results.insertWidget(3, u.cubeSpectrumLabel)
+        u.cubeAnimate.toggled.connect(self._on_cube_animate_toggled)
+        for widget in (u.cubeMapKind, u.cubeQuantity, u.cubeFreqSlider, u.cubeBandwidthMhz):
+            if hasattr(widget, "valueChanged"):
+                widget.valueChanged.connect(self._refresh_cube_view)
+            if hasattr(widget, "currentTextChanged"):
+                widget.currentTextChanged.connect(self._refresh_cube_view)
+        self._set_advanced_visible(False)
+
+    _ADVANCED_WIDGETS = (
+        "lblCentre",
+        "centreMhz",
+        "lblSpan",
+        "spanMhz",
+        "lblPoints",
+        "points",
+        "lblSamples",
+        "samplesPerXy",
+        "lblMetric",
+        "metricBox",
+        "lblRbw",
+        "rbwKhz",
+        "lblAtten",
+        "attenDb",
+        "lblSpur",
+        "spur",
+        "lna",
+        "lblProbeSourceVariant",
+        "probeSourceVariant",
+        "lblCharacterizedOutput",
+        "characterizedOutput",
+        "lblAmplifierModel",
+        "amplifierModel",
+        "lblCableId",
+        "cableId",
+        "lblCableCurvePath",
+        "cableCurvePath",
+        "lblRangePolicy",
+        "characterizationRangePolicy",
+        "chkBackground",
+        "lblBackgroundMode",
+        "backgroundMode",
+        "backgroundHoldSweeps",
+        "chkCharacterization",
+        "lblProbeModel",
+        "probeModel",
+    )
+
+    def _on_advanced_toggled(self, checked: bool):
+        self._set_advanced_visible(bool(checked))
+        u = self.ui
+        if (
+            checked
+            and getattr(u, "chkSpectrumCube", None) is not None
+            and u.chkSpectrumCube.isChecked()
+            and u.chkBackground.isChecked()
+            and u.chkCharacterization.isChecked()
+        ):
+            u.backgroundMode.setCurrentText("linear_subtract")
+
+    def _set_advanced_visible(self, visible: bool):
+        u = self.ui
+        for name in self._ADVANCED_WIDGETS:
+            widget = getattr(u, name, None)
+            setter = getattr(widget, "setVisible", None)
+            if callable(setter):
+                setter(visible)
+
+    def _apply_simple_survey_defaults(self):
+        """Simple mode: E5 cube, TBWA2-40, 2 mm. Advanced still holds the knobs."""
+        u = self.ui
+        cube = getattr(u, "chkSpectrumCube", None)
+        if cube is None:
+            return
+        if not cube.isChecked():
+            cube.setChecked(True)
+        if u.amplifierModel.currentText() in ("", "bypass"):
+            u.amplifierModel.setCurrentText("TBWA2_40")
+        self._set_advanced_visible(False)
+        self._refresh_scan_intro()
+        self._refresh_amplifier_label()
+
+    def _refresh_amplifier_label(self, *_args):
+        label = getattr(self.ui, "lblAmplifierSurvey", None)
+        combo = getattr(self.ui, "amplifierModel", None)
+        setter = getattr(label, "setText", None) if label is not None else None
+        if not callable(setter) or combo is None:
+            return
+        names = {
+            "TBWA2_40": "TBWA2-40 (40 dB)",
+            "TBWA2_20": "TBWA2-20 (20 dB)",
+            "bypass": "bypass (no external amp)",
+        }
+        amp = combo.currentText()
+        setter(f"Amplifier: {names.get(amp, amp)}")
+
+    def _cube_selected(self):
+        box = getattr(self.ui, "chkSpectrumCube", None)
+        return box is not None and box.isChecked()
+
+    def _rf_confirmed(self):
+        box = getattr(self.ui, "chkRfConfirmed", None)
+        return box is not None and box.isChecked()
+
+    def _refresh_scan_intro(self):
+        """Cube scans need the RF-chain tick on this page; single-span does not."""
+        cube = self._cube_selected()
+        rf = getattr(self.ui, "chkRfConfirmed", None)
+        if rf is not None and hasattr(rf, "setVisible"):
+            rf.setVisible(cube)
+        intro = getattr(self.ui, "scanIntro", None)
+        if intro is None:
+            return
+        if self._mode() != MODE_PCB:
+            intro.setText(
+                "Confirm the RF chain is reviewed, then Start scan."
+                if cube
+                else "Start scan maps the rectangle from the origin you set."
+            )
+            return
+        intro.setText(
+            "Confirm the probe height, PCB travel, and RF chain, then Start scan."
+            if cube
+            else "Confirm the probe height and PCB travel are clear, then Start scan."
+        )
+
+    def _on_cube_preset_toggled(self, checked: bool):
+        u = self.ui
+        if checked:
+            self._saved_single_span = {
+                "centre": u.centreMhz.value(),
+                "span": u.spanMhz.value(),
+                "points": u.points.value(),
+                "rbw": u.rbwKhz.value(),
+                "atten": u.attenDb.value(),
+                "samples": u.samplesPerXy.value(),
+                "step": u.stepMm.value(),
+                "lna": u.lna.isChecked(),
+                "background": u.chkBackground.isChecked(),
+                "background_mode": u.backgroundMode.currentText(),
+                "characterization": u.chkCharacterization.isChecked(),
+                "probe": u.probeModel.currentText(),
+                "amplifier": u.amplifierModel.currentText(),
+            }
+            u.centreMhz.setValue(25.5)
+            u.spanMhz.setValue(49.0)
+            u.points.setValue(450)
+            u.rbwKhz.setValue(300.0)
+            u.attenDb.setValue(10)
+            u.samplesPerXy.setValue(2)
+            u.stepMm.setValue(2.0)
+            u.lna.setChecked(False)
+            u.chkBackground.setChecked(True)
+            u.backgroundMode.setCurrentText("delta_db")
+            u.chkCharacterization.setChecked(True)
+            u.probeModel.setCurrentText("E5")
+            u.characterizedOutput.setCurrentText("electric_field_dbuv_per_m")
+            u.amplifierModel.setCurrentText("TBWA2_40")
+            height_approved = bool(
+                getattr(self, "_height_override_mm", None) is not None
+                or getattr(self, "_last_commanded_scan_z", None) is not None
+            )
+            if not height_approved:
+                clearance = getattr(u, "probeClearanceMm", None)
+                if clearance is not None:
+                    clearance.setValue(5.0)
+        elif self._saved_single_span:
+            saved = self._saved_single_span
+            u.centreMhz.setValue(saved["centre"])
+            u.spanMhz.setValue(saved["span"])
+            u.points.setValue(saved["points"])
+            u.rbwKhz.setValue(saved["rbw"])
+            u.attenDb.setValue(saved["atten"])
+            u.samplesPerXy.setValue(saved["samples"])
+            u.stepMm.setValue(saved["step"])
+            u.lna.setChecked(saved["lna"])
+            u.chkBackground.setChecked(saved["background"])
+            u.backgroundMode.setCurrentText(saved["background_mode"])
+            u.chkCharacterization.setChecked(saved["characterization"])
+            u.probeModel.setCurrentText(saved["probe"])
+            if "amplifier" in saved:
+                u.amplifierModel.setCurrentText(saved["amplifier"])
+            self._saved_single_span = None
+        self._refresh_scan_intro()
+        self._update_nav()
 
     def _layout_register_page(self):
         """Keep the control column readable and stop spare height pooling at the top.
@@ -694,22 +1116,44 @@ class EMIMapWizard(QtCore.QObject):
         self.image.setColorMap(pyqtgraph.colormap.get("inferno"))
         pw.addItem(self.image)
         pw.setAspectLocked(True)
+        live = getattr(self.ui, "liveSpectrum", None)
+        if live is None or not callable(getattr(live, "plot", None)):
+            return
+        get_axis = getattr(live, "getAxis", None)
+        if not callable(get_axis) or get_axis("bottom") is None:
+            return
+        if callable(getattr(live, "setBackground", None)):
+            live.setBackground("w")
+        if callable(getattr(live, "setLabel", None)):
+            live.setLabel("bottom", "Frequency (MHz)")
+            live.setLabel("left", "Power (dBm)")
+        for axis_name in ("bottom", "left"):
+            axis = get_axis(axis_name)
+            if axis is None:
+                continue
+            if callable(getattr(axis, "enableAutoSIPrefix", None)):
+                axis.enableAutoSIPrefix(False)
+            if callable(getattr(axis, "setPen", None)):
+                axis.setPen(pyqtgraph.mkPen("k"))
+            if callable(getattr(axis, "setTextPen", None)):
+                axis.setTextPen(pyqtgraph.mkPen("k"))
+        self._live_spectrum_curve = live.plot(pen=pyqtgraph.mkPen("#1f4e79", width=2))
 
     def _setup_board_plots(self):
         # pyqtgraph stays inside the plot methods, as in _setup_plot, so the
         # headless tests can drive the interlocks without it installed.
         import pyqtgraph
 
-        for plot in (self.ui.boardPlot, self.ui.regPlot):
-            plot.setBackground("w")
-            plot.setLabel("bottom", "Board X (mm)")
-            plot.setLabel("left", "Board Y (mm)")
-            for axis_name in ("bottom", "left"):
-                axis = plot.getAxis(axis_name)
-                axis.enableAutoSIPrefix(False)
-                axis.setPen(pyqtgraph.mkPen("k"))
-                axis.setTextPen(pyqtgraph.mkPen("k"))
-            plot.setAspectLocked(True)
+        plot = self.ui.regPlot
+        plot.setBackground("w")
+        plot.setLabel("bottom", "Board X (mm)")
+        plot.setLabel("left", "Board Y (mm)")
+        for axis_name in ("bottom", "left"):
+            axis = plot.getAxis(axis_name)
+            axis.enableAutoSIPrefix(False)
+            axis.setPen(pyqtgraph.mkPen("k"))
+            axis.setTextPen(pyqtgraph.mkPen("k"))
+        plot.setAspectLocked(True)
 
         self._landmark_marks = pyqtgraph.ScatterPlotItem(
             size=13, symbol="o", pen=pyqtgraph.mkPen("k"), brush=pyqtgraph.mkBrush("#00b070")
@@ -717,14 +1161,16 @@ class EMIMapWizard(QtCore.QObject):
         self._selected_mark = pyqtgraph.ScatterPlotItem(
             size=20, symbol="+", pen=pyqtgraph.mkPen("#b30000", width=2)
         )
-        self.ui.regPlot.addItem(self._landmark_marks)
-        self.ui.regPlot.addItem(self._selected_mark)
-        self.ui.regPlot.scene().sigMouseClicked.connect(self._on_reg_plot_clicked)
+        plot.addItem(self._landmark_marks)
+        plot.addItem(self._selected_mark)
+        plot.scene().sigMouseClicked.connect(self._on_reg_plot_clicked)
+        self._selector.step_mm = self.ui.stepMm.value()
 
-    def _draw_board(self, plot, view):
+    def _draw_board(self, plot, view, *, preserve_camera=True):
         """Draw one board view: artwork, outline, then component markers."""
         import pyqtgraph
 
+        self._selector.board_view = view
         plot.clear()
         if plot is self.ui.regPlot:
             plot.addItem(self._landmark_marks)
@@ -761,8 +1207,6 @@ class EMIMapWizard(QtCore.QObject):
                     brush=pyqtgraph.mkBrush("#c04000"),
                 )
             )
-        # Same cap the PNG/HTML overlays use: past it the labels are unreadable
-        # anyway and every one is a separate text item.
         if len(view.components) <= engine_overlay.MAX_LABELLED_COMPONENTS:
             for part in view.components:
                 label = pyqtgraph.TextItem(part.refdes, color="#603000", anchor=(0.5, 1.2))
@@ -877,12 +1321,51 @@ class EMIMapWizard(QtCore.QObject):
         if chosen:
             self.ui.outputRoot.setText(chosen)
 
+    def _update_characterization_ui(self, *_args):
+        u = self.ui
+        enabled = u.chkCharacterization.isChecked()
+        h10 = enabled and u.probeModel.currentText().upper() == "H10"
+        for name in (
+            "probeModel",
+            "characterizedOutput",
+            "amplifierModel",
+            "cableId",
+            "cableCurvePath",
+            "characterizationRangePolicy",
+        ):
+            getattr(u, name).setEnabled(enabled)
+        u.probeSourceVariant.setEnabled(h10)
+
+        if not enabled:
+            text = (
+                "Disabled: scan output remains raw receiver dBm. Manufacturer "
+                "characterization is diagnostic only, not EMC compliance data."
+            )
+        elif u.chkBackground.isChecked() and u.backgroundMode.currentText() != "linear_subtract":
+            text = (
+                "Characterized background scans require linear_subtract. Raw and "
+                "background spectra are retained; nonpositive residual bins are invalid."
+            )
+        elif h10 and not u.probeSourceVariant.currentText():
+            text = (
+                "H10 requires workbook_S63 or faq_S62. Both are preserved source "
+                "variants; neither is independently verified."
+            )
+        else:
+            text = (
+                "Probe → cable → optional external amplifier → TinySA. The TinySA "
+                "LNA is recorded separately and is never gain-corrected twice."
+            )
+        u.characterizationWarning.setText(text)
+
     def _on_area_changed(self):
         # Geometry changed, so the frozen grid is stale. The landmarks and the
         # fit are not: they still describe where the board sits. Invalidation
         # runs downwards only, so they survive this.
         self._invalidate_plan()
+        self._selector.step_mm = self.ui.stepMm.value()
         self.ui.gridInfo.setText(self._grid_summary())
+        self._update_selection_info()
         self._update_travel_warning()
         # The residual limit scales with the step, so the verdict can change
         self._update_registration_ui()
@@ -897,7 +1380,13 @@ class EMIMapWizard(QtCore.QObject):
                 height_mm=y_end - y_start,
                 step_mm=step_mm,
             )
-            return f"{area.nx} x {area.ny} cells over the board, clipped to its outline"
+            if self._scan_selection is None:
+                return f"{area.nx} x {area.ny} cells over the board, clipped to its outline"
+            selected = self._selected_cell_count()
+            return (
+                f"{selected} selected cells of {area.nx} x {area.ny} "
+                "on the board grid"
+            )
         area = engine_config.ScanArea(
             width_mm=self.ui.widthMm.value(),
             height_mm=self.ui.heightMm.value(),
@@ -922,6 +1411,11 @@ class EMIMapWizard(QtCore.QObject):
             baud=self.ui.printerBaud.value(),
             settle_s=self.ui.settleMs.value() / 1000.0,
             set_current_xy_as_origin=False,
+            manage_z=self.ui.chkAllowSetupZ.isChecked(),
+            # Drop X/Y holding after each move so stepper PWM is off during
+            # settle + sweeps. Z stays held so the probe cannot sag (INV-Z-007).
+            disable_steppers_during_measure=True,
+            disable_stepper_axes="XY",
         )
 
     def build_config(self):
@@ -934,6 +1428,31 @@ class EMIMapWizard(QtCore.QObject):
         if dev is not None and dev.usb is not None:
             baud = getattr(dev.usb, "baudrate", baud)
 
+        cube = (
+            getattr(u, "chkSpectrumCube", None) is not None
+            and u.chkSpectrumCube.isChecked()
+        )
+        advanced = (
+            getattr(u, "chkAdvanced", None) is not None and u.chkAdvanced.isChecked()
+        )
+        if cube:
+            from EMI_Mapper.spectrum_cube import E5_CUBE_START_HZ, E5_CUBE_STOP_HZ
+
+            cube_start_hz = E5_CUBE_START_HZ
+            cube_stop_hz = E5_CUBE_STOP_HZ
+        else:
+            cube_start_hz = u.centreMhz.value() * 1e6 - u.spanMhz.value() * 5e5
+            cube_stop_hz = u.centreMhz.value() * 1e6 + u.spanMhz.value() * 5e5
+        hold_widget = getattr(u, "backgroundHoldSweeps", None)
+        hold_sweeps = int(hold_widget.value()) if hold_widget is not None else 8
+        if cube and not advanced:
+            background = True
+            background_kind = "stationary"
+            background_mode = "delta_db"
+        else:
+            background = u.chkBackground.isChecked()
+            background_kind = "xy_grid"
+            background_mode = u.backgroundMode.currentText()
         config = engine_config.ScanConfig(
             printer=self._printer_config(),
             tinysa=engine_config.TinySAConfig(
@@ -946,6 +1465,30 @@ class EMIMapWizard(QtCore.QObject):
                 lna=u.lna.isChecked(),
                 spur=u.spur.currentText(),
                 samples_per_xy=u.samplesPerXy.value(),
+                unsupported_setting_policy=(
+                    "reject"
+                    if getattr(u, "chkSpectrumCube", None) is not None
+                    and u.chkSpectrumCube.isChecked()
+                    else "clip"
+                ),
+            ),
+            measurement_chain=engine_config.MeasurementChainConfig(
+                enabled=u.chkCharacterization.isChecked(),
+                probe=u.probeModel.currentText(),
+                probe_source_variant=(
+                    u.probeSourceVariant.currentText()
+                    if u.probeModel.currentText().upper() == "H10"
+                    else {
+                        "H20": "workbook_S80",
+                        "H5": "workbook_S40",
+                        "E5": "workbook_112_5",
+                    }.get(u.probeModel.currentText().upper(), "")
+                ),
+                output_quantity=u.characterizedOutput.currentText(),
+                amplifier=u.amplifierModel.currentText(),
+                cable_id=u.cableId.text().strip() or "none",
+                cable_curve_path=u.cableCurvePath.text().strip(),
+                out_of_range_policy=u.characterizationRangePolicy.currentText(),
             ),
             area=engine_config.ScanArea(
                 width_mm=u.widthMm.value(),
@@ -953,10 +1496,23 @@ class EMIMapWizard(QtCore.QObject):
                 step_mm=u.stepMm.value(),
             ),
             metric=u.metricBox.currentText(),
-            background=u.chkBackground.isChecked(),
-            background_mode=u.backgroundMode.currentText(),
+            background=background,
+            background_mode=background_mode,
+            background_kind=background_kind,
+            background_hold_sweeps=hold_sweeps,
             output_root=u.outputRoot.text().strip() or "EMI_Scans",
             label=u.runLabel.text().strip(),
+            acquisition="spectrum_cube" if cube else "single_span",
+            cube_start_hz=cube_start_hz,
+            cube_stop_hz=cube_stop_hz,
+            physical_amplifier_present=bool(
+                getattr(u, "chkPhysicalTbwa2", None) is not None
+                and u.chkPhysicalTbwa2.isChecked()
+            ),
+            rf_configuration_confirmed=bool(
+                getattr(u, "chkRfConfirmed", None) is not None
+                and u.chkRfConfirmed.isChecked()
+            ),
         )
         config.validate()
         return config
@@ -1078,28 +1634,50 @@ class EMIMapWizard(QtCore.QObject):
             self._clear_landmarks_and_alignment()
             self.ui.boardInfo.setText(f"Import failed: {exc}")
             self.ui.boardWarnings.setPlainText("")
-            self._draw_board(self.ui.boardPlot, None)
+            self._reset_scan_selection()
             self._draw_board(self.ui.regPlot, None)
+            self.ui.boardRotation.setText("0°")
+            self._refresh_height_ui()
             QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
             self._update_nav()
             return
         self._board_model = model
         self.ui.boardPath.setText(path)
-        self._apply_board_side()
+        self._board_view = None
+        self._apply_board_view(rotation_deg=0)
 
-    def _apply_board_side(self, _side=None):
-        """Derive the view for the selected side and drop what it invalidates.
+    def _rotate_board(self, delta):
+        if self._board_view is None:
+            return
+        self._apply_board_view(
+            rotation_deg=(self._board_view.rotation_deg + int(delta)) % 360
+        )
 
-        A new board or a flipped side invalidates the board-to-machine
-        transform, so the landmarks recorded against the old one go with it.
-        Homing survives: flipping the board does not move the Ender's frame.
+    def _apply_board_view(self, _side=None, *, rotation_deg=None):
+        """Derive the view for the selected side and rotation.
+
+        A changed side or rotation invalidates the board-to-machine transform
+        through ``_clear_landmarks_and_alignment``. Homing survives: turning
+        the drawing does not move the Ender's frame.
         """
         if self._board_model is None:
             return
-        self._board_view = self._board_model.view(self.ui.boardSide.currentText())
-        self._clear_landmarks_and_alignment()
+        side = self.ui.boardSide.currentText()
+        if rotation_deg is None:
+            rotation_deg = 0 if self._board_view is None else self._board_view.rotation_deg
+        old_view = self._board_view
+        changed = (
+            old_view is None
+            or old_view.side != side
+            or old_view.rotation_deg != rotation_deg
+        )
+        self._board_view = self._board_model.view(side=side, rotation_deg=rotation_deg)
+        self._selector.board_view = self._board_view
+        if changed:
+            self._clear_landmarks_and_alignment()
+        self._reconcile_scan_selection(old_view)
+        self.ui.boardRotation.setText(f"{rotation_deg}°")
         self._describe_board()
-        self._draw_board(self.ui.boardPlot, self._board_view)
         self._draw_board(self.ui.regPlot, self._board_view)
         self.ui.gridInfo.setText(self._grid_summary())
         self._update_nav()
@@ -1113,11 +1691,407 @@ class EMIMapWizard(QtCore.QObject):
             f"{view.outline.hole_count} cutout(s), {len(view.components)} components, "
             f"{len(view.strokes)} artwork strokes\n"
             f"Side {view.side}{' (mirrored)' if view.mirrored else ''}, "
+            f"rotated {view.rotation_deg}°, "
             f"board-view extent X[{x0:.2f}, {x1:.2f}] Y[{y0:.2f}, {y1:.2f}] mm\n"
             f"{view.height_note()}"
         )
         warnings = list(view.report.warnings) if view.report is not None else []
         self.ui.boardWarnings.setPlainText("\n".join(warnings))
+        self._refresh_height_ui()
+        self._update_selection_info()
+
+    def _empty_scan_selection(self):
+        return self._selector.empty()
+
+    def _selection_tool(self):
+        if self.ui.radioSelectPoint.isChecked():
+            return "point"
+        if self.ui.radioSelectRect.isChecked():
+            return "rectangle"
+        return None
+
+    def _set_selection_radios(self, tool):
+        for radio, want in (
+            (self.ui.radioSelectPoint, tool == "point"),
+            (self.ui.radioSelectRect, tool == "rectangle"),
+        ):
+            blocker = getattr(radio, "blockSignals", None)
+            if callable(blocker):
+                blocker(True)
+            radio.setChecked(want)
+            if callable(blocker):
+                blocker(False)
+        self._selector.tool = tool
+
+    def _reset_scan_selection(self):
+        """Default full-board scan. Not the same as Clear."""
+        self._selector.scan_entire_board()
+        self._set_selection_radios(None)
+        self._invalidate_plan()
+        self._update_selection_info()
+        self.ui.gridInfo.setText(self._grid_summary())
+
+    def _reconcile_scan_selection(self, old_view):
+        new_view = self._board_view
+        if old_view is None or old_view.side != new_view.side:
+            self._reset_scan_selection()
+            return
+        if (
+            old_view.rotation_deg == new_view.rotation_deg
+            or self._scan_selection is None
+            or engine_selection is None
+        ):
+            return
+        self._scan_selection = engine_selection.transform_selection(
+            old_view, new_view, self._scan_selection
+        )
+        self._invalidate_plan()
+        self._update_selection_info()
+
+    def _on_point_tool_toggled(self, checked):
+        if checked:
+            self._uncheck_selection_radio(self.ui.radioSelectRect)
+            before = self._scan_selection
+            self._selector.set_tool("point")
+            if before is None:
+                self._after_selection_changed()
+        elif not self.ui.radioSelectRect.isChecked():
+            self._selector.tool = None
+
+    def _on_rect_tool_toggled(self, checked):
+        if checked:
+            self._uncheck_selection_radio(self.ui.radioSelectPoint)
+            before = self._scan_selection
+            self._selector.set_tool("rectangle")
+            if before is None:
+                self._after_selection_changed()
+        elif not self.ui.radioSelectPoint.isChecked():
+            self._selector.tool = None
+
+    def _uncheck_selection_radio(self, radio):
+        blocker = getattr(radio, "blockSignals", None)
+        if callable(blocker):
+            blocker(True)
+        radio.setChecked(False)
+        if callable(blocker):
+            blocker(False)
+
+    def _scan_entire_board(self, _checked=False):
+        self._reset_scan_selection()
+        self._update_nav()
+
+    def _clear_scan_selection(self, _checked=False):
+        self._selector.clear()
+        self._after_selection_changed()
+
+    def _undo_scan_selection(self, _checked=False):
+        if self._scan_selection is None:
+            return
+        self._selector.undo()
+        self._after_selection_changed()
+
+    def _after_selection_changed(self):
+        self._invalidate_plan()
+        self._update_selection_info()
+        self.ui.gridInfo.setText(self._grid_summary())
+        self._update_nav()
+
+    def _selected_cell_count(self):
+        return self._selector.selected_cell_count()
+
+    def _assert_scan_selection_ready(self):
+        if self._scan_selection is None:
+            return
+        if not self._scan_selection.items:
+            raise RuntimeError(
+                "Nothing is selected. Add a point or rectangle, or click "
+                "Scan entire board."
+            )
+        if self._selected_cell_count() == 0:
+            raise RuntimeError(
+                "No selected cell falls on the board. Adjust the regions "
+                "or the grid step."
+            )
+
+    def _update_selection_info(self):
+        label = getattr(self.ui, "selectionInfo", None)
+        if label is None:
+            return
+        if self._selector.last_message:
+            label.setText(self._selector.last_message)
+            return
+        label.setText(self._selector.status_text())
+
+    def _add_selection_point(self, x, y):
+        if not self._selector.add_point(x, y):
+            self._update_selection_info()
+            return False
+        self._after_selection_changed()
+        return True
+
+    def _add_selection_roi(self, x_min, x_max, y_min, y_max):
+        if not self._selector.add_roi(x_min, x_max, y_min, y_max):
+            return False
+        self._after_selection_changed()
+        return True
+
+    def _open_board_selector(self, _checked=False):
+        if self._board_view is None:
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                "Import a board before selecting a scan area.",
+            )
+            return
+        parent = self.ui if isinstance(self.ui, QtWidgets.QWidget) else None
+        dialog = BoardSelectorDialog(
+            parent,
+            self._board_view,
+            self._scan_selection,
+            self.ui.stepMm.value(),
+            tool=self._selection_tool(),
+        )
+        if dialog.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self._scan_selection = dialog.applied_selection()
+        self._set_selection_radios(dialog.applied_tool())
+        self._after_selection_changed()
+
+    def _scan_height_plan(self):
+        """CAD plan using the agreed override, independent of the checkbox.
+
+        Apply stores the plane; unchecking without Apply does not drop it.
+        Uncheck-then-Apply still clears it. An invalid override is an error,
+        not a silent CAD+clearance substitute.
+        """
+        return engine_height.height_plan_from_view(
+            self._board_view,
+            clearance_mm=self._printer_config().probe_clearance_mm,
+            override_height_above_pcb_mm=self._height_override_mm,
+        )
+
+    def _height_snapshot(self, reported_z=None):
+        return engine_height.height_status_block(
+            self._scan_height_plan(),
+            pcb_surface_machine_z=self._pcb_surface_z,
+            reported_machine_z=reported_z,
+            last_commanded_scan_z=self._last_commanded_scan_z,
+        )
+
+    def _reported_z(self):
+        handle = getattr(self, "printer", None)
+        if handle is not None and hasattr(handle, "get_xyz"):
+            try:
+                return handle.get_xyz()[2]
+            except (engine_printer.PrinterError, OSError, RuntimeError, TypeError):
+                return getattr(handle, "z", None)
+        if self.printer_serial is None:
+            return None
+        try:
+            return engine_printer.Printer(
+                self.printer_serial, self._printer_config()
+            ).get_xyz()[2]
+        except (engine_printer.PrinterError, OSError, RuntimeError):
+            return None
+
+    def _refresh_height_ui(self, *_args):
+        u = self.ui
+        allow_z = u.chkAllowSetupZ.isChecked()
+        for widget in (u.btnJogZUp, u.btnJogZDown, u.btnMoveToScanHeight):
+            widget.setEnabled(allow_z)
+        try:
+            plan = self._scan_height_plan()
+            block = self._height_snapshot(self._reported_z())
+        except engine_height.HeightError as exc:
+            u.heightCadLabel.setText(str(exc))
+            u.chkAtScanPlane.setChecked(False)
+            u.chkAtScanPlane.setEnabled(False)
+            extra = u.boardWarnings.toPlainText().strip()
+            note = str(exc)
+            if extra:
+                existing = extra.splitlines()
+                if note not in existing:
+                    u.boardWarnings.setPlainText("\n".join(existing + [note]))
+            else:
+                u.boardWarnings.setPlainText(note)
+            return
+        tallest = block.get("tallest_mm")
+        recommended = block.get("recommended_height_above_pcb_mm")
+        if plan.coverage == "none":
+            cad = "CAD: no listed component heights. Enter an operator override."
+        else:
+            cad = (
+                f"CAD: tallest listed is {block.get('tallest_refdes')} at "
+                f"{tallest:.2f} mm. Recommended plane is {recommended:.2f} mm "
+                f"above the PCB ({plan.coverage} coverage, "
+                f"{block['known']}/{block['total']} heights known)."
+            )
+        if plan.coverage == "partial":
+            cad += " Incomplete CAD is not collision protection."
+        u.heightCadLabel.setText(cad)
+        surface = block.get("pcb_surface_machine_z")
+        if surface is None:
+            u.heightSurfaceLabel.setText("PCB surface: not set. Park over a component-free area.")
+        else:
+            u.heightSurfaceLabel.setText(f"PCB surface datum: {surface:.2f} mm (logical).")
+        reported_h = block.get("reported_height_above_pcb_mm")
+        reported_z = block.get("reported_machine_z")
+        if reported_z is None:
+            u.heightPositionLabel.setText("Reported height: unknown until the printer answers M114.")
+        elif reported_h is None:
+            u.heightPositionLabel.setText(f"Reported Z {reported_z:.2f} mm. Set the PCB surface to convert to height.")
+        else:
+            u.heightPositionLabel.setText(
+                f"Reported height {reported_h:.2f} mm above PCB (logical Z {reported_z:.2f} mm)."
+            )
+        at_plane = bool(block.get("at_requested_plane"))
+        u.chkAtScanPlane.setChecked(at_plane)
+        u.chkAtScanPlane.setEnabled(False)
+        warnings = list(block.get("warnings") or [])
+        extra = u.boardWarnings.toPlainText().strip()
+        height_notes = [note for note in warnings if note]
+        if height_notes:
+            existing = extra.splitlines() if extra else []
+            merged = existing + [note for note in height_notes if note not in existing]
+            u.boardWarnings.setPlainText("\n".join(merged))
+
+    def _commit_override_from_spinbox(self):
+        """Store the visible override as the agreed plane. False if invalid."""
+        try:
+            plan = engine_height.height_plan_from_view(
+                self._board_view,
+                clearance_mm=self._printer_config().probe_clearance_mm,
+                override_height_above_pcb_mm=self.ui.heightOverrideMm.value(),
+            )
+        except engine_height.HeightError as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        self._height_override_mm = plan.override_height_above_pcb_mm
+        return True
+
+    def _apply_height_override(self):
+        if not self.ui.chkHeightOverride.isChecked():
+            self._height_override_mm = None
+            self._refresh_height_ui()
+            return
+        if self._commit_override_from_spinbox():
+            self._refresh_height_ui()
+
+    def _set_pcb_surface(self):
+        if not self.ui.chkHeightReference.isChecked():
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                "Position the probe over a component-free PCB reference area, "
+                "then confirm that before setting the surface.",
+            )
+            return
+        gap = self.ui.heightGapMm.value()
+        try:
+            reported_z = self._printer().get_xyz()[2]
+        except (engine_printer.PrinterError, OSError, RuntimeError, AttributeError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return
+        self._pcb_surface_z = reported_z - gap
+        self._last_commanded_scan_z = None
+        self._refresh_height_ui()
+
+    def _jog_z(self, direction):
+        if not self.ui.chkAllowSetupZ.isChecked():
+            return
+        step = self.ui.jogStep.value() * direction
+        try:
+            printer = self._printer()
+            _x, _y, current = printer.get_xyz()
+            target = current + step
+            if target < current and not self.ui.chkHeightClearance.isChecked():
+                QMessageBox.warning(
+                    self.ui,
+                    DIALOG_TITLE,
+                    "This Z move is toward the PCB. Confirm probe clearance first.",
+                )
+                return
+            printer.move_z(target)
+            self._last_commanded_scan_z = None
+            self._refresh_height_ui()
+        except engine_printer.PrinterReset as exc:
+            self._clear_height_datum()
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+
+    def _drive_to_agreed_plane(self, printer, *, required=True):
+        """Setup-only G1 Z to the stored requested plane. No XY.
+
+        ``required`` False skips when there is no datum or requested height
+        (Home XY / Start scan). Toward-PCB still needs the clearance tick.
+        """
+        plan = self._scan_height_plan()
+        requested = plan.requested_height_above_pcb_mm
+        if self._pcb_surface_z is None or requested is None:
+            if not required:
+                return False
+            if self._pcb_surface_z is None:
+                raise RuntimeError("Set the PCB surface datum first.")
+            raise RuntimeError(
+                "No requested scan height. Import component heights or enter an override."
+            )
+        target = engine_height.target_machine_z(self._pcb_surface_z, requested)
+        current = printer.get_xyz()[2]
+        toward = requested < engine_height.reported_height_above_pcb(
+            current, self._pcb_surface_z
+        )
+        if toward and not self.ui.chkHeightClearance.isChecked():
+            raise RuntimeError(
+                "Moving to scan height lowers the probe toward the PCB. "
+                "Confirm probe clearance first."
+            )
+        printer.move_z(target)
+        reported = printer.get_xyz()[2]
+        if not engine_height.logical_position_matches(reported, target):
+            raise engine_printer.PrinterError(
+                "Marlin-reported position did not reach the requested logical target"
+            )
+        self._last_commanded_scan_z = target
+        return True
+
+    def _move_to_scan_height(self):
+        if not self.ui.chkAllowSetupZ.isChecked():
+            return
+        if self.ui.chkHeightOverride.isChecked() and not self._commit_override_from_spinbox():
+            return
+        try:
+            self._drive_to_agreed_plane(self._printer(), required=True)
+            self._refresh_height_ui()
+        except engine_printer.PrinterReset as exc:
+            self._clear_height_datum()
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+        except (
+            engine_height.HeightError,
+            engine_printer.PrinterError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+
+    def _confirm_board_reseated(self):
+        if not self.ui.chkBoardReseated.isChecked():
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                "Confirm that the PCB has been physically flipped or reseated.",
+            )
+            return
+        self._clear_height_datum()
+        self.ui.chkBoardReseated.setChecked(False)
+        self._refresh_height_ui()
+
+    def _clear_height_datum(self):
+        self._pcb_surface_z = None
+        self._last_commanded_scan_z = None
 
     # ------------------------------------------------------- homing and jog
     def _printer(self):
@@ -1140,15 +2114,29 @@ class EMIMapWizard(QtCore.QObject):
         printer.drain()
         printer.prepare()
         printer.home_xy()
-        return printer.get_xy()
+        note = None
+        if self.ui.chkAllowSetupZ.isChecked():
+            try:
+                self._drive_to_agreed_plane(printer, required=False)
+            except engine_height.HeightError as exc:
+                note = str(exc)
+            except RuntimeError as exc:
+                note = str(exc)
+        return printer.get_xy(), note
 
-    def _on_home_ok(self, position):
+    def _on_home_ok(self, payload):
+        position, note = payload
         self._pcb_xy_homed = True
         self._bump_motion()
         self._clear_landmarks_and_alignment()
         self._show_position(position)
+        self._refresh_height_ui()
+        if note:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, note)
 
     def _on_home_failed(self, exc):
+        if isinstance(exc, engine_printer.PrinterReset):
+            self._clear_height_datum()
         self._clear_pcb_homing()
         self.ui.posLabel.setText(f"Homing failed: {exc}")
         QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
@@ -1174,6 +2162,7 @@ class EMIMapWizard(QtCore.QObject):
             self._bump_motion()
             self._show_position(printer.get_xy())
         except engine_printer.PrinterReset as exc:
+            self._clear_height_datum()
             self._clear_pcb_homing()
             QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
         except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
@@ -2134,6 +3123,8 @@ class EMIMapWizard(QtCore.QObject):
         try:
             config = self.build_config()
             plan = self._preflight(config)
+            self._maybe_resume_cube(config, plan)
+            self._warn_long_cube_scan(config, plan)
             self._launch(config, plan)
         except (ValueError, RuntimeError, OSError, engine_printer.PrinterError) as exc:
             self._refuse_start(str(exc))
@@ -2154,11 +3145,15 @@ class EMIMapWizard(QtCore.QObject):
         if self._mode() != MODE_PCB:
             if not self.origin_set:
                 return "Set the origin first."
+            if self._cube_selected() and not self._rf_confirmed():
+                return RF_CHAIN_CONFIRM_HINT
             return ""
         try:
             self._pcb_preflight()
         except (ValueError, RuntimeError) as exc:
             return str(exc)
+        if self._cube_selected() and not self._rf_confirmed():
+            return RF_CHAIN_CONFIRM_HINT
         return ""
 
     def _apply_scan_gate(self):
@@ -2188,13 +3183,23 @@ class EMIMapWizard(QtCore.QObject):
         if self._mode() != MODE_PCB:
             if not self.origin_set:
                 raise RuntimeError("Set the origin first.")
+            self._assert_cube_rf_confirmed(config)
             return None
         self._pcb_preflight()
+        self._assert_cube_rf_confirmed(config)
         return self._build_validated_plan(config)
+
+    def _assert_cube_rf_confirmed(self, config):
+        if (
+            getattr(config, "acquisition", "") == "spectrum_cube"
+            and not config.rf_configuration_confirmed
+        ):
+            raise RuntimeError(RF_CHAIN_CONFIRM_HINT)
 
     def _pcb_preflight(self):
         if self._board_view is None:
             raise RuntimeError("Import an ODB++ board first.")
+        self._assert_scan_selection_ready()
         if not self._pcb_xy_homed:
             raise RuntimeError(
                 "Home X and Y before a PCB-aligned scan: the landmarks are "
@@ -2209,6 +3214,14 @@ class EMIMapWizard(QtCore.QObject):
             raise RuntimeError(
                 "Confirm the probe height and the full PCB travel area are clear."
             )
+        self._ensure_at_agreed_scan_plane()
+        try:
+            engine_height.apply_scan_height_preflight(
+                self._height_snapshot(self._reported_z()),
+                self._scan_height_plan(),
+            )
+        except engine_height.HeightError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def _build_validated_plan(self, config):
         """Freeze the grid from current state and prevalidate every machine point.
@@ -2230,6 +3243,7 @@ class EMIMapWizard(QtCore.QObject):
             step_mm=step_mm,
             clip_to_outline=True,
             registration=self._registration,
+            selection=self._scan_selection,
         )
         if plan.point_count == 0:
             raise ValueError(
@@ -2326,16 +3340,25 @@ class EMIMapWizard(QtCore.QObject):
             cells = plan.point_count if plan is not None else config.area.nx * config.area.ny
             self._total = cells * (2 if config.background else 1)
             self._done = 0
+            self._cube_live = getattr(config, "acquisition", "single_span") == "spectrum_cube"
             self.ui.scanProgress.setMaximum(self._total)
             self.ui.scanProgress.setValue(0)
 
-            self.worker = ScanWorker(config, dev.usb, transport, plan, self._provenance())
+            self.worker = ScanWorker(
+                config,
+                dev.usb,
+                transport,
+                plan,
+                self._provenance(),
+                height=self._height_for_scan(),
+            )
             self.thread = QtCore.QThread(self)
             self.worker.moveToThread(self.thread)
             self.thread.started.connect(self.worker.run)
             self.worker.status.connect(self.ui.scanStatus.setText)
             self.worker.point.connect(self._on_point)
             self.worker.row.connect(self._on_row)
+            self.worker.spectrum.connect(self._on_spectrum)
             self.worker.prompt.connect(self._on_prompt)
             self.worker.succeeded.connect(self._on_succeeded)
             self.worker.failed.connect(self._on_failed)
@@ -2403,8 +3426,18 @@ class EMIMapWizard(QtCore.QObject):
         self.ui.scanProgress.setValue(self._done)
         if self._grid is not None:
             self._grid[info["iy"], info["ix"]] = info["power_dbm"]
+        measured = info.get("measured_cell_s")
+        remaining = None
+        if measured and self.ui.scanProgress.maximum():
+            remaining = max(self.ui.scanProgress.maximum() - self._done, 0) * float(measured)
+            minutes = remaining / 60.0
+            self.ui.scanStatus.setText(
+                f"{info.get('pass', '')} {self._done}/{self.ui.scanProgress.maximum()} "
+                f"ETA {minutes:.1f} min"
+            )
         self._pending_updates += 1
-        if self._pending_updates >= 8:
+        refresh_every = 1 if getattr(self, "_cube_live", False) else 8
+        if self._pending_updates >= refresh_every:
             self._refresh_image()
 
     def _on_row(self, info):
@@ -2412,6 +3445,18 @@ class EMIMapWizard(QtCore.QObject):
         self.ui.scanStatus.setText(
             f"{info['pass']} pass: row {info['iy'] + 1} of {info['rows']} complete"
         )
+
+    def _on_spectrum(self, info):
+        """Draw the latest USB scanraw. The TinySA LCD does not animate."""
+        self._live_spectrum = info
+        curve = getattr(self, "_live_spectrum_curve", None)
+        if curve is None:
+            return
+        freqs = np.asarray(info.get("freqs"), dtype=float)
+        power = np.asarray(info.get("power_dbm"), dtype=float)
+        if freqs.size < 2 or power.shape != freqs.shape:
+            return
+        curve.setData(freqs / 1e6, power)
 
     def _refresh_image(self):
         self._pending_updates = 0
@@ -2425,11 +3470,16 @@ class EMIMapWizard(QtCore.QObject):
             low, high = low - 0.5, high + 0.5
         self.image.setImage(self._grid.T, autoLevels=False, levels=(low, high))
 
-    def _on_prompt(self):
+    def _on_prompt(self, message=""):
         self.ui.btnContinueDut.setEnabled(True)
-        self.ui.scanStatus.setText(
+        text = message or (
             "Background pass complete. Turn the DUT ON without moving it, then continue."
         )
+        self.ui.scanStatus.setText(text)
+        if "OFF" in text:
+            self.ui.btnContinueDut.setText("DUT is OFF — continue")
+        else:
+            self.ui.btnContinueDut.setText("DUT is ON — continue")
         QtWidgets.QApplication.beep()
 
     def _continue_dut(self):
@@ -2452,13 +3502,274 @@ class EMIMapWizard(QtCore.QObject):
         if summary is not None:
             summary.setText(results_overview(result))
         self._show_board_artifacts(result)
+        self._load_cube_results(result)
         self.ui.wizardStack.setCurrentIndex(PAGE_RESULTS)
+        self._fit_results_image()
+
+    def _load_cube_results(self, result):
+        spectra = Path(result.output_dir) / "spectra.npz"
+        self._cube_data = None
+        self._cube_picks = []
+        if not spectra.exists():
+            return
+        from EMI_Mapper.storage import load_spectra_cube
+
+        payload = load_spectra_cube(spectra)
+        self._cube_data = payload
+        slider = getattr(self.ui, "cubeFreqSlider", None)
+        if slider is None:
+            return
+        n_freq = int(np.asarray(payload["freqs"]).size)
+        slider.setMinimum(0)
+        slider.setMaximum(max(n_freq - 1, 0))
+        slider.setValue(min(slider.value(), max(n_freq - 1, 0)))
+        self._refresh_cube_view()
+
+    def _refresh_cube_view(self, *_args):
+        if self._cube_data is None:
+            return
+        from EMI_Mapper.processing import (
+            EmptyBand,
+            band_max_map,
+            single_frequency_map,
+            sum_of_measured_bin_powers,
+        )
+
+        freqs = np.asarray(self._cube_data["freqs"], dtype=float)
+        cube = np.asarray(self._cube_data["dut"], dtype=float)
+        kind = self.ui.cubeMapKind.currentText()
+        if kind == "dB_above_stationary_reference":
+            reference = self._cube_data.get("background_reference")
+            if reference is None:
+                values = np.full(cube.shape[:2], np.nan)
+                self._show_array_on_results(values)
+                self.ui.cubeFreqLabel.setText("dB above stationary reference (none saved)")
+                return
+            from EMI_Mapper.processing import db_above_stationary_reference
+
+            cube = db_above_stationary_reference(cube, reference)
+        quantity = getattr(self.ui, "cubeQuantity", None)
+        if (
+            quantity is not None
+            and quantity.currentText() == "characterized"
+            and self.result is not None
+        ):
+            characterized = Path(self.result.output_dir) / "characterized.npz"
+            if characterized.exists():
+                with np.load(characterized) as data:
+                    cube = np.asarray(data["characterized_spectrum"], dtype=float)
+        completed = np.asarray(
+            self._cube_data.get("dut_completed", np.isfinite(cube).any(axis=-1))
+        )
+        slider = self.ui.cubeFreqSlider
+        index = int(slider.value()) if freqs.size else 0
+        center = float(freqs[index]) if freqs.size else 0.0
+        bandwidth = float(self.ui.cubeBandwidthMhz.value()) * 1e6
+        kind = self.ui.cubeMapKind.currentText()
+        start = center - bandwidth / 2.0
+        stop = center + bandwidth / 2.0
+        if bandwidth <= 0 or kind == "single_frequency":
+            values, actual = single_frequency_map(cube, freqs, center)
+            self.ui.cubeFreqLabel.setText(f"{actual / 1e6:.3f} MHz")
+        else:
+            try:
+                if kind == "sum_of_measured_bin_powers":
+                    values = sum_of_measured_bin_powers(cube, freqs, start, stop)
+                else:
+                    values = band_max_map(cube, freqs, start, stop)
+            except EmptyBand:
+                values = np.full(cube.shape[:2], np.nan)
+            self.ui.cubeFreqLabel.setText(f"{center / 1e6:.3f} MHz")
+        if self.ui.cubeMapKind.currentText() == "dB_above_stationary_reference":
+            self.ui.cubeFreqLabel.setText(
+                f"{self.ui.cubeFreqLabel.text()} — dB above stationary reference, not DUT-only"
+            )
+        values = np.where(completed, values, np.nan)
+        self._show_array_on_results(values)
+        self._update_cube_spectrum_label()
+
+    def cube_pick_cell(self, iy, ix):
+        """Record up to two completed cells for spectrum comparison."""
+        if self._cube_data is None:
+            return []
+        completed = np.asarray(
+            self._cube_data.get("dut_completed", np.ones(self._cube_data["dut"].shape[:2]))
+        )
+        if iy < 0 or ix < 0 or iy >= completed.shape[0] or ix >= completed.shape[1]:
+            return []
+        if not completed[iy, ix]:
+            return list(self._cube_picks)
+        pick = (int(iy), int(ix))
+        if pick in self._cube_picks:
+            self._cube_picks = [item for item in self._cube_picks if item != pick]
+        else:
+            self._cube_picks.append(pick)
+            self._cube_picks = self._cube_picks[-2:]
+        self._update_cube_spectrum_label()
+        return list(self._cube_picks)
+
+    def cube_cell_spectrum(self, iy, ix):
+        if self._cube_data is None:
+            return None
+        return np.asarray(self._cube_data["dut"][iy, ix], dtype=float)
+
+    def _update_cube_spectrum_label(self):
+        label = getattr(self.ui, "cubeSpectrumLabel", None)
+        if label is None or self._cube_data is None:
+            return
+        freqs = np.asarray(self._cube_data["freqs"], dtype=float)
+        if not self._cube_picks:
+            label.setText("Click a completed cell for its measured spectrum")
+            return
+        parts = []
+        for iy, ix in self._cube_picks:
+            spectrum = self.cube_cell_spectrum(iy, ix)
+            if spectrum is None or not np.any(np.isfinite(spectrum)):
+                continue
+            peak_i = int(np.nanargmax(spectrum))
+            parts.append(
+                f"({ix},{iy}) peak {spectrum[peak_i]:.1f} dBm at {freqs[peak_i] / 1e6:.3f} MHz"
+            )
+        if len(parts) == 2:
+            parts.append("Proximity to CAD is a source candidate, not a confirmed source.")
+        label.setText(" | ".join(parts) if parts else "Selected cell has no spectrum")
+
+    def _on_cube_animate_toggled(self, checked: bool):
+        if self._cube_animate is not None:
+            self._cube_animate.stop()
+            self._cube_animate = None
+        if not checked or self._cube_data is None:
+            return
+        slider = getattr(self.ui, "cubeFreqSlider", None)
+        if slider is None or not hasattr(QtCore, "QTimer"):
+            return
+        timer = QtCore.QTimer(self)
+        timer.setInterval(120)
+
+        def _step():
+            if slider.maximum() <= 0:
+                return
+            slider.setValue((int(slider.value()) + 1) % (int(slider.maximum()) + 1))
+
+        timer.timeout.connect(_step)
+        timer.start()
+        self._cube_animate = timer
+
+    def _cube_cell_count(self, config, plan):
+        if plan is not None:
+            return int(plan.point_count)
+        return int(config.area.nx * config.area.ny)
+
+    def _maybe_resume_cube(self, config, plan):
+        """Offer to continue the newest incomplete cube with the same plan."""
+        if getattr(config, "acquisition", "single_span") != "spectrum_cube":
+            return
+        folder = self._find_resumable_cube(config, plan)
+        if folder is None:
+            return
+        answer = QMessageBox.question(
+            self.ui,
+            DIALOG_TITLE,
+            (
+                f"Resume incomplete cube scan in {folder.name}?\n"
+                "Yes keeps existing cells and RF settings. No starts a new folder."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            config.resume_output_dir = str(folder)
+
+    def _find_resumable_cube(self, config, plan):
+        root = Path(config.output_root)
+        if not root.is_dir():
+            return None
+        plan_id = "" if plan is None else plan.plan_id
+        for child in sorted(root.iterdir(), key=lambda path: path.name, reverse=True):
+            snap_path = child / "snapshot.json"
+            state_path = child / "scan_state.npz"
+            if not snap_path.exists() or not state_path.exists():
+                continue
+            if (child / "spectra.npz").exists():
+                continue
+            try:
+                snapshot = json.loads(snap_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if snapshot.get("acquisition") != "spectrum_cube":
+                continue
+            saved_plan = (snapshot.get("plan") or {}).get("plan_id", "")
+            if saved_plan != plan_id:
+                continue
+            return child
+        return None
+
+    def _warn_long_cube_scan(self, config, plan):
+        if getattr(config, "resume_output_dir", None):
+            return
+        if getattr(config, "acquisition", "single_span") != "spectrum_cube":
+            return
+        from EMI_Mapper.spectrum_cube import cube_workload
+
+        work = cube_workload(config, self._cube_cell_count(config, plan))
+        has_roi = self._scan_selection is not None
+        if has_roi or work["sweeps"] < 200:
+            return
+        QMessageBox.warning(
+            self.ui,
+            DIALOG_TITLE,
+            (
+                f"Long cube scan without an ROI: {work['cells']} cells, "
+                f"{work['segments']} segments, {work['repeats']} repeats, "
+                f"{work['sweeps']} sweeps. This is a duration warning only."
+            ),
+        )
+
+    def _show_cube_scan_estimate(self):
+        try:
+            config = self.build_config()
+        except (ValueError, RuntimeError):
+            return
+        if getattr(config, "acquisition", "single_span") != "spectrum_cube":
+            return
+        from EMI_Mapper.spectrum_cube import cube_workload
+
+        work = cube_workload(config, self._cube_cell_count(config, self._plan))
+        self.ui.scanStatus.setText(
+            f"Cube {work['cells']} cells, {work['segments']} segments, "
+            f"{work['repeats']} repeats, {work['sweeps']} sweeps. "
+            "Remaining time is measured after the first complete cell."
+        )
+
+    def _show_array_on_results(self, values):
+        values = np.asarray(values, dtype=float)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return
+        lo, hi = float(finite.min()), float(finite.max())
+        if hi - lo < 1e-9:
+            hi = lo + 1.0
+        norm = (np.clip(values, lo, hi) - lo) / (hi - lo)
+        norm = np.where(np.isfinite(values), norm, 0.0)
+        rgb = np.zeros(values.shape + (3,), dtype=np.uint8)
+        rgb[..., 0] = np.clip(255 * np.power(norm, 0.5), 0, 255)
+        rgb[..., 1] = np.clip(80 * norm, 0, 255)
+        rgb[..., 2] = np.clip(180 * (1.0 - norm), 0, 255)
+        rgb[~np.isfinite(values)] = 240
+        flipped = np.ascontiguousarray(np.flipud(rgb))
+        height, width, _ = flipped.shape
+        image = QtGui.QImage(flipped.data, width, height, 3 * width, QtGui.QImage.Format_RGB888)
+        self._results_pixmap = QtGui.QPixmap.fromImage(image.copy())
         self._fit_results_image()
 
     def _show_board_artifacts(self, result):
         overlay_html = result.files.get("board_html")
         self.ui.btnOpenOverlay.setEnabled(bool(overlay_html))
-        image_path = result.files.get("board_png") or result.files.get("heatmap_png")
+        image_path = (
+            result.files.get("board_png")
+            or result.files.get("heatmap_png")
+            or result.files.get("characterized_heatmap_png")
+        )
         if not image_path:
             self._results_pixmap = None
             self.ui.boardImage.clear()
@@ -2493,16 +3804,80 @@ class EMIMapWizard(QtCore.QObject):
         board = getattr(self.ui, "boardImage", None)
         if obj is board and event.type() == QtCore.QEvent.Type.Resize:
             self._fit_results_image()
+            return super().eventFilter(obj, event)
+        if (
+            obj is board
+            and event.type() == QtCore.QEvent.Type.MouseButtonPress
+            and self._cube_data is not None
+        ):
+            cell = self._results_cell_from_pos(event.position() if hasattr(event, "position") else event.pos())
+            if cell is not None:
+                self.cube_pick_cell(*cell)
+            return True
         return super().eventFilter(obj, event)
+
+    def _results_cell_from_pos(self, pos):
+        if self._cube_data is None:
+            return None
+        ny, nx = np.asarray(self._cube_data["dut"]).shape[:2]
+        if nx < 1 or ny < 1:
+            return None
+        x = pos.x() if hasattr(pos, "x") else pos[0]
+        y = pos.y() if hasattr(pos, "y") else pos[1]
+        label = getattr(self.ui, "boardImage", None)
+        if label is None or not hasattr(label, "size"):
+            return None
+        width = max(label.size().width(), 1)
+        height = max(label.size().height(), 1)
+        ix = int(np.clip(x * nx / width, 0, nx - 1))
+        iy = int(np.clip((height - 1 - y) * ny / height, 0, ny - 1))
+        return iy, ix
 
     def _on_failed(self, message):
         self.ui.scanStatus.setText(message)
         QMessageBox.warning(self.ui, DIALOG_TITLE, message)
 
+    def _height_for_scan(self):
+        """Freeze the current height block into scan provenance. No Z motion."""
+        block = self._height_snapshot(self._reported_z())
+        return engine_height.apply_scan_height_preflight(block, self._scan_height_plan())
+
+    def _ensure_at_agreed_scan_plane(self):
+        """Restore once, or refuse, when a datum and requested plane exist."""
+        try:
+            plan = self._scan_height_plan()
+        except engine_height.HeightError as exc:
+            raise RuntimeError(str(exc)) from exc
+        requested = plan.requested_height_above_pcb_mm
+        if self._pcb_surface_z is None or requested is None:
+            return
+        target = engine_height.target_machine_z(self._pcb_surface_z, requested)
+        reported = self._reported_z()
+        if reported is not None and engine_height.logical_position_matches(
+            reported, target
+        ):
+            return
+        if not self.ui.chkAllowSetupZ.isChecked():
+            raise RuntimeError(
+                f"probe is not at the {requested:g} mm plane you set"
+            )
+        try:
+            self._drive_to_agreed_plane(self._printer(), required=True)
+        except engine_height.HeightError as exc:
+            raise RuntimeError(str(exc)) from exc
+        reported = self._reported_z()
+        if reported is None or not engine_height.logical_position_matches(
+            reported, target
+        ):
+            raise RuntimeError(
+                f"probe is not at the {requested:g} mm plane you set"
+            )
+
     def _on_printer_reset(self):
         """Marlin rebooted mid-scan, so the frame the landmarks were recorded in
         is gone. Without this the scan fails while the GUI still claims the
         machine is homed, which is the worst of both states."""
+        self._clear_height_datum()
         self._clear_pcb_homing()
 
     def _on_scan_ended(self):
@@ -2562,13 +3937,7 @@ class EMIMapWizard(QtCore.QObject):
         travel = getattr(self.ui, "chkTravelClearBoard", None)
         if travel is not None and hasattr(travel, "setVisible"):
             travel.setVisible(not rectangle)
-        intro = getattr(self.ui, "scanIntro", None)
-        if intro is not None:
-            intro.setText(
-                "Start scan maps the rectangle from the origin you set."
-                if rectangle
-                else "Confirm the probe height and PCB travel are clear, then Start scan."
-            )
+        self._refresh_scan_intro()
 
     def _update_header(self):
         sequence = self._sequence()
@@ -2612,6 +3981,8 @@ class EMIMapWizard(QtCore.QObject):
             self.ui.btnUpdateProfile: (
                 self._save_allowed() and bool(self._selected_profile_name())
             ),
+            self.ui.btnRotateCcw: self._board_view is not None,
+            self.ui.btnRotateCw: self._board_view is not None,
             self.ui.btnNext: (
                 position + 1 < len(self._sequence())
                 and self._next_allowed(self.ui.wizardStack.currentIndex())
@@ -2657,6 +4028,8 @@ class EMIMapWizard(QtCore.QObject):
         self._update_nav()
         if index == PAGE_REGISTER:
             self._layout_register_page()
+        if index == PAGE_SCAN:
+            self._show_cube_scan_estimate()
         if index == PAGE_RESULTS:
             self._fit_results_image()
 

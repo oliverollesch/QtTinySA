@@ -146,7 +146,11 @@ class TestDialogLayout:
         scan = next(w for w in root.iter("widget") if w.get("name") == "pageScan")
         on_scan = {w.get("name") for w in scan.iter("widget")}
         assert "chkTravelClearBoard" in on_scan
+        assert "chkRfConfirmed" in on_scan
+        assert "liveSpectrum" in on_scan
         assert "btnStartScan" in on_scan
+        rf = properties(emi_widgets["chkRfConfirmed"])["text"].find("string").text
+        assert "overload" in rf.lower()
 
     def test_no_widget_name_is_shadowed_by_the_qdialog_api(self, emi_widgets):
         # QUiLoader attaches children as attributes, so a widget called e.g.
@@ -156,11 +160,25 @@ class TestDialogLayout:
         clashes = [name for name in emi_widgets if hasattr(QDialog, name)]
         assert clashes == []
 
-    def test_no_z_controls_are_offered(self, emi_widgets):
-        # Probe height stays a hand-set, locked quantity in both modes
+    def test_no_z_homing_controls_are_offered(self, emi_widgets):
         names = " ".join(emi_widgets).lower()
         assert "zmm" not in names and "probez" not in names
         assert "homez" not in names
+        assert "grpScanHeight" in emi_widgets
+        assert "btnMoveToScanHeight" in emi_widgets
+
+    def test_measurement_chain_controls_are_explicit(self, emi_widgets):
+        assert {
+            "chkCharacterization",
+            "probeModel",
+            "probeSourceVariant",
+            "characterizedOutput",
+            "amplifierModel",
+            "cableId",
+            "cableCurvePath",
+            "characterizationRangePolicy",
+            "characterizationWarning",
+        } <= set(emi_widgets)
 
     def test_xy_homing_sits_behind_its_own_clearance_acknowledgement(self, emi_widgets):
         # PCB mode homes X and Y, which is a different hazard from the travel
@@ -172,6 +190,25 @@ class TestDialogLayout:
         assert "homing" in home.lower()
         assert "travel" in travel.lower()
         assert home != travel
+
+
+    def test_scan_selection_tools_live_on_the_board_page(self, emi_widgets):
+        root = ET.parse(EMI_UI).getroot()
+        board = next(w for w in root.iter("widget") if w.get("name") == "pageBoard")
+        register_page = next(w for w in root.iter("widget") if w.get("name") == "pageRegister")
+        on_board = {w.get("name") for w in board.iter("widget")}
+        on_register = {w.get("name") for w in register_page.iter("widget")}
+        tools = {
+            "btnScanEntireBoard",
+            "radioSelectPoint",
+            "radioSelectRect",
+            "btnUndoSelection",
+            "btnClearSelection",
+            "selectionInfo",
+            "btnOpenBoardSelector",
+        }
+        assert tools <= on_board
+        assert not tools & on_register
 
 
 class TestWidgetReferences:
@@ -202,7 +239,22 @@ class TestWidgetReferences:
             "height",
             "frameGeometry",
         }
-        declared = set(emi_widgets) | builtin
+        # Installed by EMIMapWizard._install_cube_controls on existing pages.
+        cube_runtime = {
+            "chkSpectrumCube",
+            "chkAdvanced",
+            "chkPhysicalTbwa2",
+            "lblAmplifierSurvey",
+            "backgroundHoldSweeps",
+            "cubeMapKind",
+            "cubeQuantity",
+            "cubeFreqSlider",
+            "cubeBandwidthMhz",
+            "cubeFreqLabel",
+            "cubeAnimate",
+            "cubeSpectrumLabel",
+        }
+        declared = set(emi_widgets) | builtin | cube_runtime
         assert referenced <= declared, sorted(referenced - declared)
 
 
@@ -380,12 +432,110 @@ class TestEngineConfig:
         config.validate()
         assert config.printer.set_current_xy_as_origin is False
 
-    def test_managed_z_is_rejected(self):
+    def test_managed_z_is_valid_setup_only(self):
         config = engine_config.ScanConfig(
             printer=engine_config.PrinterConfig(manage_z=True)
         )
-        with pytest.raises(ValueError):
-            config.validate()
+        config.validate()
+        assert config.printer.manage_z is True
+
+    def test_characterization_is_opt_in_after_leaving_the_cube_preset(self, wizard):
+        wizard.ui.chkSpectrumCube.setChecked(False)
+        assert wizard.build_config().measurement_chain.enabled is False
+        wizard.ui.chkCharacterization.setChecked(True)
+        wizard.ui.probeModel.setCurrentText("E5")
+        wizard.ui.characterizedOutput.setCurrentText(
+            "electric_field_dbuv_per_m"
+        )
+        wizard.ui.amplifierModel.setCurrentText("TBWA2_40")
+        chain = wizard.build_config().measurement_chain
+        assert chain.enabled is True
+        assert chain.probe == "E5"
+        assert chain.probe_source_variant == "workbook_112_5"
+        assert chain.amplifier == "TBWA2_40"
+
+    def test_h10_requires_operator_selection_of_the_conflicting_source(
+        self, wizard
+    ):
+        wizard.ui.chkSpectrumCube.setChecked(False)
+        wizard.ui.chkCharacterization.setChecked(True)
+        wizard.ui.probeModel.setCurrentText("H10")
+        wizard.ui.characterizedOutput.setCurrentText("magnetic_flux_density_t")
+        with pytest.raises(ValueError, match="H10 requires explicit"):
+            wizard.build_config()
+        wizard.ui.probeSourceVariant.setCurrentText("faq_S62")
+        assert (
+            wizard.build_config().measurement_chain.probe_source_variant
+            == "faq_S62"
+        )
+
+    def test_simple_survey_defaults_e5_tbwa2_40_and_hides_advanced(self, wizard):
+        wizard._apply_simple_survey_defaults()
+        config = wizard.build_config()
+        assert config.acquisition == "spectrum_cube"
+        assert config.measurement_chain.probe == "E5"
+        assert config.measurement_chain.amplifier == "TBWA2_40"
+        assert config.background_kind == "stationary"
+        assert config.background_mode == "delta_db"
+        assert config.area.step_mm == 2.0
+        assert getattr(wizard.ui, "chkPhysicalTbwa2") is not None
+        assert getattr(wizard.ui, "chkRfConfirmed") is not None
+        assert "TBWA2-40" in wizard.ui.lblAmplifierSurvey.text()
+        assert config.cube_start_hz == 1_000_000.0
+        assert config.cube_stop_hz == 50_000_000.0
+        assert wizard.ui.chkRfConfirmed.isChecked() is False
+        assert config.rf_configuration_confirmed is False
+        assert wizard.ui.centreMhz.visible is False
+        wizard.ui.chkAdvanced.setChecked(True)
+        assert wizard.ui.centreMhz.visible is True
+        wizard.ui.chkBackground.setChecked(True)
+        wizard.ui.backgroundMode.setCurrentText("linear_subtract")
+        advanced = wizard.build_config()
+        assert advanced.background_kind == "xy_grid"
+        assert advanced.background_mode == "linear_subtract"
+
+    def test_cube_preset_selects_tbwa2_40(self, wizard):
+        wizard.ui.chkSpectrumCube.setChecked(True)
+        config = wizard.build_config()
+        assert config.acquisition == "spectrum_cube"
+        assert config.tinysa.points == 450
+        assert config.tinysa.rbw_khz == 300.0
+        assert config.tinysa.attenuation_db == 10
+        assert config.measurement_chain.enabled is True
+        assert config.measurement_chain.probe == "E5"
+        assert config.measurement_chain.amplifier == "TBWA2_40"
+        assert config.background_kind == "stationary"
+        assert config.cube_start_hz == 1_000_000.0
+        assert config.cube_stop_hz == 50_000_000.0
+        assert wizard.ui.centreMhz.value() == 25.5
+        assert wizard.ui.spanMhz.value() == 49.0
+        wizard.ui.chkSpectrumCube.setChecked(False)
+        restored = wizard.build_config()
+        assert restored.acquisition == "single_span"
+        assert restored.tinysa.points == 101
+
+    def test_live_spectrum_callback_stores_the_latest_scanraw(self, wizard):
+        freqs = np.array([1e6, 25e6, 50e6])
+        power = np.array([-40.0, -35.0, -42.0])
+        wizard._on_spectrum({"freqs": freqs, "power_dbm": power, "label": "hold"})
+        assert wizard._live_spectrum["label"] == "hold"
+        assert wizard._live_spectrum["power_dbm"].tolist() == power.tolist()
+
+    def test_cube_pick_compares_two_cells(self, wizard, tmp_path):
+        freqs = np.array([20e6, 40e6, 57e6])
+        dut = np.full((1, 2, 3), -80.0)
+        dut[0, 0, 0] = -20.0
+        dut[0, 1, 1] = -22.0
+        wizard._cube_data = {
+            "freqs": freqs,
+            "dut": dut,
+            "dut_completed": np.array([[True, True]]),
+        }
+        wizard.ui.cubeSpectrumLabel = type("L", (), {"text": "", "setText": lambda self, t: setattr(self, "text", t)})()
+        assert wizard.cube_pick_cell(0, 0) == [(0, 0)]
+        assert wizard.cube_pick_cell(0, 1) == [(0, 0), (0, 1)]
+        assert "20.000 MHz" in wizard.ui.cubeSpectrumLabel.text
+        assert "40.000 MHz" in wizard.ui.cubeSpectrumLabel.text
 
 
 # --------------------------------------------------------------- PCB harness
@@ -477,6 +627,9 @@ class _FakeWidget:
     def isVisible(self):
         return self.visible
 
+    def setValue(self, value):
+        self._value = value
+
     def setChecked(self, checked):
         self._checked = checked
 
@@ -530,6 +683,7 @@ class _FakeMessageBox:
 class _FakePrinter:
     def __init__(self, position=(0.0, 0.0), home_error=None, xy_error=None):
         self.position = position
+        self.z = 0.0
         self.home_error = home_error
         self.xy_error = xy_error
         self.sent = []
@@ -554,9 +708,18 @@ class _FakePrinter:
             raise self.xy_error
         return self.position
 
+    def get_xyz(self):
+        if self.xy_error is not None:
+            raise self.xy_error
+        return (self.position[0], self.position[1], self.z)
+
     def move_xy(self, x_mm, y_mm):
         self.sent.append(f"G0 X{x_mm} Y{y_mm}")
         self.position = (x_mm, y_mm)
+
+    def move_z(self, z_mm):
+        self.sent.append(f"G1 Z{z_mm}")
+        self.z = z_mm
 
 
 class _CountingSerial(_MapSerial):
@@ -580,7 +743,7 @@ class _HeadlessWizard(emi_map.EMIMapWizard):
     def _setup_board_plots(self):
         pass
 
-    def _draw_board(self, plot, view):
+    def _draw_board(self, plot, view, *, preserve_camera=True):
         pass
 
     def _printer(self):
@@ -614,6 +777,8 @@ def _fake_ui():
         "rbwKhz": 0.0,
         "attenDb": -1,
         "jogStep": 1.0,
+        "heightOverrideMm": 10.0,
+        "heightGapMm": 0.0,
     }
     texts = {
         "printerPort": "COM9",
@@ -625,6 +790,13 @@ def _fake_ui():
         "metricBox": "peak",
         "spur": "auto",
         "backgroundMode": "delta_db",
+        "probeModel": "E5",
+        "probeSourceVariant": "",
+        "characterizedOutput": "electric_field_dbuv_per_m",
+        "amplifierModel": "bypass",
+        "cableId": "none",
+        "cableCurvePath": "",
+        "characterizationRangePolicy": "reject",
     }
     for name, value in numbers.items():
         setattr(ui, name, _FakeWidget(value=value))
@@ -641,6 +813,11 @@ def wizard(monkeypatch):
     _FakeMessageBox.answer = _FakeMessageBox.No
     made = _HeadlessWizard(_fake_ui(), _FakeUsbInstr([_FakeDevice()]), None)
     made.printer = _FakePrinter()
+    # Production opens in cube survey mode. Most tests still exercise the
+    # single-span PCB path, so drop the preset after construction.
+    cube = getattr(made.ui, "chkSpectrumCube", None)
+    if cube is not None:
+        cube.setChecked(False)
     return made
 
 
@@ -839,7 +1016,7 @@ def register_points(wizard, pairs, machine_origin=(60.0, 40.0)):
 def pcb_wizard(wizard):
     wizard.ui.scanMode.setCurrentText(MODE_PCB)
     wizard._board_model = board_50x30()
-    wizard._apply_board_side()
+    wizard._apply_board_view()
     return wizard
 
 
@@ -1018,7 +1195,7 @@ class TestRegistrationGates:
     def test_recording_needs_a_homed_machine(self, wizard):
         wizard.ui.scanMode.setCurrentText(MODE_PCB)
         wizard._board_model = board_50x30()
-        wizard._apply_board_side()
+        wizard._apply_board_view()
         wizard._select_landmark(0.0, 0.0)
         wizard._record_landmark()
         assert wizard._landmarks == []
@@ -1039,13 +1216,42 @@ class TestInvalidationCascade:
         plan = pcb_wizard._build_validated_plan(pcb_wizard.build_config())
         assert plan is pcb_wizard._plan
         pcb_wizard.ui.boardSide.setCurrentText("bottom")
-        pcb_wizard._apply_board_side()
+        pcb_wizard._apply_board_view()
         assert pcb_wizard._board_view.side == "bottom"
         assert pcb_wizard._landmarks == []
         assert pcb_wizard._registration is None
         assert pcb_wizard._plan is None
         # Flipping the board does not move the Ender's frame
         assert pcb_wizard._pcb_xy_homed is True
+
+    def test_rotating_the_board_clears_the_fit_but_keeps_homing(self, pcb_wizard):
+        register(pcb_wizard)
+        pcb_wizard._build_validated_plan(pcb_wizard.build_config())
+        pcb_wizard._rotate_board(90)
+        assert pcb_wizard._board_view.rotation_deg == 90
+        assert pcb_wizard._landmarks == []
+        assert pcb_wizard._registration is None
+        assert pcb_wizard._plan is None
+        assert pcb_wizard._pcb_xy_homed is True
+
+    def test_reapplying_the_same_view_keeps_landmarks(self, pcb_wizard):
+        register(pcb_wizard)
+        pcb_wizard._apply_board_view()
+        assert len(pcb_wizard._landmarks) == 2
+        assert pcb_wizard._registration is not None
+
+    def test_rotate_buttons_are_disabled_without_a_board(self, wizard):
+        wizard._update_nav()
+        assert not wizard.ui.btnRotateCcw.isEnabled()
+        assert not wizard.ui.btnRotateCw.isEnabled()
+        wizard._board_model = board_50x30()
+        wizard._apply_board_view()
+        assert wizard.ui.btnRotateCcw.isEnabled()
+        assert wizard.ui.btnRotateCw.isEnabled()
+
+    def test_rotate_before_import_is_a_noop(self, wizard):
+        wizard._rotate_board(90)
+        assert wizard._board_view is None
 
     def test_changing_the_step_drops_the_plan_but_keeps_the_landmarks(self, pcb_wizard):
         register(pcb_wizard)
@@ -1179,6 +1385,34 @@ class TestAnalyserBorrowedLast:
         pcb_wizard._update_nav()
         assert pcb_wizard.ui.btnStartScan.isEnabled() is True
         assert pcb_wizard.ui.scanStatus.text() == "Ready to scan."
+
+    def test_cube_start_stays_off_until_the_rf_chain_is_confirmed(self, pcb_wizard):
+        pcb_wizard.ui.chkSpectrumCube.setChecked(True)
+        register(pcb_wizard)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SCAN)
+        pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
+        pcb_wizard._update_nav()
+        assert pcb_wizard.ui.btnStartScan.isEnabled() is False
+        reason = pcb_wizard.ui.scanStatus.text().lower()
+        assert "overload" in reason
+        assert pcb_wizard.build_config().rf_configuration_confirmed is False
+        pcb_wizard.ui.chkRfConfirmed.setChecked(True)
+        pcb_wizard._update_nav()
+        assert pcb_wizard.ui.btnStartScan.isEnabled() is True
+        assert pcb_wizard.build_config().rf_configuration_confirmed is True
+        assert pcb_wizard.ui.scanStatus.text() == "Ready to scan."
+
+    def test_cube_start_does_not_take_the_analyser_without_rf_confirm(
+        self, pcb_wizard
+    ):
+        pcb_wizard.ui.chkSpectrumCube.setChecked(True)
+        register(pcb_wizard)
+        pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
+        wizard = self._armed(pcb_wizard)
+        wizard._start_scan()
+        assert wizard.serial.take_calls == 0
+        assert wizard.thread is None
+        assert any("overload" in text.lower() for text in _FakeMessageBox.warnings)
 
     def test_a_refused_start_is_written_on_the_scan_page(self, pcb_wizard):
         register(pcb_wizard)
@@ -1379,6 +1613,117 @@ class TestExactClickSelection:
         assert pcb_wizard._selected_landmark is None
 
 
+class TestBoardScanSelection:
+    """Board-page ROI/point subset vs entire-board. Register clicks stay landmarks."""
+
+    def test_default_is_the_entire_board(self, pcb_wizard):
+        assert pcb_wizard._scan_selection is None
+        register(pcb_wizard)
+        plan = pcb_wizard._build_validated_plan(pcb_wizard.build_config())
+        assert plan.point_count == 24
+        assert plan.selection is None
+
+    def test_point_tool_without_a_click_cannot_start(self, pcb_wizard):
+        pcb_wizard._on_point_tool_toggled(True)
+        assert pcb_wizard._scan_selection is not None
+        assert pcb_wizard._scan_selection.items == ()
+        register(pcb_wizard)
+        pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
+        reason = pcb_wizard._scan_block_reason()
+        assert "entire board" in reason.lower()
+
+    def test_clear_does_not_become_a_full_board_scan(self, pcb_wizard):
+        pcb_wizard._add_selection_point(12.0, 8.0)
+        pcb_wizard._clear_scan_selection()
+        assert pcb_wizard._scan_selection is not None
+        assert pcb_wizard._scan_selection.items == ()
+        register(pcb_wizard)
+        pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
+        reason = pcb_wizard._scan_block_reason()
+        assert reason
+        assert "entire board" in reason.lower()
+        with pytest.raises(ValueError, match="scan selection is empty"):
+            pcb_wizard._build_validated_plan(pcb_wizard.build_config())
+
+    def test_scan_entire_board_restores_full_coverage(self, pcb_wizard):
+        pcb_wizard._clear_scan_selection()
+        pcb_wizard._scan_entire_board()
+        assert pcb_wizard._scan_selection is None
+        register(pcb_wizard)
+        plan = pcb_wizard._build_validated_plan(pcb_wizard.build_config())
+        assert plan.point_count == 24
+        assert plan.selection is None
+        assert "entire board" in pcb_wizard.ui.selectionInfo.text().lower()
+
+    def test_a_point_shrinks_the_plan_and_keeps_the_click(self, pcb_wizard):
+        pcb_wizard._add_selection_point(12.0, 8.0)
+        register(pcb_wizard)
+        plan = pcb_wizard._build_validated_plan(pcb_wizard.build_config())
+        assert plan.point_count == 1
+        stored = plan.selection.items[0]
+        assert (stored.x, stored.y) == (12.0, 8.0)
+        assert "1 selected cell" in pcb_wizard._grid_summary()
+
+    def test_undo_drops_the_last_item(self, pcb_wizard):
+        pcb_wizard._add_selection_point(12.0, 8.0)
+        pcb_wizard._add_selection_roi(0.0, 20.0, 0.0, 20.0)
+        pcb_wizard._undo_scan_selection()
+        assert len(pcb_wizard._scan_selection.items) == 1
+        assert isinstance(
+            pcb_wizard._scan_selection.items[0], emi_map.engine_selection.BoardPoint
+        )
+
+    def test_a_click_just_outside_the_outline_is_a_miss(self, pcb_wizard):
+        assert pcb_wizard._add_selection_point(-0.1, 15.0) is False
+        assert pcb_wizard._scan_selection is None
+
+    def test_side_change_returns_to_the_entire_board(self, pcb_wizard):
+        pcb_wizard._add_selection_point(12.0, 8.0)
+        pcb_wizard.ui.boardSide.setCurrentText("bottom")
+        pcb_wizard._apply_board_view()
+        assert pcb_wizard._scan_selection is None
+
+    def test_same_side_rotate_keeps_the_point_on_the_same_copper(self, pcb_wizard):
+        pcb_wizard._add_selection_point(35.0, 15.0)
+        pcb_wizard._rotate_board(90)
+        point = pcb_wizard._scan_selection.items[0]
+        assert point.x == pytest.approx(25.0)
+        assert point.y == pytest.approx(25.0)
+        assert point.name == "Point 1"
+
+    def test_step_change_re_snaps_without_rewriting_the_click(self, pcb_wizard):
+        pcb_wizard._add_selection_point(12.0, 8.0)
+        pcb_wizard.ui.stepMm.setValue(5.0)
+        pcb_wizard._on_area_changed()
+        point = pcb_wizard._scan_selection.items[0]
+        assert (point.x, point.y) == (12.0, 8.0)
+        assert pcb_wizard._selected_cell_count() == 1
+
+    def test_register_clicks_stay_landmarks(self, pcb_wizard):
+        pcb_wizard._on_point_tool_toggled(True)
+        pcb_wizard._select_landmark(1.0, 1.5)
+        assert pcb_wizard._selected_landmark[1:] == (0.0, 0.0)
+        assert pcb_wizard._scan_selection.items == ()
+        assert len(pcb_wizard._landmarks) == 0
+
+    def test_selection_status_names_the_last_roi(self, pcb_wizard):
+        pcb_wizard._add_selection_roi(10.0, 20.0, 5.0, 15.0)
+        text = pcb_wizard.ui.selectionInfo.text()
+        assert "ROI 1" in text
+        assert "10.0" in text and "20.0" in text
+        assert "selected cells" in text
+
+    def test_opening_the_selector_without_a_board_warns(self, wizard):
+        wizard._open_board_selector()
+        assert _FakeMessageBox.warnings
+        assert "board" in _FakeMessageBox.warnings[-1].lower()
+
+    def test_the_embedded_plot_and_the_dialog_share_one_editor(self, pcb_wizard):
+        pcb_wizard._add_selection_point(12.0, 8.0)
+        assert pcb_wizard._selector.selection is pcb_wizard._scan_selection
+        assert pcb_wizard._selector.board_view is pcb_wizard._board_view
+
+
 class TestClickToMove:
     def test_the_target_is_previewed_in_machine_coordinates(self, pcb_wizard):
         register(pcb_wizard)
@@ -1465,7 +1810,7 @@ class TestProfileRoundTrip:
         save_current(pcb_wizard)
         # The same board, flipped: a saved top-side transform cannot describe it
         pcb_wizard.ui.boardSide.setCurrentText("bottom")
-        pcb_wizard._apply_board_side()
+        pcb_wizard._apply_board_view()
         register(pcb_wizard)
         kept = pcb_wizard._registration
         load_saved(pcb_wizard)
@@ -1611,7 +1956,7 @@ class TestStaleConfirmation:
     def test_flipping_the_side_drops_the_whole_profile(self, pcb_wizard, profile_home):
         prepared_profile(pcb_wizard)
         pcb_wizard.ui.boardSide.setCurrentText("bottom")
-        pcb_wizard._apply_board_side()
+        pcb_wizard._apply_board_view()
         assert pcb_wizard._profile is None
         assert pcb_wizard._verified_points == []
 
@@ -1881,13 +2226,13 @@ class TestIdentityAcknowledgement:
     ):
         declare_identity(pcb_wizard)
         pcb_wizard._board_model = board_50x30(sha="a" * 64)
-        pcb_wizard._apply_board_side()
+        pcb_wizard._apply_board_view()
         register(pcb_wizard)
         save_current(pcb_wizard)
         # Same outline, a different archive: the transform is still correct, and
         # refusing here would cost a full manual registration for nothing
         pcb_wizard._board_model = board_50x30(sha="b" * 64)
-        pcb_wizard._apply_board_side()
+        pcb_wizard._apply_board_view()
         register(pcb_wizard)
         pcb_wizard._clear_landmarks_and_alignment()
 
@@ -2041,6 +2386,33 @@ class TestResultsOverview:
         assert "EMI_Scans" in text
         assert "heatmap.png" in text
 
+    def test_overview_includes_the_agreed_probe_height(self):
+        result = _scan_result()
+        result.snapshot["height"] = {
+            "requested_height_above_pcb_mm": 6.0,
+            "reported_height_above_pcb_mm": 6.0,
+            "source": "operator_override",
+        }
+        text = emi_map.results_overview(result)
+        assert "Probe height: 6 mm above PCB (operator override)" in text
+        assert "reported 6 mm" in text
+
+    def test_overview_labels_characterization_as_diagnostic(self):
+        result = _scan_result(
+            characterization={
+                "output_quantity": "electric_field_dbuv_per_m",
+                "output_units": "dBµV/m",
+                "receiver_processing_mode": "linear_subtract_background",
+                "characterized_peak_electric_field_dbuv_per_m": np.array(
+                    [[48.25]]
+                ),
+            }
+        )
+        text = emi_map.results_overview(result)
+        assert "48.25 dBµV/m" in text
+        assert "linear_subtract_background" in text
+        assert "not EMC compliance" in text
+
     def test_overview_does_not_dump_low_level_instrument_keys(self):
         text = emi_map.results_overview(_scan_result())
         assert "serial_baud" not in text
@@ -2053,3 +2425,203 @@ class TestResultsOverview:
         assert "Scan complete" in wizard.ui.resultsBanner.text()
         assert "tinySA Ultra" in wizard.ui.resultsSummary.text()
         assert "24 measured cells" in wizard.ui.resultsSummary.text()
+
+
+def _board_with_height(height_mm=8.0):
+    return engine_board.rectangular_board(
+        50.0,
+        30.0,
+        components=(
+            engine_board.Component(
+                refdes="U1", x_mm=10.0, y_mm=10.0, side="top", height_mm=height_mm
+            ),
+        ),
+    )
+
+
+def _agree_six_mm_plane(wizard, *, allow_z=True, surface_z=2.0):
+    """Board-page 6 mm override plus a surface datum.
+
+    Tallest listed part is 4 mm so 6 mm is legal but below CAD+clearance (7 mm).
+    """
+    wizard._board_model = _board_with_height(4.0)
+    wizard._apply_board_view()
+    wizard.ui.chkHeightOverride.setChecked(True)
+    wizard.ui.heightOverrideMm.setValue(6.0)
+    wizard._apply_height_override()
+    wizard.ui.chkHeightReference.setChecked(True)
+    if allow_z:
+        wizard.ui.chkAllowSetupZ.setChecked(True)
+        wizard.ui.chkHeightClearance.setChecked(True)
+    wizard.printer.z = surface_z
+    wizard._set_pcb_surface()
+
+
+def _scan_gcode_has_z(commands):
+    for command in commands:
+        if not command.upper().startswith(("G0", "G1")):
+            continue
+        for token in command.split():
+            if token.upper().startswith("Z"):
+                return True
+    return False
+
+
+class TestScanHeightBoardPage:
+    def test_cad_recommendation_comes_from_the_engine(self, pcb_wizard):
+        pcb_wizard._board_model = _board_with_height(8.0)
+        pcb_wizard._apply_board_view()
+        text = pcb_wizard.ui.heightCadLabel.text()
+        assert "U1" in text
+        assert "8.00" in text
+        assert "11.00" in text
+
+    def test_override_below_tallest_is_rejected(self, pcb_wizard):
+        pcb_wizard._board_model = _board_with_height(8.0)
+        pcb_wizard._apply_board_view()
+        pcb_wizard.ui.chkHeightOverride.setChecked(True)
+        pcb_wizard.ui.heightOverrideMm.setValue(4.0)
+        pcb_wizard._apply_height_override()
+        assert pcb_wizard._height_override_mm is None
+        assert _FakeMessageBox.warnings
+
+    def test_surface_and_move_to_scan_height_call_the_engine(self, pcb_wizard):
+        pcb_wizard._board_model = _board_with_height(8.0)
+        pcb_wizard._apply_board_view()
+        pcb_wizard.ui.chkAllowSetupZ.setChecked(True)
+        pcb_wizard.ui.chkHeightReference.setChecked(True)
+        pcb_wizard.ui.chkHeightClearance.setChecked(True)
+        pcb_wizard.printer.z = 2.0
+        pcb_wizard._set_pcb_surface()
+        assert pcb_wizard._pcb_surface_z == pytest.approx(2.0)
+        pcb_wizard._move_to_scan_height()
+        assert pcb_wizard.printer.z == pytest.approx(13.0)
+        assert pcb_wizard.ui.chkAtScanPlane.isChecked()
+        assert any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_software_rotation_keeps_the_datum(self, pcb_wizard):
+        pcb_wizard.ui.chkHeightReference.setChecked(True)
+        pcb_wizard.printer.z = 5.0
+        pcb_wizard._set_pcb_surface()
+        pcb_wizard._rotate_board(90)
+        assert pcb_wizard._pcb_surface_z == pytest.approx(5.0)
+
+    def test_physical_reseat_clears_the_datum(self, pcb_wizard):
+        pcb_wizard.ui.chkHeightReference.setChecked(True)
+        pcb_wizard._set_pcb_surface()
+        pcb_wizard.ui.chkBoardReseated.setChecked(True)
+        pcb_wizard._confirm_board_reseated()
+        assert pcb_wizard._pcb_surface_z is None
+
+    def test_allow_setup_z_reaches_printer_config(self, pcb_wizard):
+        assert pcb_wizard._printer_config().manage_z is False
+        pcb_wizard.ui.chkAllowSetupZ.setChecked(True)
+        assert pcb_wizard._printer_config().manage_z is True
+
+    def test_scan_drops_xy_holding_then_settles(self, wizard):
+        printer = wizard._printer_config()
+        assert printer.disable_steppers_during_measure is True
+        assert printer.disable_stepper_axes == "XY"
+        assert printer.settle_s == pytest.approx(0.2)
+
+    def test_applied_override_stays_after_unchecking_the_box(self, pcb_wizard):
+        _agree_six_mm_plane(pcb_wizard)
+        pcb_wizard.ui.chkHeightOverride.setChecked(False)
+        plan = pcb_wizard._scan_height_plan()
+        assert plan.requested_height_above_pcb_mm == pytest.approx(6.0)
+        assert plan.source == "operator_override"
+        pcb_wizard._move_to_scan_height()
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+        assert not any(
+            cmd.startswith("G1 Z9") for cmd in pcb_wizard.printer.sent
+        )
+
+    def test_move_uses_the_spinbox_when_override_is_checked(self, pcb_wizard):
+        pcb_wizard._board_model = _board_with_height(4.0)
+        pcb_wizard._apply_board_view()
+        pcb_wizard.ui.chkAllowSetupZ.setChecked(True)
+        pcb_wizard.ui.chkHeightClearance.setChecked(True)
+        pcb_wizard.ui.chkHeightReference.setChecked(True)
+        pcb_wizard.printer.z = 2.0
+        pcb_wizard._set_pcb_surface()
+        pcb_wizard.ui.chkHeightOverride.setChecked(True)
+        pcb_wizard.ui.heightOverrideMm.setValue(6.0)
+        pcb_wizard._move_to_scan_height()
+        assert pcb_wizard._height_override_mm == pytest.approx(6.0)
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+
+    def test_invalid_override_does_not_fall_back_to_cad(self, pcb_wizard):
+        pcb_wizard._board_model = _board_with_height(8.0)
+        pcb_wizard._apply_board_view()
+        pcb_wizard._height_override_mm = 4.0
+        with pytest.raises(emi_map.engine_height.HeightError, match="below the tallest"):
+            pcb_wizard._scan_height_plan()
+        pcb_wizard.ui.chkAllowSetupZ.setChecked(True)
+        pcb_wizard.ui.chkHeightClearance.setChecked(True)
+        pcb_wizard.ui.chkHeightReference.setChecked(True)
+        pcb_wizard.printer.z = 2.0
+        pcb_wizard._set_pcb_surface()
+        pcb_wizard._move_to_scan_height()
+        assert pcb_wizard.printer.z == pytest.approx(2.0)
+        assert not any(cmd.startswith("G1 Z13") for cmd in pcb_wizard.printer.sent)
+
+    def test_home_xy_restores_the_agreed_plane(self, pcb_wizard):
+        _agree_six_mm_plane(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+
+        def home_xy():
+            pcb_wizard.printer.sent.append("G28 X Y")
+            pcb_wizard.printer.position = (0.0, 0.0)
+            pcb_wizard.printer.z = 20.0
+
+        pcb_wizard.printer.home_xy = home_xy
+        pcb_wizard._home_xy()
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+        assert any(cmd.startswith("G28") for cmd in pcb_wizard.printer.sent)
+        assert any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_start_refuses_when_not_at_the_agreed_plane(self, pcb_wizard):
+        _agree_six_mm_plane(pcb_wizard, allow_z=False)
+        register(pcb_wizard)
+        pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
+        with pytest.raises(RuntimeError, match="not at the 6 mm plane you set"):
+            pcb_wizard._pcb_preflight()
+
+    def test_start_restores_the_agreed_plane_once(self, pcb_wizard):
+        _agree_six_mm_plane(pcb_wizard, allow_z=False)
+        register(pcb_wizard)
+        pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
+        pcb_wizard.ui.chkAllowSetupZ.setChecked(True)
+        pcb_wizard.ui.chkHeightClearance.setChecked(True)
+        pcb_wizard._pcb_preflight()
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+
+    def test_start_scan_snapshot_keeps_six_mm_and_scan_stays_xy_only(
+        self, pcb_wizard, tmp_path
+    ):
+        from EMI_Mapper import fakes
+
+        _agree_six_mm_plane(pcb_wizard)
+        pcb_wizard.ui.chkHeightOverride.setChecked(False)
+        register(pcb_wizard)
+        pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
+        pcb_wizard.ui.outputRoot._text = str(tmp_path)
+
+        config = pcb_wizard.build_config()
+        plan = pcb_wizard._preflight(config)
+        height = pcb_wizard._height_for_scan()
+        assert height["requested_height_above_pcb_mm"] == pytest.approx(6.0)
+        assert height["source"] == "operator_override"
+
+        printer = fakes.FakePrinterTransport()
+        result = engine_scanner.run_scan(
+            config,
+            tinysa_transport=fakes.FakeTinySATransport(config.tinysa),
+            printer_transport=printer,
+            plan=plan,
+            height=height,
+        )
+        assert result.snapshot["height"]["requested_height_above_pcb_mm"] == pytest.approx(
+            6.0
+        )
+        assert not _scan_gcode_has_z(printer.commands)

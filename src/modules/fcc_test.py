@@ -86,19 +86,9 @@ def _as_emc_result(actual, E, dbuv, scalar: bool):
 
 
 def compute_emc_tekbox(freq_hz, data2_dbm, amp_gain_db: float = 40.0):
-    freq_hz = np.asarray(freq_hz, dtype=float)
-    data2_dbm = np.asarray(data2_dbm, dtype=float)
-    scalar = freq_hz.ndim == 0
-    actual = data2_dbm - amp_gain_db
-    freq_mhz = freq_hz / 1e6
-    with np.errstate(divide="ignore", invalid="ignore"):
-        E = np.where(
-            freq_mhz > 0,
-            1e6 * 10 ** ((actual + 112.5 - 20.0 * np.log10(freq_mhz)) / 20.0),
-            np.nan,
-        )
-        dbuv = np.where(E > 0, 20.0 * np.log10(E), np.nan)
-    return _as_emc_result(actual, E, dbuv, scalar)
+    from EMI_Mapper.measurement_chain import characterize_e5_constant_gain
+
+    return characterize_e5_constant_gain(freq_hz, data2_dbm, amp_gain_db)
 
 
 def compute_emc_schwarzbeck(freq_hz, data2_dbm, ant_factor: float):

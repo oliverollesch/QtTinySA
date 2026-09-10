@@ -78,7 +78,7 @@
        <item>
         <widget class="QLabel" name="setupIntro">
          <property name="text">
-          <string>Mount the H-field probe on the X carriage and put the DUT on a non-conductive spacer. The scan moves X and Y only: probe height is set by hand and Z is never commanded.</string>
+          <string>Mount the H-field probe on the X carriage and put the DUT on a non-conductive spacer. The scan moves X and Y only. Optional setup Z on the Board page parks the probe at one constant plane; the scan loop never commands Z.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -468,6 +468,118 @@
         </widget>
        </item>
        <item>
+        <widget class="QGroupBox" name="grpCharacterization">
+         <property name="title">
+          <string>Measurement-chain characterization (optional)</string>
+         </property>
+         <layout class="QFormLayout" name="characterizationForm">
+          <item row="0" column="1">
+           <widget class="QCheckBox" name="chkCharacterization">
+            <property name="text">
+             <string>Generate setup-dependent characterized maps</string>
+            </property>
+            <property name="toolTip">
+             <string>Manufacturer characterization only; not an absolute EMC compliance measurement.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="lblProbeModel">
+            <property name="text"><string>Probe</string></property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QComboBox" name="probeModel">
+            <item><property name="text"><string>E5</string></property></item>
+            <item><property name="text"><string>H20</string></property></item>
+            <item><property name="text"><string>H10</string></property></item>
+            <item><property name="text"><string>H5</string></property></item>
+           </widget>
+          </item>
+          <item row="2" column="0">
+           <widget class="QLabel" name="lblProbeSourceVariant">
+            <property name="text"><string>H10 source</string></property>
+           </widget>
+          </item>
+          <item row="2" column="1">
+           <widget class="QComboBox" name="probeSourceVariant">
+            <item><property name="text"><string/></property></item>
+            <item><property name="text"><string>workbook_S63</string></property></item>
+            <item><property name="text"><string>faq_S62</string></property></item>
+           </widget>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="lblCharacterizedOutput">
+            <property name="text"><string>Output quantity</string></property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QComboBox" name="characterizedOutput">
+            <item><property name="text"><string>electric_field_dbuv_per_m</string></property></item>
+            <item><property name="text"><string>electric_field_v_per_m</string></property></item>
+            <item><property name="text"><string>magnetic_flux_density_t</string></property></item>
+            <item><property name="text"><string>rf_current_dbua</string></property></item>
+            <item><property name="text"><string>rf_current_a</string></property></item>
+           </widget>
+          </item>
+          <item row="4" column="0">
+           <widget class="QLabel" name="lblAmplifierModel">
+            <property name="text"><string>External amplifier</string></property>
+           </widget>
+          </item>
+          <item row="4" column="1">
+           <widget class="QComboBox" name="amplifierModel">
+            <item><property name="text"><string>bypass</string></property></item>
+            <item><property name="text"><string>TBWA2_20</string></property></item>
+            <item><property name="text"><string>TBWA2_40</string></property></item>
+           </widget>
+          </item>
+          <item row="5" column="0">
+           <widget class="QLabel" name="lblCableId">
+            <property name="text"><string>Additional cable ID</string></property>
+           </widget>
+          </item>
+          <item row="5" column="1">
+           <widget class="QLineEdit" name="cableId">
+            <property name="text"><string>none</string></property>
+            <property name="toolTip">
+             <string>The supplied probe characterization already includes its 75 cm RG316U cable.</string>
+            </property>
+           </widget>
+          </item>
+          <item row="6" column="0">
+           <widget class="QLabel" name="lblCableCurvePath">
+            <property name="text"><string>Additional cable loss CSV</string></property>
+           </widget>
+          </item>
+          <item row="6" column="1">
+           <widget class="QLineEdit" name="cableCurvePath">
+            <property name="placeholderText"><string>frequency_hz,loss_db (blank for none)</string></property>
+           </widget>
+          </item>
+          <item row="7" column="0">
+           <widget class="QLabel" name="lblRangePolicy">
+            <property name="text"><string>Out-of-range bins</string></property>
+           </widget>
+          </item>
+          <item row="7" column="1">
+           <widget class="QComboBox" name="characterizationRangePolicy">
+            <item><property name="text"><string>reject</string></property></item>
+            <item><property name="text"><string>flag</string></property></item>
+           </widget>
+          </item>
+          <item row="8" column="0" colspan="2">
+           <widget class="QLabel" name="characterizationWarning">
+            <property name="text">
+             <string>Raw dBm is always retained. Characterized output is diagnostic only, not EMC compliance data.</string>
+            </property>
+            <property name="wordWrap"><bool>true</bool></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
         <widget class="QGroupBox" name="grpOutput">
          <property name="title">
           <string>Output</string>
@@ -611,6 +723,27 @@
            </item>
           </widget>
          </item>
+         <item>
+          <widget class="QPushButton" name="btnRotateCcw">
+           <property name="text">
+            <string>Rotate 90° CCW</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="btnRotateCw">
+           <property name="text">
+            <string>Rotate 90° CW</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="boardRotation">
+           <property name="text">
+            <string>0°</string>
+           </property>
+          </widget>
+         </item>
         </layout>
        </item>
        <item>
@@ -640,14 +773,343 @@
         </widget>
        </item>
        <item>
-        <widget class="PlotWidget" name="boardPlot" native="true">
+        <widget class="QGroupBox" name="grpScanHeight">
+         <property name="title">
+          <string>Probe height (constant scan plane)</string>
+         </property>
          <property name="sizePolicy">
-          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-           <horstretch>1</horstretch>
-           <verstretch>1</verstretch>
+          <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
           </sizepolicy>
          </property>
+         <layout class="QVBoxLayout" name="scanHeightLayout">
+          <property name="spacing">
+           <number>4</number>
+          </property>
+          <item>
+           <widget class="QLabel" name="heightCadLabel">
+            <property name="text">
+             <string>1. CAD recommendation: import a board to see the tallest listed part.</string>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="heightOverrideRow">
+            <item>
+             <widget class="QCheckBox" name="chkHeightOverride">
+              <property name="text">
+               <string>Override plane (mm above PCB)</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QDoubleSpinBox" name="heightOverrideMm">
+              <property name="decimals">
+               <number>2</number>
+              </property>
+              <property name="minimum">
+               <double>0</double>
+              </property>
+              <property name="maximum">
+               <double>80</double>
+              </property>
+              <property name="value">
+               <double>10</double>
+              </property>
+              <property name="suffix">
+               <string> mm</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnApplyHeightOverride">
+              <property name="text">
+               <string>Apply</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QLabel" name="heightSurfaceLabel">
+            <property name="text">
+             <string>2. PCB surface: park over a component-free area, then set the datum.</string>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="heightSurfaceRow">
+            <item>
+             <widget class="QLabel" name="lblHeightGap">
+              <property name="text">
+               <string>Reference gap</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QDoubleSpinBox" name="heightGapMm">
+              <property name="decimals">
+               <number>2</number>
+              </property>
+              <property name="minimum">
+               <double>0</double>
+              </property>
+              <property name="maximum">
+               <double>20</double>
+              </property>
+              <property name="suffix">
+               <string> mm</string>
+              </property>
+              <property name="toolTip">
+               <string>Known shim or gauge thickness. Surface = reported Z minus this gap. No copper contact required.</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="chkHeightReference">
+              <property name="text">
+               <string>Over a component-free area</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnSetPcbSurface">
+              <property name="text">
+               <string>Set PCB surface</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QLabel" name="heightPositionLabel">
+            <property name="text">
+             <string>3. Probe position: reported height is Marlin's logical Z, not a physical measurement.</string>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="heightMoveRow">
+            <item>
+             <widget class="QCheckBox" name="chkAllowSetupZ">
+              <property name="text">
+               <string>Allow setup Z</string>
+              </property>
+              <property name="toolTip">
+               <string>Unlocks setup-only Z motion. The scan loop stays XY-only either way.</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnJogZUp">
+              <property name="text">
+               <string>+Z</string>
+              </property>
+              <property name="enabled">
+               <bool>false</bool>
+              </property>
+              <property name="toolTip">
+               <string>Jog away from the PCB by the current jog step.</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnJogZDown">
+              <property name="text">
+               <string>−Z</string>
+              </property>
+              <property name="enabled">
+               <bool>false</bool>
+              </property>
+              <property name="toolTip">
+               <string>Jog toward the PCB by the current jog step. Requires clearance confirmation.</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="chkHeightClearance">
+              <property name="text">
+               <string>Clear toward PCB</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnMoveToScanHeight">
+              <property name="text">
+               <string>Move to scan height</string>
+              </property>
+              <property name="enabled">
+               <bool>false</bool>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="heightStatusRow">
+            <item>
+             <widget class="QCheckBox" name="chkAtScanPlane">
+              <property name="text">
+               <string>Reported Z matches requested scan plane</string>
+              </property>
+              <property name="enabled">
+               <bool>false</bool>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="chkBoardReseated">
+              <property name="text">
+               <string>Board flipped or reseated</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnBoardReseated">
+              <property name="text">
+               <string>Clear datum</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+         </layout>
         </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="grpScanSelection">
+         <property name="title">
+          <string>Where to measure</string>
+         </property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <layout class="QVBoxLayout" name="scanSelectionLayout">
+          <property name="spacing">
+           <number>4</number>
+          </property>
+          <item>
+           <layout class="QHBoxLayout" name="selectionToolLayout">
+            <item>
+             <widget class="QPushButton" name="btnScanEntireBoard">
+              <property name="text">
+               <string>Scan entire board</string>
+              </property>
+              <property name="toolTip">
+               <string>Measure every on-board cell. This is the default, and the only way to restore a full-board scan after Clear.</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QRadioButton" name="radioSelectPoint">
+              <property name="text">
+               <string>Point</string>
+              </property>
+              <property name="autoExclusive">
+               <bool>false</bool>
+              </property>
+              <property name="toolTip">
+               <string>Open the large board selector, then click to measure the nearest on-board grid cell.</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QRadioButton" name="radioSelectRect">
+              <property name="text">
+               <string>Rectangle</string>
+              </property>
+              <property name="autoExclusive">
+               <bool>false</bool>
+              </property>
+              <property name="toolTip">
+               <string>Open the large board selector, then drag a rectangle. Only on-board cells inside it are measured.</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnUndoSelection">
+              <property name="text">
+               <string>Undo last</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPushButton" name="btnClearSelection">
+              <property name="text">
+               <string>Clear</string>
+              </property>
+              <property name="toolTip">
+               <string>Forget every region and point. Start stays blocked until you add a selection or click Scan entire board.</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="boardSelectorLaunchLayout">
+            <item>
+             <widget class="QPushButton" name="btnOpenBoardSelector">
+              <property name="text">
+               <string>Open large board selector…</string>
+              </property>
+              <property name="toolTip">
+               <string>Edit the scan area in a large window. Apply commits; Cancel leaves the current selection unchanged.</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <spacer name="boardSelectorLaunchSpacer">
+              <property name="orientation">
+               <enum>Qt::Horizontal</enum>
+              </property>
+              <property name="sizeHint" stdset="0">
+               <size>
+                <width>40</width>
+                <height>20</height>
+               </size>
+              </property>
+             </spacer>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QLabel" name="selectionInfo">
+            <property name="text">
+             <string>Scanning the entire board.</string>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <spacer name="boardPageBottomSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>12</height>
+          </size>
+         </property>
+        </spacer>
        </item>
       </layout>
      </widget>
@@ -1266,11 +1728,11 @@ To scan a board: Back, set Scan mode to PCB aligned, then Next. That path is Set
      </widget>
      <!-- Page 4: Scan -->
      <widget class="QWidget" name="pageScan">
-      <layout class="QVBoxLayout" name="scanLayout">
+      <layout class="QVBoxLayout" name="scanLayout" stretch="0,0,0,0,0,0,1,1">
        <item>
         <widget class="QLabel" name="scanIntro">
          <property name="text">
-          <string>Confirm the probe height and PCB travel are clear, then Start scan.</string>
+          <string>Confirm the probe height, PCB travel, and RF chain, then Start scan.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -1283,7 +1745,17 @@ To scan a board: Back, set Scan mode to PCB aligned, then Next. That path is Set
           <string>Probe height and PCB travel are clear</string>
          </property>
          <property name="toolTip">
-          <string>Required before a PCB-aligned scan. The probe will traverse the whole board; Z is never commanded.</string>
+          <string>Required before a PCB-aligned scan. The probe will traverse the whole board. Scan motion is X and Y only.</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="chkRfConfirmed">
+         <property name="text">
+          <string>RF chain reviewed (no firmware overload flag)</string>
+         </property>
+         <property name="toolTip">
+          <string>Required for the spectrum cube on firmware without an overload USB command. Tick after checking the probe, TBWA2, and TinySA attenuation. This does not prove the receiver is not overloaded.</string>
          </property>
         </widget>
        </item>
@@ -1345,6 +1817,25 @@ To scan a board: Back, set Scan mode to PCB aligned, then Next. That path is Set
            <horstretch>1</horstretch>
            <verstretch>1</verstretch>
           </sizepolicy>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="PlotWidget" name="liveSpectrum" native="true">
+         <property name="toolTip">
+          <string>Live USB scanraw. The TinySA LCD does not redraw during scanraw.</string>
+         </property>
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+           <horstretch>1</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>120</height>
+          </size>
          </property>
         </widget>
        </item>
