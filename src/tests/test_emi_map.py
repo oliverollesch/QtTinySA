@@ -27,7 +27,10 @@ from modules.emi_map import (  # noqa: E402
     MODE_PAGES,
     MODE_PCB,
     MODE_RECTANGLE,
+    OPERATOR_MODE_ADVANCED,
+    OPERATOR_MODE_EASY,
     PAGE_BOARD,
+    PAGE_EASY_HEIGHT,
     PAGE_ORIGIN,
     PAGE_REGISTER,
     PAGE_RESULTS,
@@ -231,6 +234,7 @@ class TestWidgetReferences:
             "hide",
             "rejected",
             "setEnabled",
+            "layout",
             "screen",
             "resize",
             "move",
@@ -254,7 +258,27 @@ class TestWidgetReferences:
             "cubeAnimate",
             "cubeSpectrumLabel",
         }
-        declared = set(emi_widgets) | builtin | cube_runtime
+        easy_runtime = {
+            "operatorMode",
+            "pageEasyHeight",
+            "grpEasyHeight",
+            "easyJogStep",
+            "easyStatusLabel",
+            "easyHeightLabel",
+            "btnEasyMoveToRef",
+            "btnEasyFineAdjust",
+            "btnEasyResetXy",
+            "btnEasySaveXy",
+            "btnEasyCancelXy",
+            "btnEasySetHeight",
+            "btnEasySetPcbSurface",
+            "btnEasyResetPcbSurface",
+            "btnEasyJogXPlus",
+            "btnEasyJogXMinus",
+            "btnEasyJogYPlus",
+            "btnEasyJogYMinus",
+        }
+        declared = set(emi_widgets) | builtin | cube_runtime | easy_runtime
         assert referenced <= declared, sorted(referenced - declared)
 
 
@@ -721,6 +745,12 @@ class _FakePrinter:
         self.sent.append(f"G1 Z{z_mm}")
         self.z = z_mm
 
+    def release_z_holding(self):
+        self.sent.append("M18 Z")
+
+    def enable_z_holding(self):
+        self.sent.append("M17 Z")
+
 
 class _CountingSerial(_MapSerial):
     """Counts handovers, so analyser-last ordering can be asserted, not assumed."""
@@ -746,7 +776,7 @@ class _HeadlessWizard(emi_map.EMIMapWizard):
     def _draw_board(self, plot, view, *, preserve_camera=True):
         pass
 
-    def _printer(self):
+    def _printer(self, *, manage_z=None):
         return self.printer
 
 
@@ -991,6 +1021,16 @@ def register(wizard, offsets=((0.0, 0.0), (50.0, 30.0)), machine_origin=(60.0, 4
         wizard._record_landmark()
 
 
+def _agree_easy_scan_plane(wizard, surface_z=53.0):
+    """Session PCB datum with the probe already at the Easy Mode A target."""
+    wizard._pcb_surface_z = float(surface_z)
+    target = emi_map.engine_height.easy_scan_target_z(
+        surface_z, wizard._default_probe_gap_mm()
+    )
+    wizard.printer.z = target
+    wizard._last_commanded_scan_z = target
+
+
 def register_points(wizard, pairs, machine_origin=(60.0, 40.0)):
     """Record exact board/machine pairs, bypassing the click snapping.
 
@@ -1039,6 +1079,9 @@ class TestModeNavigation:
         assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_REGISTER
         register(pcb_wizard)
         pcb_wizard._on_next()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_EASY_HEIGHT
+        _agree_easy_scan_plane(pcb_wizard)
+        pcb_wizard._on_next()
         assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_SCAN
 
     def test_back_returns_along_the_same_sequence(self, pcb_wizard):
@@ -1054,7 +1097,7 @@ class TestModeNavigation:
     def test_next_names_the_pcb_import_page(self, pcb_wizard):
         pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SETUP)
         pcb_wizard._update_nav()
-        assert pcb_wizard.ui.btnNext.text() == "Next: import board"
+        assert pcb_wizard.ui.btnNext.text() == "Next: select board"
 
     def test_the_origin_page_says_it_is_not_the_pcb_path(self, emi_widgets):
         text = properties(emi_widgets["originIntro"])["text"].find("string").text
@@ -1344,6 +1387,7 @@ class TestAnalyserBorrowedLast:
         self, pcb_wizard
     ):
         register(pcb_wizard, machine_origin=(200.0, 40.0))
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
         wizard = self._armed(pcb_wizard)
         wizard._start_scan()
@@ -1364,6 +1408,7 @@ class TestAnalyserBorrowedLast:
 
     def test_the_happy_path_only_needs_the_clearance_tick(self, pcb_wizard):
         register(pcb_wizard)
+        _agree_easy_scan_plane(pcb_wizard)
         assert pcb_wizard._registration_problems() == []
         assert pcb_wizard._pcb_xy_homed is True
 
@@ -1377,6 +1422,7 @@ class TestAnalyserBorrowedLast:
 
     def test_start_stays_off_until_travel_is_confirmed_on_the_scan_page(self, pcb_wizard):
         register(pcb_wizard)
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SCAN)
         pcb_wizard._update_nav()
         assert pcb_wizard.ui.btnStartScan.isEnabled() is False
@@ -1389,6 +1435,7 @@ class TestAnalyserBorrowedLast:
     def test_cube_start_stays_off_until_the_rf_chain_is_confirmed(self, pcb_wizard):
         pcb_wizard.ui.chkSpectrumCube.setChecked(True)
         register(pcb_wizard)
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SCAN)
         pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
         pcb_wizard._update_nav()
@@ -1407,6 +1454,7 @@ class TestAnalyserBorrowedLast:
     ):
         pcb_wizard.ui.chkSpectrumCube.setChecked(True)
         register(pcb_wizard)
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
         wizard = self._armed(pcb_wizard)
         wizard._start_scan()
@@ -1434,6 +1482,7 @@ class TestEndToEndBoardScan:
         from EMI_Mapper import fakes
 
         register(pcb_wizard)
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
         pcb_wizard.ui.outputRoot._text = str(tmp_path)
 
@@ -2444,6 +2493,7 @@ def _agree_six_mm_plane(wizard, *, allow_z=True, surface_z=2.0):
 
     Tallest listed part is 4 mm so 6 mm is legal but below CAD+clearance (7 mm).
     """
+    wizard._set_operator_mode(emi_map.OPERATOR_MODE_ADVANCED)
     wizard._board_model = _board_with_height(4.0)
     wizard._apply_board_view()
     wizard.ui.chkHeightOverride.setChecked(True)
@@ -2625,3 +2675,405 @@ class TestScanHeightBoardPage:
             6.0
         )
         assert not _scan_gcode_has_z(printer.commands)
+
+
+def _mark_xy_verified(wizard):
+    from dataclasses import replace
+
+    document = emi_map.engine_profiles.set_xy_verified(wizard._profile.path, True)
+    wizard._profile = replace(wizard._profile, document=document)
+    wizard._update_registration_ui()
+    wizard._update_nav()
+
+
+class TestEasyModeGates:
+    def test_easy_is_the_pcb_default(self, pcb_wizard):
+        assert pcb_wizard._easy_mode_active() is True
+        assert pcb_wizard.ui.operatorMode.currentText() == OPERATOR_MODE_EASY
+
+    def test_easy_skips_landmark_confirms_when_seated_and_verified(
+        self, pcb_wizard, profile_home
+    ):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_REGISTER)
+        pcb_wizard._update_nav()
+        assert pcb_wizard._registration_problems() == []
+        assert pcb_wizard.ui.btnNext.isEnabled() is True
+        assert "Easy" in pcb_wizard.ui.profileStatus.text()
+
+    def test_advanced_still_blocks_unverified_even_when_xy_verified(
+        self, pcb_wizard, profile_home
+    ):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        pcb_wizard._set_operator_mode(OPERATOR_MODE_ADVANCED)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_REGISTER)
+        pcb_wizard._update_nav()
+        assert pcb_wizard.ui.btnNext.isEnabled() is False
+        assert "UNVERIFIED" in pcb_wizard.ui.profileStatus.text()
+
+    def test_easy_navigation_matches_setup_xy_height_scan(
+        self, pcb_wizard, profile_home
+    ):
+        assert MODE_PAGES[MODE_PCB] == (
+            PAGE_SETUP,
+            PAGE_BOARD,
+            PAGE_REGISTER,
+            PAGE_SCAN,
+            PAGE_RESULTS,
+        )
+        assert pcb_wizard._sequence() == (
+            PAGE_SETUP,
+            PAGE_BOARD,
+            PAGE_REGISTER,
+            PAGE_EASY_HEIGHT,
+            PAGE_SCAN,
+            PAGE_RESULTS,
+        )
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SETUP)
+        pcb_wizard._on_next()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_BOARD
+        pcb_wizard._on_next()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_REGISTER
+        pcb_wizard._on_next()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_EASY_HEIGHT
+
+    def test_easy_mode_and_current_step_survive_hide_and_reopen(
+        self, pcb_wizard, monkeypatch
+    ):
+        pcb_wizard.ui.hide = lambda: None
+        pcb_wizard.ui.show = lambda: None
+        pcb_wizard.ui.raise_ = lambda: None
+        pcb_wizard.ui.activateWindow = lambda: None
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_EASY_HEIGHT)
+        pcb_wizard._on_close()
+        monkeypatch.setattr(pcb_wizard, "_refresh_ports", lambda: None)
+        monkeypatch.setattr(pcb_wizard, "_refresh_profiles", lambda: None)
+        monkeypatch.setattr(pcb_wizard, "_fit_dialog_to_screen", lambda: None)
+        pcb_wizard.start()
+        assert pcb_wizard._easy_mode_active() is True
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_EASY_HEIGHT
+        assert "Probe Height" in pcb_wizard.ui.stepHeader.text()
+
+    def test_easy_z_controls_remain_available_after_page_round_trip(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = None
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_EASY_HEIGHT)
+        pcb_wizard._on_back()
+        pcb_wizard._on_next()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_EASY_HEIGHT
+        assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is True
+        assert "SET PCB SURFACE" in pcb_wizard.ui.easyHeightLabel.text()
+
+    def test_scan_start_still_needs_travel_clearance(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        with pytest.raises(RuntimeError, match="travel"):
+            pcb_wizard._pcb_preflight()
+
+    def test_easy_home_lifts_then_homes_without_g91(self, pcb_wizard):
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard.printer.z = 4.0
+        pcb_wizard._home_xy()
+        assert pcb_wizard.printer.z == pytest.approx(14.0)
+        assert "G28 X Y" in pcb_wizard.printer.sent
+        assert any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+        assert not any("G91" in cmd for cmd in pcb_wizard.printer.sent)
+
+    def test_easy_home_moves_to_the_effective_landmark(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        base = emi_map.engine_profiles.primary_reference_machine(
+            pcb_wizard._profile.document
+        )
+        pcb_wizard._commit_easy_xy_from_machine(base[0] + 0.32, base[1] - 0.18)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard._home_xy()
+        assert pcb_wizard.printer.position == pytest.approx((base[0] + 0.32, base[1] - 0.18))
+
+    def test_easy_set_height_refused_until_session_datum(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = None
+        assert pcb_wizard._easy_set_probe_height() is False
+        assert any("SET PCB SURFACE" in text for text in _FakeMessageBox.warnings)
+
+    def test_easy_set_height_uses_session_datum_not_stored_z(self, pcb_wizard):
+        pcb_wizard.ui.chkHeightReference.setChecked(True)
+        pcb_wizard.printer.z = 40.0
+        pcb_wizard._set_pcb_surface()
+        pcb_wizard._clear_height_datum()
+        pcb_wizard.printer.z = 0.0
+        assert pcb_wizard._pcb_surface_z is None
+        assert pcb_wizard._easy_set_probe_height() is False
+        pcb_wizard.printer.z = 12.0
+        pcb_wizard.ui.chkHeightReference.setChecked(True)
+        pcb_wizard._set_pcb_surface()
+        assert pcb_wizard._easy_set_probe_height() is True
+        assert pcb_wizard.printer.z == pytest.approx(15.0)
+
+    def test_downward_z_blocked_when_datum_unknown(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = None
+        pcb_wizard.printer.z = 10.0
+        pcb_wizard._jog_z(-1)
+        assert pcb_wizard.printer.z == pytest.approx(10.0)
+        assert any("Z reference required" in text for text in _FakeMessageBox.warnings)
+
+
+class TestEasyXyCalibration:
+    def test_jogged_difference_is_translation_only(self, pcb_wizard, profile_home, monkeypatch):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        theta = pcb_wizard._registration.transform.theta_rad
+        scale = pcb_wizard._registration.scale
+        calls = {"n": 0}
+        real = emi_map.engine_registration.fit_registration
+
+        def wrapped(*args, **kwargs):
+            calls["n"] += 1
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(emi_map.engine_registration, "fit_registration", wrapped)
+        monkeypatch.setattr(emi_map.engine_profiles, "fit_registration", wrapped)
+        base = emi_map.engine_profiles.primary_reference_machine(
+            pcb_wizard._profile.document
+        )
+        assert pcb_wizard._commit_easy_xy_from_machine(base[0] + 0.32, base[1] - 0.18) is True
+        assert calls["n"] == 0
+        assert pcb_wizard._easy_xy_offset() == pytest.approx((0.32, -0.18))
+        assert pcb_wizard._registration.transform.theta_rad == pytest.approx(theta)
+        assert pcb_wizard._registration.scale == pytest.approx(scale)
+        assert pcb_wizard._profile.xy_verified is True
+
+    def test_saved_offset_survives_reload(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        base = emi_map.engine_profiles.primary_reference_machine(
+            pcb_wizard._profile.document
+        )
+        pcb_wizard._commit_easy_xy_from_machine(base[0] + 0.5, base[1] - 0.25)
+        load_saved(pcb_wizard)
+        assert pcb_wizard._easy_xy_offset() == pytest.approx((0.5, -0.25))
+        assert pcb_wizard._profile.xy_verified is True
+
+    def test_scan_plan_receives_the_same_translation(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        before = pcb_wizard._build_validated_plan(pcb_wizard.build_config())
+        bbox = before.machine_bbox_mm()
+        base = emi_map.engine_profiles.primary_reference_machine(
+            pcb_wizard._profile.document
+        )
+        pcb_wizard._commit_easy_xy_from_machine(base[0] + 0.32, base[1] - 0.18)
+        after = pcb_wizard._build_validated_plan(pcb_wizard.build_config())
+        assert after.machine_bbox_mm() == pytest.approx(
+            (bbox[0] + 0.32, bbox[1] - 0.18, bbox[2] + 0.32, bbox[3] - 0.18)
+        )
+
+    def test_cancel_does_not_write_the_profile(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        pcb_wizard._easy_adjust_saved_xy = pcb_wizard.printer.position
+        pcb_wizard.printer.position = (
+            pcb_wizard.printer.position[0] + 1.0,
+            pcb_wizard.printer.position[1] + 1.0,
+        )
+        pcb_wizard._easy_cancel_fine_adjust()
+        assert pcb_wizard._easy_xy_offset() == pytest.approx((0.0, 0.0))
+        loaded = emi_map.engine_profiles.load_profile(
+            "board a", pcb_wizard._board_view, **{
+                "fixture_id": pcb_wizard.ui.fixtureId.text(),
+                "machine_id": pcb_wizard.ui.machineId.text(),
+                "probe_setup_id": pcb_wizard.ui.probeSetupId.text(),
+            }
+        )
+        assert loaded.easy_xy_offset_mm == pytest.approx((0.0, 0.0))
+
+    def test_reset_restores_the_base_landmark(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        base = emi_map.engine_profiles.primary_reference_machine(
+            pcb_wizard._profile.document
+        )
+        pcb_wizard._commit_easy_xy_from_machine(base[0] + 1.0, base[1] + 0.5)
+        pcb_wizard._easy_reset_xy_calibration()
+        assert pcb_wizard._easy_xy_offset() == pytest.approx((0.0, 0.0))
+        assert pcb_wizard.printer.position == pytest.approx(base)
+
+    def test_limit_escalates_to_advanced(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        base = emi_map.engine_profiles.primary_reference_machine(
+            pcb_wizard._profile.document
+        )
+        assert pcb_wizard._commit_easy_xy_from_machine(base[0] + 3.01, base[1]) is False
+        assert pcb_wizard._easy_xy_offset() == pytest.approx((0.0, 0.0))
+        assert any("Large fixture movement" in text for text in _FakeMessageBox.warnings)
+        assert any("Advanced" in text for text in _FakeMessageBox.warnings)
+
+
+class TestEasyZLifecycle:
+    def test_manual_touch_stores_logical_z_then_raises_three(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        pcb_wizard.printer.z = 53.0
+        pcb_wizard.printer.sent.clear()
+        _FakeMessageBox.answer = _FakeMessageBox.Yes
+        assert pcb_wizard._easy_set_pcb_surface_manually() is True
+        assert pcb_wizard._pcb_surface_z == pytest.approx(53.0)
+        assert pcb_wizard.printer.z == pytest.approx(56.0)
+        assert "M18 Z" in pcb_wizard.printer.sent
+        assert "M17 Z" in pcb_wizard.printer.sent
+        assert not any(cmd.startswith("M18 X") for cmd in pcb_wizard.printer.sent)
+        assert not any("G92" in cmd and "Z" in cmd.split() for cmd in pcb_wizard.printer.sent)
+        assert any(cmd.startswith("G1 Z56") for cmd in pcb_wizard.printer.sent)
+
+    def test_manual_touch_cancel_re_enables_z_and_stores_nothing(
+        self, pcb_wizard, profile_home
+    ):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        pcb_wizard.printer.z = 53.0
+        pcb_wizard.printer.sent.clear()
+        _FakeMessageBox.answer = _FakeMessageBox.No
+        assert pcb_wizard._easy_set_pcb_surface_manually() is False
+        assert pcb_wizard._pcb_surface_z is None
+        assert "M18 Z" in pcb_wizard.printer.sent
+        assert "M17 Z" in pcb_wizard.printer.sent
+        assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_closing_during_touch_re_enables_z_and_discards_datum(self, pcb_wizard):
+        pcb_wizard._easy_z_unlocked = True
+        pcb_wizard._easy_touch_logical_z = 53.0
+        pcb_wizard.printer.sent.clear()
+        pcb_wizard._cleanup()
+        assert "M17 Z" in pcb_wizard.printer.sent
+        assert pcb_wizard._easy_z_unlocked is False
+        assert pcb_wizard._pcb_surface_z is None
+
+    def test_real_port_change_clears_session_datum(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard._last_commanded_scan_z = 56.0
+        pcb_wizard._on_printer_port_changed("COM12")
+        assert pcb_wizard._pcb_surface_z is None
+        assert "SET PCB SURFACE" in pcb_wizard.ui.easyHeightLabel.text()
+
+    def test_reconnect_cannot_move_to_a_target_from_the_stale_datum(
+        self, pcb_wizard, monkeypatch
+    ):
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard.printer.sent.clear()
+
+        def reconnect(*, manage_z=None):
+            pcb_wizard._clear_height_datum()
+            return pcb_wizard.printer
+
+        monkeypatch.setattr(pcb_wizard, "_printer", reconnect)
+        assert pcb_wizard._easy_set_probe_height() is False
+        assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+        assert any("reconnected" in text.lower() for text in _FakeMessageBox.warnings)
+
+    def test_port_list_refresh_does_not_clear_session_state(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard._refreshing_ports = True
+        try:
+            pcb_wizard._on_printer_port_changed("")
+        finally:
+            pcb_wizard._refreshing_ports = False
+        assert pcb_wizard._pcb_surface_z == pytest.approx(53.0)
+
+    def test_home_restores_only_if_already_at_scan_plane(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard.printer.z = 56.0
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard.printer.sent.clear()
+        pcb_wizard._home_xy()
+        assert pcb_wizard.printer.z == pytest.approx(56.0)
+        z_moves = [cmd for cmd in pcb_wizard.printer.sent if cmd.startswith("G1 Z")]
+        assert any(cmd.startswith("G1 Z66") for cmd in z_moves)
+        assert any(cmd.startswith("G1 Z56") for cmd in z_moves)
+        assert "G28 X Y" in pcb_wizard.printer.sent
+        assert "G91" not in pcb_wizard.printer.sent
+        assert not any("G28 Z" in cmd for cmd in pcb_wizard.printer.sent)
+        assert not any("G92" in cmd and "Z" in cmd.split() for cmd in pcb_wizard.printer.sent)
+
+    def test_home_stays_high_when_not_at_scan_plane(self, pcb_wizard, profile_home):
+        prepared_profile(pcb_wizard)
+        _mark_xy_verified(pcb_wizard)
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard.printer.z = 60.0
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard.printer.sent.clear()
+        pcb_wizard._home_xy()
+        assert pcb_wizard.printer.z == pytest.approx(70.0)
+        assert any(cmd.startswith("G1 Z70") for cmd in pcb_wizard.printer.sent)
+        assert not any(cmd.startswith("G1 Z56") for cmd in pcb_wizard.printer.sent)
+
+    def test_start_at_plane_never_moves_z(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard.printer.z = 56.0
+        pcb_wizard.printer.sent.clear()
+        pcb_wizard._ensure_at_agreed_scan_plane()
+        assert pcb_wizard.printer.z == pytest.approx(56.0)
+        assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_set_probe_height_immediately_enables_next(self, pcb_wizard):
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_EASY_HEIGHT)
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard.printer.z = 66.0
+        pcb_wizard._update_nav()
+        assert pcb_wizard.ui.btnNext.isEnabled() is False
+        assert pcb_wizard._easy_set_probe_height() is True
+        assert pcb_wizard.printer.z == pytest.approx(56.0)
+        assert pcb_wizard.ui.btnNext.isEnabled() is True
+
+    def test_start_high_blocks_without_moving_z(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard.printer.z = 66.0
+        pcb_wizard.printer.sent.clear()
+        with pytest.raises(RuntimeError, match="SET PROBE HEIGHT"):
+            pcb_wizard._ensure_at_agreed_scan_plane()
+        assert pcb_wizard.printer.z == pytest.approx(66.0)
+        assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_start_without_datum_blocks(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = None
+        pcb_wizard.printer.sent.clear()
+        with pytest.raises(RuntimeError, match="SET PCB SURFACE"):
+            pcb_wizard._ensure_at_agreed_scan_plane()
+        assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_reset_clears_datum_and_shows_manual_surface(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard._last_commanded_scan_z = 56.0
+        pcb_wizard._on_printer_reset()
+        assert pcb_wizard._pcb_surface_z is None
+        pcb_wizard._refresh_easy_height_label()
+        text = pcb_wizard.ui.easyHeightLabel.text()
+        assert "SET PCB SURFACE" in text
+        assert "53" not in text
+
+    def test_easy_height_copy_hides_raw_z(self, pcb_wizard):
+        pcb_wizard._pcb_surface_z = 53.0
+        pcb_wizard.printer.z = 56.0
+        pcb_wizard._refresh_easy_height_label()
+        text = pcb_wizard.ui.easyHeightLabel.text()
+        assert "3.00" in text
+        assert "53" not in text
+        assert "56" not in text
+        assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is False
+        assert pcb_wizard.ui.btnEasyResetPcbSurface.isVisible() is True
+        pcb_wizard.printer.z = 66.0
+        pcb_wizard._refresh_easy_height_label()
+        raised = pcb_wizard.ui.easyHeightLabel.text()
+        assert "SET PROBE HEIGHT" in raised
+        assert "53" not in raised
+        pcb_wizard._pcb_surface_z = None
+        pcb_wizard._refresh_easy_height_label()
+        unknown = pcb_wizard.ui.easyHeightLabel.text()
+        assert "SET PCB SURFACE" in unknown
+        assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is True
+        assert pcb_wizard.ui.btnEasySetHeight.isVisible() is False
+

@@ -19,6 +19,7 @@ import math
 import sys
 import threading
 import time
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
@@ -67,6 +68,9 @@ PAGE_REGISTER = 2
 PAGE_ORIGIN = 3
 PAGE_SCAN = 4
 PAGE_RESULTS = 5
+# Runtime-only Easy page. Keeping the existing .ui indices stable avoids
+# disturbing Rectangle and Advanced workflows.
+PAGE_EASY_HEIGHT = 6
 
 MODE_RECTANGLE = "Rectangle"
 MODE_PCB = "PCB aligned"
@@ -78,6 +82,24 @@ MODE_PAGES = {
     MODE_RECTANGLE: (PAGE_SETUP, PAGE_ORIGIN, PAGE_SCAN, PAGE_RESULTS),
     MODE_PCB: (PAGE_SETUP, PAGE_BOARD, PAGE_REGISTER, PAGE_SCAN, PAGE_RESULTS),
 }
+EASY_PCB_PAGES = (
+    PAGE_SETUP,
+    PAGE_BOARD,
+    PAGE_REGISTER,
+    PAGE_EASY_HEIGHT,
+    PAGE_SCAN,
+    PAGE_RESULTS,
+)
+
+OPERATOR_MODE_EASY = "Easy"
+OPERATOR_MODE_ADVANCED = "Advanced"
+EASY_JOG_STEPS_MM = (0.05, 0.10, 0.25, 0.50, 1.00)
+LOGICAL_Z_MAX_MM = 250.0
+ORIENTATION_DRIFT_HINT = (
+    "Orientation may have changed.\n"
+    "Use Advanced → Recalibrate Fixture\n"
+    "to perform a 2-point registration."
+)
 
 # Next names the following page so Setup cannot silently send you down the
 # other mode's path. PAGE_SETUP depends on the combo; the rest do not.
@@ -628,6 +650,15 @@ class EMIMapWizard(QtCore.QObject):
         self._offset_correction_mm = (0.0, 0.0)
         self._acknowledged_warnings = []
         self._noted_warnings = []
+        self._easy_adjust_open = False
+        self._easy_adjust_saved_xy = None
+        self._easy_z_unlocked = False
+        self._easy_touch_logical_z = None
+        self._refreshing_ports = False
+        self._last_page_by_mode = {
+            MODE_RECTANGLE: PAGE_SETUP,
+            MODE_PCB: PAGE_SETUP,
+        }
 
         # Plot items, created by the pyqtgraph-touching setup methods only
         self._landmark_marks = None
@@ -644,6 +675,8 @@ class EMIMapWizard(QtCore.QObject):
 
         self._wire_ui()
         self._install_cube_controls()
+        self._install_easy_height_page()
+        self._install_easy_mode_controls()
         self._apply_simple_survey_defaults()
         self._setup_plot()
         self._setup_board_plots()
@@ -887,6 +920,296 @@ class EMIMapWizard(QtCore.QObject):
             if hasattr(widget, "currentTextChanged"):
                 widget.currentTextChanged.connect(self._refresh_cube_view)
         self._set_advanced_visible(False)
+
+    _EASY_HIDDEN_WIDGETS = (
+        "btnRecordLandmark",
+        "btnRemoveLandmark",
+        "btnClearLandmarks",
+        "chkSnapLandmark",
+        "landmarkTable",
+        "btnConfirmAlignment",
+        "btnUpdateOffset",
+        "btnMoveHere",
+        "chkOrientationLocked",
+        "fixtureId",
+        "machineId",
+        "probeSetupId",
+        "heightCadLabel",
+        "chkHeightOverride",
+        "heightOverrideMm",
+        "heightGapMm",
+        "chkHeightReference",
+        "chkAllowSetupZ",
+        "btnJogZUp",
+        "btnJogZDown",
+        "chkHeightClearance",
+        "btnMoveToScanHeight",
+        "btnSaveAsProfile",
+        "btnUpdateProfile",
+        "chkAdvanced",
+    )
+    _EASY_SHOWN_WIDGETS = (
+        "operatorMode",
+        "easyStatusLabel",
+        "btnEasyMoveToRef",
+        "btnEasyFineAdjust",
+        "btnEasyResetXy",
+        "btnEasySetHeight",
+        "btnEasySetPcbSurface",
+        "btnEasyResetPcbSurface",
+        "easyHeightLabel",
+    )
+
+    def _install_easy_height_page(self):
+        """Add a dedicated Easy Z page without changing existing .ui indices."""
+        self._easy_height_layout = None
+        stack = getattr(self.ui, "wizardStack", None)
+        if not isinstance(stack, QtWidgets.QStackedWidget):
+            return
+        page = QtWidgets.QWidget()
+        page.setObjectName("pageEasyHeight")
+        layout = QtWidgets.QVBoxLayout(page)
+        intro = QtWidgets.QLabel(
+            "Set the session PCB surface, then place the probe at the fixed "
+            "measurement height. Start and scan never move Z."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        group = QtWidgets.QGroupBox("Probe Height (Z)")
+        group_layout = QtWidgets.QVBoxLayout(group)
+        layout.addWidget(group)
+        layout.addStretch(1)
+        index = stack.addWidget(page)
+        if index != PAGE_EASY_HEIGHT:
+            raise RuntimeError(
+                f"Easy height page index changed: expected {PAGE_EASY_HEIGHT}, got {index}"
+            )
+        self.ui.pageEasyHeight = page
+        self.ui.grpEasyHeight = group
+        self._easy_height_layout = group_layout
+
+    def _install_easy_mode_controls(self):
+        """Easy|Advanced toggle and Fine Adjust controls; headless-safe stubs."""
+        u = self.ui
+
+        def _stub(name, **fields):
+            if getattr(u, name, None) is not None:
+                return getattr(u, name)
+            box = type("EasyWidget", (), {})()
+            box._text = fields.get("text", "")
+            box._checked = False
+            box._value = fields.get("value", 0.25)
+            box.enabled = True
+            box.visible = True
+            box.isChecked = lambda: box._checked
+            box.setChecked = lambda checked, b=box: setattr(b, "_checked", bool(checked))
+            box.text = lambda b=box: b._text
+            box.setText = lambda text, b=box: setattr(b, "_text", str(text))
+            box.setEnabled = lambda enabled, b=box: setattr(b, "enabled", bool(enabled))
+            box.setVisible = lambda visible, b=box: setattr(b, "visible", bool(visible))
+            box.isEnabled = lambda b=box: b.enabled
+            box.isVisible = lambda b=box: b.visible
+            box.value = lambda b=box: b._value
+            box.setValue = lambda value, b=box: setattr(b, "_value", value)
+            box.currentText = lambda b=box: b._text
+            box.setCurrentText = lambda text, b=box: setattr(b, "_text", str(text))
+            box.addItems = lambda items, b=box: None
+            box.clicked = type("Sig", (), {"connect": lambda self, *_a, **_k: None})()
+            box.currentTextChanged = type("Sig", (), {"connect": lambda self, *_a, **_k: None})()
+            setattr(u, name, box)
+            return box
+
+        profile = getattr(u, "grpProfile", None)
+        profile_layout = (
+            profile.layout()
+            if profile is not None and callable(getattr(profile, "layout", None))
+            else None
+        )
+        height_layout = self._easy_height_layout
+        root_layout = u.layout() if callable(getattr(u, "layout", None)) else None
+        real = isinstance(profile_layout, QtWidgets.QVBoxLayout)
+
+        if getattr(u, "operatorMode", None) is None:
+            if real and isinstance(root_layout, QtWidgets.QVBoxLayout):
+                row = QtWidgets.QHBoxLayout()
+                label = QtWidgets.QLabel("Mode:")
+                combo = QtWidgets.QComboBox()
+                combo.setObjectName("operatorMode")
+                combo.addItems([OPERATOR_MODE_EASY, OPERATOR_MODE_ADVANCED])
+                combo.setCurrentText(OPERATOR_MODE_EASY)
+                row.addWidget(label)
+                row.addWidget(combo)
+                row.addStretch(1)
+                # Keep the Easy/Advanced choice visible on every wizard page.
+                root_layout.insertLayout(1, row)
+                u.operatorMode = combo
+            else:
+                combo = _stub("operatorMode", text=OPERATOR_MODE_EASY)
+                combo._text = OPERATOR_MODE_EASY
+        else:
+            combo = u.operatorMode
+            setter = getattr(combo, "setCurrentText", None)
+            if callable(setter) and not combo.currentText():
+                setter(OPERATOR_MODE_EASY)
+
+        specs = (
+            ("easyStatusLabel", "Easy fixture status", QtWidgets.QLabel, profile_layout),
+            ("btnEasyMoveToRef", "Move to reference", QtWidgets.QPushButton, profile_layout),
+            ("btnEasyFineAdjust", "Fine Adjust XY", QtWidgets.QPushButton, profile_layout),
+            ("btnEasyResetXy", "Reset XY Calibration", QtWidgets.QPushButton, profile_layout),
+            ("btnEasySaveXy", "Save Position", QtWidgets.QPushButton, profile_layout),
+            ("btnEasyCancelXy", "Cancel", QtWidgets.QPushButton, profile_layout),
+            ("easyHeightLabel", "Z reference required", QtWidgets.QLabel, height_layout),
+            ("btnEasySetHeight", "SET PROBE HEIGHT", QtWidgets.QPushButton, height_layout),
+            (
+                "btnEasySetPcbSurface",
+                "SET PCB SURFACE MANUALLY",
+                QtWidgets.QPushButton,
+                height_layout,
+            ),
+            (
+                "btnEasyResetPcbSurface",
+                "RESET PCB SURFACE",
+                QtWidgets.QPushButton,
+                height_layout,
+            ),
+        )
+        for name, label, cls, target_layout in specs:
+            if getattr(u, name, None) is not None:
+                continue
+            if real and target_layout is not None:
+                widget = cls(label)
+                widget.setObjectName(name)
+                if isinstance(widget, QtWidgets.QLabel):
+                    widget.setWordWrap(True)
+                target_layout.addWidget(widget)
+                setattr(u, name, widget)
+            else:
+                _stub(name, text=label)
+
+        if getattr(u, "easyJogStep", None) is None:
+            if real:
+                step = QtWidgets.QDoubleSpinBox()
+                step.setObjectName("easyJogStep")
+                step.setRange(0.05, 1.0)
+                step.setDecimals(2)
+                step.setValue(0.25)
+                profile_layout.addWidget(step)
+                u.easyJogStep = step
+            else:
+                _stub("easyJogStep", value=0.25)
+
+        for name, label in (
+            ("btnEasyJogXPlus", "X+"),
+            ("btnEasyJogXMinus", "X-"),
+            ("btnEasyJogYPlus", "Y+"),
+            ("btnEasyJogYMinus", "Y-"),
+        ):
+            if getattr(u, name, None) is not None:
+                continue
+            if real:
+                button = QtWidgets.QPushButton(label)
+                button.setObjectName(name)
+                profile_layout.addWidget(button)
+                setattr(u, name, button)
+            else:
+                _stub(name, text=label)
+
+        changed = getattr(u.operatorMode, "currentTextChanged", None)
+        if changed is not None and callable(getattr(changed, "connect", None)):
+            changed.connect(self._on_operator_mode_changed)
+        for name, slot in (
+            ("btnEasyMoveToRef", self._easy_move_to_reference),
+            ("btnEasyFineAdjust", self._easy_open_fine_adjust),
+            ("btnEasyResetXy", self._easy_reset_xy_calibration),
+            ("btnEasySaveXy", self._easy_save_position),
+            ("btnEasyCancelXy", self._easy_cancel_fine_adjust),
+            ("btnEasySetHeight", self._easy_set_probe_height),
+            ("btnEasySetPcbSurface", self._easy_set_pcb_surface_manually),
+            ("btnEasyResetPcbSurface", self._easy_reset_pcb_surface),
+        ):
+            button = getattr(u, name, None)
+            clicked = getattr(button, "clicked", None) if button is not None else None
+            if clicked is not None and callable(getattr(clicked, "connect", None)):
+                clicked.connect(slot)
+        for name, dx, dy in (
+            ("btnEasyJogXPlus", 1, 0),
+            ("btnEasyJogXMinus", -1, 0),
+            ("btnEasyJogYPlus", 0, 1),
+            ("btnEasyJogYMinus", 0, -1),
+        ):
+            button = getattr(u, name, None)
+            clicked = getattr(button, "clicked", None) if button is not None else None
+            if clicked is not None and callable(getattr(clicked, "connect", None)):
+                clicked.connect(partial(self._easy_jog, dx, dy))
+        self._set_easy_adjust_visible(False)
+        self._apply_operator_mode_ui()
+
+    def _easy_mode_active(self):
+        combo = getattr(self.ui, "operatorMode", None)
+        text = combo.currentText() if combo is not None else OPERATOR_MODE_EASY
+        return self._mode() == MODE_PCB and text == OPERATOR_MODE_EASY
+
+    def _set_operator_mode(self, mode):
+        combo = getattr(self.ui, "operatorMode", None)
+        if combo is None:
+            return
+        setter = getattr(combo, "setCurrentText", None)
+        if callable(setter):
+            setter(mode)
+        self._on_operator_mode_changed(mode)
+
+    def _on_operator_mode_changed(self, _mode=None):
+        if self._easy_mode_active():
+            advanced = getattr(self.ui, "chkAdvanced", None)
+            if advanced is not None:
+                advanced.setChecked(False)
+        self._apply_operator_mode_ui()
+        self._refresh_height_ui()
+        self._update_nav()
+
+    def _set_widget_visible(self, name, visible):
+        widget = getattr(self.ui, name, None)
+        setter = getattr(widget, "setVisible", None)
+        if callable(setter):
+            setter(visible)
+
+    def _set_easy_adjust_visible(self, visible):
+        self._easy_adjust_open = bool(visible)
+        for name in (
+            "btnEasySaveXy",
+            "btnEasyCancelXy",
+            "btnEasyJogXPlus",
+            "btnEasyJogXMinus",
+            "btnEasyJogYPlus",
+            "btnEasyJogYMinus",
+            "easyJogStep",
+        ):
+            self._set_widget_visible(name, visible and self._easy_mode_active())
+
+    def _apply_operator_mode_ui(self):
+        pcb = self._mode() == MODE_PCB
+        easy = self._easy_mode_active()
+        self._set_widget_visible("operatorMode", pcb)
+        # Easy has a dedicated Z page; Advanced keeps the full CAD/Z controls
+        # on the Board page.
+        self._set_widget_visible("grpScanHeight", pcb and not easy)
+        for name in self._EASY_HIDDEN_WIDGETS:
+            if name == "chkAdvanced":
+                self._set_widget_visible(name, pcb and not easy)
+                continue
+            self._set_widget_visible(name, pcb and not easy)
+        for name in self._EASY_SHOWN_WIDGETS:
+            self._set_widget_visible(name, easy)
+        self._set_easy_adjust_visible(self._easy_adjust_open and easy)
+        home = getattr(self.ui, "btnHomeXy", None)
+        setter = getattr(home, "setText", None)
+        if callable(setter):
+            setter("HOME & MOVE TO GLASSBOARD" if easy else "Home X/Y")
+        if easy:
+            self._set_advanced_visible(False)
+        self._update_registration_ui()
+        self._refresh_easy_height_label()
 
     _ADVANCED_WIDGETS = (
         "lblCentre",
@@ -1227,7 +1550,11 @@ class EMIMapWizard(QtCore.QObject):
         self._refresh_profiles()
         if not self.ui.outputRoot.text():
             self.ui.outputRoot.setText(str(Path.cwd() / "EMI_Scans"))
-        self.ui.wizardStack.setCurrentIndex(PAGE_SETUP)
+        sequence = self._sequence()
+        resume = self._last_page_by_mode.get(self._mode(), PAGE_SETUP)
+        self.ui.wizardStack.setCurrentIndex(
+            resume if resume in sequence else PAGE_SETUP
+        )
         self._update_mode_ui()
         self._on_area_changed()
         self._update_header()
@@ -1261,14 +1588,18 @@ class EMIMapWizard(QtCore.QObject):
         """Offer the ports that could be the printer, likeliest first."""
         combo = self.ui.printerPort
         current = self._printer_port()
-        combo.clear()
-        for device, label in self._candidate_ports():
-            combo.addItem(label, device)
-        index = combo.findData(current)
-        if index is not None and index >= 0:
-            combo.setCurrentIndex(index)
-        elif current:
-            combo.setCurrentText(current)
+        self._refreshing_ports = True
+        try:
+            combo.clear()
+            for device, label in self._candidate_ports():
+                combo.addItem(label, device)
+            index = combo.findData(current)
+            if index is not None and index >= 0:
+                combo.setCurrentIndex(index)
+            elif current:
+                combo.setCurrentText(current)
+        finally:
+            self._refreshing_ports = False
 
     def _candidate_ports(self):
         """(device, label) pairs, with the recognised USB-serial bridges first."""
@@ -1310,8 +1641,12 @@ class EMIMapWizard(QtCore.QObject):
         """A different port is a different machine, so nothing about the old
         frame carries over. Also drops the open handle so the next operation
         reconnects instead of talking to the previous printer."""
+        if self._refreshing_ports:
+            return
         self._close_printer()
+        self._clear_height_datum()
         self._clear_pcb_homing()
+        self._refresh_height_ui()
         self._update_nav()
 
     def _browse_folder(self):
@@ -1412,6 +1747,7 @@ class EMIMapWizard(QtCore.QObject):
             settle_s=self.ui.settleMs.value() / 1000.0,
             set_current_xy_as_origin=False,
             manage_z=self.ui.chkAllowSetupZ.isChecked(),
+            z_max_mm=LOGICAL_Z_MAX_MM,
             # Drop X/Y holding after each move so stepper PWM is off during
             # settle + sweeps. Z stays held so the probe cannot sag (INV-Z-007).
             disable_steppers_during_measure=True,
@@ -1584,6 +1920,8 @@ class EMIMapWizard(QtCore.QObject):
         """Why a loaded profile is not yet fit to scan with."""
         if self._profile is None:
             return []
+        if self._easy_fixture_ready():
+            return []
         required = self._verification_points_required()
         confirmed = len(self._verified_points)
         if confirmed < required:
@@ -1593,6 +1931,15 @@ class EMIMapWizard(QtCore.QObject):
         if required > 1 and not self._verified_spread_ok():
             return ["the verified points are too close together to detect rotation"]
         return []
+
+    def _easy_fixture_ready(self):
+        """Easy + seated + a verified fixture replaces landmark confirmation."""
+        return (
+            self._easy_mode_active()
+            and self.ui.chkBoardSeated.isChecked()
+            and self._profile is not None
+            and bool(self._profile.xy_verified)
+        )
 
     def _verified_spread_ok(self):
         """Two verification points only prove orientation if they are far apart.
@@ -1626,6 +1973,9 @@ class EMIMapWizard(QtCore.QObject):
         )
         if not path:
             return
+        self._import_board_path(path)
+
+    def _import_board_path(self, path):
         try:
             model = engine_odbpp.import_odbpp(path)
         except engine_odbpp.OdbppError as exc:
@@ -1899,6 +2249,7 @@ class EMIMapWizard(QtCore.QObject):
         allow_z = u.chkAllowSetupZ.isChecked()
         for widget in (u.btnJogZUp, u.btnJogZDown, u.btnMoveToScanHeight):
             widget.setEnabled(allow_z)
+        self._refresh_easy_height_label()
         try:
             plan = self._scan_height_plan()
             block = self._height_snapshot(self._reported_z())
@@ -1997,9 +2348,20 @@ class EMIMapWizard(QtCore.QObject):
         self._refresh_height_ui()
 
     def _jog_z(self, direction):
-        if not self.ui.chkAllowSetupZ.isChecked():
+        if not self.ui.chkAllowSetupZ.isChecked() and not self._easy_mode_active():
             return
         step = self.ui.jogStep.value() * direction
+        if (
+            self._easy_mode_active()
+            and self._pcb_surface_z is None
+            and step < 0
+        ):
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                "Z reference required. Set the PCB surface in Advanced before lowering.",
+            )
+            return
         try:
             printer = self._printer()
             _x, _y, current = printer.get_xyz()
@@ -2092,11 +2454,472 @@ class EMIMapWizard(QtCore.QObject):
     def _clear_height_datum(self):
         self._pcb_surface_z = None
         self._last_commanded_scan_z = None
+        self._easy_touch_logical_z = None
 
     # ------------------------------------------------------- homing and jog
-    def _printer(self):
+    def _printer(self, *, manage_z=None):
         """A Printer on the shared transport, carrying the form's machine limits."""
-        return engine_printer.Printer(self._open_printer(), self._printer_config())
+        config = self._printer_config()
+        if manage_z is not None:
+            config = replace(config, manage_z=manage_z)
+        return engine_printer.Printer(self._open_printer(), config)
+
+    def _logical_z_max_mm(self):
+        return LOGICAL_Z_MAX_MM
+
+    def _safe_home_lift_mm(self):
+        if self._profile is not None:
+            return self._profile.safe_home_lift_mm
+        document = self._selected_profile_document()
+        if document is not None:
+            try:
+                return engine_profiles._optional_finite(
+                    document.get("safe_home_lift_mm"),
+                    engine_profiles.SAFE_HOME_LIFT_MM,
+                )
+            except engine_profiles.ProfileError:
+                return engine_profiles.SAFE_HOME_LIFT_MM
+        return engine_profiles.SAFE_HOME_LIFT_MM
+
+    def _default_probe_gap_mm(self):
+        if self._profile is not None:
+            return self._profile.default_probe_gap_mm
+        return engine_profiles.DEFAULT_PROBE_GAP_MM
+
+    def _easy_scan_target_z(self):
+        if self._pcb_surface_z is None:
+            return None
+        return engine_height.easy_scan_target_z(
+            self._pcb_surface_z, self._default_probe_gap_mm()
+        )
+
+    def _easy_at_scan_plane(self, reported_z=None):
+        target = self._easy_scan_target_z()
+        if target is None:
+            return False
+        if reported_z is None:
+            reported_z = self._reported_z()
+        if reported_z is None:
+            return False
+        return engine_height.logical_position_matches(reported_z, target)
+
+    def _easy_reenable_z_if_unlocked(self, printer=None):
+        if not self._easy_z_unlocked:
+            return
+        handle = printer if printer is not None else self._printer(manage_z=True)
+        handle.enable_z_holding()
+        self._easy_z_unlocked = False
+
+    def _selected_profile_document(self):
+        name = self._selected_profile_name()
+        if not name or engine_profiles is None:
+            return None
+        try:
+            return engine_profiles.read_profile_document(name)
+        except engine_profiles.ProfileError:
+            return None
+
+    def _easy_xy_offset(self):
+        if self._profile is None:
+            return (0.0, 0.0)
+        return self._profile.easy_xy_offset_mm
+
+    def _scan_transform(self):
+        if self._registration is None:
+            return None
+        dx, dy = self._easy_xy_offset()
+        if dx == 0.0 and dy == 0.0:
+            return self._registration.transform
+        return engine_profiles.with_easy_xy_offset(self._registration.transform, dx, dy)
+
+    def _easy_home_landmark(self):
+        document = None
+        if self._profile is not None:
+            document = self._profile.document
+        else:
+            document = self._selected_profile_document()
+        if not document:
+            return None
+        try:
+            return engine_profiles.effective_reference_machine(document)
+        except engine_profiles.ProfileError:
+            return None
+
+    def _update_easy_status(self):
+        label = getattr(self.ui, "easyStatusLabel", None)
+        if label is None or not callable(getattr(label, "setText", None)):
+            return
+        if not self._easy_mode_active():
+            return
+        document = (
+            self._profile.document
+            if self._profile is not None
+            else self._selected_profile_document()
+        )
+        if document is None:
+            label.setText("Select a verified Glassboard fixture, then HOME & MOVE.")
+            return
+        try:
+            base = engine_profiles.primary_reference_machine(document)
+            effective = engine_profiles.effective_reference_machine(document)
+            dx, dy = engine_profiles.easy_xy_offset_mm(document)
+        except engine_profiles.ProfileError as exc:
+            label.setText(str(exc))
+            return
+        verified = "✓" if (self._profile is not None and self._profile.xy_verified) or document.get("xy_verified") else "—"
+        datum = "—"
+        if self._registration is not None:
+            point = self._registration.points[0]
+            datum = f"({point.board_x_mm:.2f}, {point.board_y_mm:.2f})"
+        label.setText(
+            f"Fixture {verified}   board datum {datum} mm\n"
+            f"Base machine XY ({base[0]:.2f}, {base[1]:.2f})\n"
+            f"Effective ({effective[0]:.2f}, {effective[1]:.2f})   "
+            f"ΔX {dx:+.2f}  ΔY {dy:+.2f} mm"
+        )
+
+    def _refresh_easy_height_label(self):
+        u = self.ui
+        easy = self._easy_mode_active()
+        unknown = self._pcb_surface_z is None
+        gap = self._default_probe_gap_mm()
+        easy_height = getattr(u, "easyHeightLabel", None)
+        if easy_height is not None and callable(getattr(easy_height, "setText", None)):
+            if unknown:
+                easy_height.setText(
+                    "Z reference required. Use SET PCB SURFACE MANUALLY, "
+                    "then SET PROBE HEIGHT."
+                )
+            elif self._easy_at_scan_plane():
+                easy_height.setText(f"Probe is {gap:.2f} mm above PCB.")
+            else:
+                easy_height.setText(
+                    f"Probe is not at the {gap:.2f} mm measurement height. "
+                    "Use SET PROBE HEIGHT."
+                )
+        surface_btn = getattr(u, "btnEasySetPcbSurface", None)
+        if surface_btn is not None and callable(getattr(surface_btn, "setVisible", None)):
+            surface_btn.setVisible(easy and unknown)
+        reset_btn = getattr(u, "btnEasyResetPcbSurface", None)
+        if reset_btn is not None and callable(getattr(reset_btn, "setVisible", None)):
+            reset_btn.setVisible(easy and not unknown)
+        easy_set = getattr(u, "btnEasySetHeight", None)
+        if easy_set is not None:
+            if callable(getattr(easy_set, "setVisible", None)):
+                easy_set.setVisible(easy and not unknown)
+            if callable(getattr(easy_set, "setEnabled", None)):
+                easy_set.setEnabled(easy and not unknown)
+
+    def _easy_move_to_reference(self):
+        target = self._easy_home_landmark()
+        if target is None or not self._pcb_xy_homed:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Home XY and load a fixture first.")
+            return
+        try:
+            printer = self._printer()
+            printer.move_xy(*target)
+            self._show_position(printer.get_xy())
+            self._bump_motion()
+        except engine_printer.PrinterReset as exc:
+            self._clear_height_datum()
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+
+    def _easy_open_fine_adjust(self):
+        if not self._pcb_xy_homed or self._profile is None:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Load a verified fixture first.")
+            return
+        try:
+            self._easy_adjust_saved_xy = self._printer().get_xy()
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return
+        self._set_easy_adjust_visible(True)
+        self._update_easy_status()
+
+    def _easy_jog(self, dx, dy):
+        if not self._pcb_xy_homed:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Home X and Y before jogging.")
+            return
+        step_widget = getattr(self.ui, "easyJogStep", None)
+        step_mm = step_widget.value() if step_widget is not None else 0.25
+        try:
+            printer = self._printer()
+            x_mm, y_mm = printer.get_xy()
+            printer.move_xy(x_mm + dx * step_mm, y_mm + dy * step_mm)
+            self._show_position(printer.get_xy())
+            self._bump_motion()
+            self._update_easy_status()
+        except engine_printer.PrinterReset as exc:
+            self._clear_height_datum()
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+
+    def _easy_save_position(self):
+        try:
+            x_mm, y_mm = self._printer().get_xy()
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        return self._commit_easy_xy_from_machine(x_mm, y_mm)
+
+    def _commit_easy_xy_from_machine(self, x_mm, y_mm):
+        """Persist translation-only offset. Never calls fit_registration."""
+        if self._profile is None:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Load a verified fixture first.")
+            return False
+        try:
+            base_x, base_y = engine_profiles.primary_reference_machine(
+                self._profile.document
+            )
+        except engine_profiles.ProfileError as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        dx = float(x_mm) - base_x
+        dy = float(y_mm) - base_y
+        try:
+            document = engine_profiles.save_easy_xy_offset(self._profile.path, dx, dy)
+        except engine_profiles.ProfileError as exc:
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                f"{exc}\n\n{ORIENTATION_DRIFT_HINT}",
+            )
+            return False
+        self._profile = replace(self._profile, document=document)
+        self._invalidate_plan()
+        self._easy_adjust_open = False
+        self._easy_adjust_saved_xy = None
+        self._set_easy_adjust_visible(False)
+        self._update_easy_status()
+        self._update_registration_ui()
+        self._update_nav()
+        return True
+
+    def _easy_cancel_fine_adjust(self):
+        saved = self._easy_adjust_saved_xy
+        self._easy_adjust_open = False
+        self._set_easy_adjust_visible(False)
+        if saved is not None and self._pcb_xy_homed:
+            try:
+                self._printer().move_xy(*saved)
+                self._show_position(saved)
+            except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+                QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+        self._easy_adjust_saved_xy = None
+        self._update_easy_status()
+        return True
+
+    def _easy_reset_xy_calibration(self):
+        if self._profile is None:
+            return False
+        try:
+            document = engine_profiles.reset_easy_xy_offset(self._profile.path)
+        except engine_profiles.ProfileError as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        self._profile = replace(self._profile, document=document)
+        self._invalidate_plan()
+        landmark = self._easy_home_landmark()
+        if landmark is not None and self._pcb_xy_homed:
+            try:
+                self._printer().move_xy(*landmark)
+                self._show_position(self._printer().get_xy())
+            except (engine_printer.PrinterError, OSError, RuntimeError, ValueError):
+                pass
+        self._set_easy_adjust_visible(False)
+        self._update_easy_status()
+        self._update_registration_ui()
+        self._update_nav()
+        return True
+
+    def _easy_set_probe_height(self):
+        if self._easy_z_unlocked:
+            try:
+                self._easy_reenable_z_if_unlocked()
+            except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+                QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+                return False
+        if self._pcb_surface_z is None:
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                "Z reference required. Use SET PCB SURFACE MANUALLY first.",
+            )
+            return False
+        try:
+            printer = self._printer(manage_z=True)
+            # A newly opened serial connection pulses DTR and clears the
+            # session datum. Re-read it after acquiring the printer so a
+            # target calculated before reconnect can never be commanded.
+            target = self._easy_scan_target_z()
+            if target is None:
+                raise RuntimeError(
+                    "Printer reconnected, so the session Z reference was cleared. "
+                    "Use SET PCB SURFACE MANUALLY again."
+                )
+            printer.move_z(target)
+            reported = printer.get_xyz()[2]
+            if not engine_height.logical_position_matches(reported, target):
+                raise engine_printer.PrinterError(
+                    "Marlin-reported position did not reach the requested logical target"
+                )
+            self._last_commanded_scan_z = target
+            self._refresh_height_ui()
+            self._update_nav()
+            return True
+        except engine_printer.PrinterReset as exc:
+            self._clear_height_datum()
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+
+    def _easy_begin_pcb_surface_touch(self):
+        if not self._pcb_xy_homed:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Home X and Y before setting the PCB surface.")
+            return False
+        printer = self._printer(manage_z=True)
+        # Any manual Z release breaks the previous logical-to-physical datum.
+        self._clear_height_datum()
+        landmark = self._easy_home_landmark()
+        if landmark is not None:
+            printer.move_xy(*landmark)
+        self._easy_touch_logical_z = printer.get_xyz()[2]
+        printer.release_z_holding()
+        self._easy_z_unlocked = True
+        return True
+
+    def _easy_confirm_pcb_touch(self):
+        if not self._easy_z_unlocked:
+            return False
+        printer = self._printer(manage_z=True)
+        printer.enable_z_holding()
+        self._easy_z_unlocked = False
+        surface = self._easy_touch_logical_z
+        if surface is None:
+            surface = printer.get_xyz()[2]
+        self._pcb_surface_z = float(surface)
+        target = self._easy_scan_target_z()
+        printer.move_z(target)
+        reported = printer.get_xyz()[2]
+        if not engine_height.logical_position_matches(reported, target):
+            raise engine_printer.PrinterError(
+                "Marlin-reported position did not reach the requested logical target"
+            )
+        self._last_commanded_scan_z = target
+        self._refresh_height_ui()
+        self._update_nav()
+        return True
+
+    def _easy_cancel_pcb_touch(self):
+        self._easy_reenable_z_if_unlocked()
+        self._clear_height_datum()
+        return True
+
+    def _easy_set_pcb_surface_manually(self):
+        try:
+            if not self._easy_begin_pcb_surface_touch():
+                return False
+        except engine_printer.PrinterReset as exc:
+            self._easy_z_unlocked = False
+            self._clear_height_datum()
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            try:
+                self._easy_cancel_pcb_touch()
+            except (engine_printer.PrinterError, OSError, RuntimeError, ValueError):
+                pass
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        answer = QMessageBox.question(
+            self.ui,
+            DIALOG_TITLE,
+            "Z holding is released. Turn the Z screw until the tip just touches the PCB.\n\n"
+            "Yes = tip is touching the PCB.\n"
+            "No = cancel (Z holding is restored; no surface is stored).",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        try:
+            if answer != QMessageBox.Yes:
+                self._easy_cancel_pcb_touch()
+                self._refresh_easy_height_label()
+                return False
+            return self._easy_confirm_pcb_touch()
+        except engine_printer.PrinterReset as exc:
+            self._easy_z_unlocked = False
+            self._clear_height_datum()
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+
+    def _easy_reset_pcb_surface(self):
+        try:
+            self._easy_cancel_pcb_touch()
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+        self._clear_height_datum()
+        self._refresh_height_ui()
+        self._update_nav()
+        return True
+
+    def _easy_try_load_profile(self):
+        if not self._easy_mode_active():
+            return
+        if self._board_view is None or not self._pcb_xy_homed:
+            return
+        if not self.ui.chkBoardSeated.isChecked():
+            return
+        if not self._selected_profile_name():
+            return
+        document = self._selected_profile_document()
+        if document is None or not document.get("xy_verified"):
+            return
+        self._load_profile()
+
+    def _easy_auto_import_board(self):
+        if self._board_model is not None:
+            return
+        document = self._selected_profile_document()
+        source = str((document or {}).get("source_name") or "").strip()
+        path = self._resolve_odbpp_path(source)
+        if path is None:
+            if not source:
+                return
+            path, _ = QFileDialog.getOpenFileName(
+                self.ui,
+                "Choose the ODB++ job for this board",
+                self.ui.boardPath.text(),
+                "ODB++ archives (*.tgz *.tar *.tar.gz);;All files (*)",
+            )
+        if path:
+            self._import_board_path(path)
+
+    def _resolve_odbpp_path(self, source_name):
+        if not source_name:
+            return None
+        candidate = Path(source_name)
+        if candidate.is_file():
+            return str(candidate)
+        cwd = Path.cwd() / source_name
+        if cwd.is_file():
+            return str(cwd)
+        downloads = Path.home() / "Downloads" / Path(source_name).name
+        if downloads.is_file():
+            return str(downloads)
+        return None
 
     def _home_xy_clicked(self):
         if not self.ui.chkHomeClear.isChecked():
@@ -2110,18 +2933,48 @@ class EMIMapWizard(QtCore.QObject):
         )
 
     def _do_home_xy(self):
-        printer = self._printer()
+        printer = self._printer(manage_z=self._mode() == MODE_PCB)
         printer.drain()
         printer.prepare()
-        printer.home_xy()
         note = None
-        if self.ui.chkAllowSetupZ.isChecked():
-            try:
-                self._drive_to_agreed_plane(printer, required=False)
-            except engine_height.HeightError as exc:
-                note = str(exc)
-            except RuntimeError as exc:
-                note = str(exc)
+        if self._mode() == MODE_PCB:
+            self._easy_reenable_z_if_unlocked(printer)
+            was_at_scan_plane = False
+            target = None
+            if self._easy_mode_active():
+                current_z = printer.get_xyz()[2]
+                target = self._easy_scan_target_z()
+                was_at_scan_plane = (
+                    target is not None
+                    and engine_height.logical_position_matches(current_z, target)
+                )
+            engine_printer.lift_then_home_xy(
+                printer,
+                lift_mm=self._safe_home_lift_mm(),
+                z_max_mm=self._logical_z_max_mm(),
+            )
+            landmark = self._easy_home_landmark()
+            if self._easy_mode_active() and landmark is not None:
+                printer.move_xy(*landmark)
+            elif (
+                not self._easy_mode_active()
+                and self.ui.chkAllowSetupZ.isChecked()
+                and self._pcb_surface_z is not None
+            ):
+                try:
+                    self._drive_to_agreed_plane(printer, required=False)
+                except engine_height.HeightError as exc:
+                    note = str(exc)
+                except RuntimeError as exc:
+                    note = str(exc)
+            if self._easy_mode_active() and was_at_scan_plane:
+                printer.move_z(target)
+                reported = printer.get_xyz()[2]
+                if not engine_height.logical_position_matches(reported, target):
+                    raise RuntimeError("Home could not restore the measurement height")
+                self._last_commanded_scan_z = target
+        else:
+            printer.home_xy()
         return printer.get_xy(), note
 
     def _on_home_ok(self, payload):
@@ -2130,12 +2983,15 @@ class EMIMapWizard(QtCore.QObject):
         self._bump_motion()
         self._clear_landmarks_and_alignment()
         self._show_position(position)
+        self._easy_try_load_profile()
+        self._update_easy_status()
         self._refresh_height_ui()
         if note:
             QMessageBox.warning(self.ui, DIALOG_TITLE, note)
 
     def _on_home_failed(self, exc):
         if isinstance(exc, engine_printer.PrinterReset):
+            self._easy_z_unlocked = False
             self._clear_height_datum()
         self._clear_pcb_homing()
         self.ui.posLabel.setText(f"Homing failed: {exc}")
@@ -2283,7 +3139,8 @@ class EMIMapWizard(QtCore.QObject):
         return f"{base} -> machine X {machine_x:.2f} Y {machine_y:.2f} mm"
 
     def _machine_target(self, board_x, board_y):
-        target = self._registration.transform.to_machine((board_x, board_y))
+        transform = self._scan_transform()
+        target = transform.to_machine((board_x, board_y))
         return float(target[0][0]), float(target[0][1])
 
     def _limit_problem(self, machine_x, machine_y):
@@ -2666,6 +3523,10 @@ class EMIMapWizard(QtCore.QObject):
         combo = self.ui.fixtureProfile
         wanted = combo.currentText()
         try:
+            engine_profiles.seed_glassboard_v1_profile()
+        except (OSError, engine_profiles.ProfileError, TypeError) as exc:
+            logging.info(f"EMI map could not seed Glassboard V1 profile: {exc}")
+        try:
             summaries = engine_profiles.list_profiles()
         except (OSError, engine_profiles.ProfileError) as exc:
             logging.info(f"EMI map could not list fixture profiles: {exc}")
@@ -2743,6 +3604,7 @@ class EMIMapWizard(QtCore.QObject):
         self._noted_warnings = list(loaded.soft_warnings)
         self._clear_selection()
         self._update_registration_ui()
+        self._update_easy_status()
         self._update_nav()
 
     def _acknowledge(self, loaded):
@@ -2875,6 +3737,11 @@ class EMIMapWizard(QtCore.QObject):
                 lines.append("Probe is on the selected point; confirm the alignment.")
             else:
                 lines.append("Select a point, Move probe here, then confirm.")
+        elif self._easy_fixture_ready():
+            dx, dy = self._easy_xy_offset()
+            lines.append("VERIFIED fixture (Easy). Landmark confirms not required.")
+            if dx or dy:
+                lines.append(f"Easy XY offset: X {dx:+.3f} Y {dy:+.3f} mm")
         else:
             last = self._verified_points[-1]["verified_at"]
             lines.append(f"VERIFIED at {last} on {confirmed} point(s)")
@@ -2902,6 +3769,7 @@ class EMIMapWizard(QtCore.QObject):
             if third_useful and not self._registration_problems()
             else ""
         )
+        self._update_easy_status()
 
     def _unfitted_reason(self):
         """Why the recorded landmarks still produced no transform.
@@ -3024,6 +3892,9 @@ class EMIMapWizard(QtCore.QObject):
             handle.close()
             raise
         self.printer_serial = handle
+        # Opening the serial port pulses DTR on this Marlin controller. Its
+        # logical Z can no longer be tied safely to the previous PCB touch.
+        self._clear_height_datum()
         return handle
 
     def _greet_marlin(self, handle, port):
@@ -3235,7 +4106,7 @@ class EMIMapWizard(QtCore.QObject):
         x_start, x_end, y_start, y_end = _board_bounds(self._board_view, step_mm)
         plan = engine_registration.build_plan(
             self._board_view,
-            self._registration.transform,
+            self._scan_transform(),
             x_start=x_start,
             x_end=x_end,
             y_start=y_start,
@@ -3843,7 +4714,27 @@ class EMIMapWizard(QtCore.QObject):
         return engine_height.apply_scan_height_preflight(block, self._scan_height_plan())
 
     def _ensure_at_agreed_scan_plane(self):
-        """Restore once, or refuse, when a datum and requested plane exist."""
+        """Refuse Easy Start unless M114 already matches the Easy target. Never move Z."""
+        if self._easy_mode_active():
+            if self._easy_z_unlocked:
+                self._easy_reenable_z_if_unlocked()
+                raise RuntimeError(
+                    "Z holding was released. Complete SET PCB SURFACE MANUALLY or cancel."
+                )
+            target = self._easy_scan_target_z()
+            if target is None:
+                raise RuntimeError(
+                    "Z reference required. Use SET PCB SURFACE MANUALLY, then SET PROBE HEIGHT."
+                )
+            reported = self._reported_z()
+            if reported is None or not engine_height.logical_position_matches(
+                reported, target
+            ):
+                raise RuntimeError(
+                    f"Probe is not at the {self._default_probe_gap_mm():g} mm measurement height. "
+                    "Use SET PROBE HEIGHT."
+                )
+            return
         try:
             plan = self._scan_height_plan()
         except engine_height.HeightError as exc:
@@ -3877,6 +4768,7 @@ class EMIMapWizard(QtCore.QObject):
         """Marlin rebooted mid-scan, so the frame the landmarks were recorded in
         is gone. Without this the scan fails while the GUI still claims the
         machine is homed, which is the worst of both states."""
+        self._easy_z_unlocked = False
         self._clear_height_datum()
         self._clear_pcb_homing()
 
@@ -3897,6 +4789,8 @@ class EMIMapWizard(QtCore.QObject):
 
     def _sequence(self):
         """The pages this mode uses, in order. Pages outside it are skipped."""
+        if self._easy_mode_active():
+            return EASY_PCB_PAGES
         return MODE_PAGES.get(self._mode(), MODE_PAGES[MODE_RECTANGLE])
 
     def _position(self):
@@ -3938,12 +4832,25 @@ class EMIMapWizard(QtCore.QObject):
         if travel is not None and hasattr(travel, "setVisible"):
             travel.setVisible(not rectangle)
         self._refresh_scan_intro()
+        self._apply_operator_mode_ui()
 
     def _update_header(self):
         sequence = self._sequence()
         position = self._position()
+        if self._easy_mode_active():
+            titles = {
+                PAGE_SETUP: "DUT Setup",
+                PAGE_BOARD: "Select Board",
+                PAGE_REGISTER: "Home & Position (XY)",
+                PAGE_EASY_HEIGHT: "Probe Height (Z)",
+                PAGE_SCAN: "Scan",
+                PAGE_RESULTS: "Results",
+            }
+            title = titles[sequence[position]]
+        else:
+            title = STEP_TITLES[sequence[position]]
         self.ui.stepHeader.setText(
-            f"Step {position + 1} of {len(sequence)} — {STEP_TITLES[sequence[position]]}"
+            f"Step {position + 1} of {len(sequence)} — {title}"
         )
 
     def _next_allowed(self, page):
@@ -3951,6 +4858,7 @@ class EMIMapWizard(QtCore.QObject):
         gates = {
             PAGE_BOARD: lambda: self._board_view is not None,
             PAGE_REGISTER: lambda: not self._registration_problems(),
+            PAGE_EASY_HEIGHT: lambda: self._easy_at_scan_plane(),
             PAGE_ORIGIN: lambda: self.origin_set,
             PAGE_SCAN: lambda: self.result is not None,
         }
@@ -3988,6 +4896,26 @@ class EMIMapWizard(QtCore.QObject):
                 and self._next_allowed(self.ui.wizardStack.currentIndex())
             ),
         }
+        easy_move = getattr(self.ui, "btnEasyMoveToRef", None)
+        if easy_move is not None:
+            allowed[easy_move] = (
+                self._easy_mode_active()
+                and self._pcb_xy_homed
+                and self._easy_home_landmark() is not None
+            )
+        easy_fine = getattr(self.ui, "btnEasyFineAdjust", None)
+        if easy_fine is not None:
+            allowed[easy_fine] = (
+                self._easy_mode_active() and self._pcb_xy_homed and self._profile is not None
+            )
+        easy_reset = getattr(self.ui, "btnEasyResetXy", None)
+        if easy_reset is not None:
+            allowed[easy_reset] = self._easy_mode_active() and self._profile is not None
+        easy_set = getattr(self.ui, "btnEasySetHeight", None)
+        if easy_set is not None:
+            allowed[easy_set] = (
+                self._easy_mode_active() and self._pcb_surface_z is not None
+            )
         # Nothing that moves the machine or changes the plan stays live while a
         # scan is running, so idleness gates every one of them.
         idle = self.thread is None and self._printer_job is None
@@ -3999,6 +4927,14 @@ class EMIMapWizard(QtCore.QObject):
 
     def _next_caption(self):
         page = self.ui.wizardStack.currentIndex()
+        if self._easy_mode_active():
+            return {
+                PAGE_SETUP: "Next: select board",
+                PAGE_BOARD: "Next: home & position",
+                PAGE_REGISTER: "Next: set probe height",
+                PAGE_EASY_HEIGHT: "Next: scan",
+                PAGE_SCAN: "Next: results",
+            }.get(page, "Next")
         caption = NEXT_CAPTIONS.get(page, "Next")
         if isinstance(caption, dict):
             caption = caption.get(self._mode(), "Next")
@@ -4015,6 +4951,10 @@ class EMIMapWizard(QtCore.QObject):
             problems = self._registration_problems()
             if problems:
                 return "Cannot scan yet:\n- " + "\n- ".join(problems)
+        if page == PAGE_EASY_HEIGHT:
+            if self._pcb_surface_z is None:
+                return "Set the PCB surface manually first."
+            return "Use SET PROBE HEIGHT before continuing."
         if page == PAGE_SCAN:
             return "Start the scan first. Results open when it finishes."
         if page == PAGE_BOARD:
@@ -4024,7 +4964,10 @@ class EMIMapWizard(QtCore.QObject):
         return "Cannot continue yet."
 
     def _on_page_changed(self, index):
+        self._last_page_by_mode[self._mode()] = index
         self._update_header()
+        self._apply_operator_mode_ui()
+        self._refresh_height_ui()
         self._update_nav()
         if index == PAGE_REGISTER:
             self._layout_register_page()
@@ -4049,6 +4992,9 @@ class EMIMapWizard(QtCore.QObject):
         position = self._position()
         if position + 1 < len(sequence):
             self.ui.wizardStack.setCurrentIndex(sequence[position + 1])
+        if self.ui.wizardStack.currentIndex() == PAGE_REGISTER:
+            self._easy_try_load_profile()
+            self._update_easy_status()
 
     def _open_folder(self):
         if self.result is None:
@@ -4064,6 +5010,7 @@ class EMIMapWizard(QtCore.QObject):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(overlay_html)))
 
     def _on_close(self):
+        self._last_page_by_mode[self._mode()] = self.ui.wizardStack.currentIndex()
         self._cleanup()
         self.ui.hide()
 
@@ -4074,6 +5021,14 @@ class EMIMapWizard(QtCore.QObject):
             self.thread.quit()
             self.thread.wait(5000)
             self.thread = None
+        if self._easy_z_unlocked:
+            try:
+                self._easy_cancel_pcb_touch()
+            except (engine_printer.PrinterError, OSError, RuntimeError, ValueError):
+                # The port may already have disappeared. Never retain a datum
+                # from an incomplete touch sequence.
+                self._easy_z_unlocked = False
+                self._clear_height_datum()
         self.serial.release()
         self._close_printer()
         self.origin_set = False
