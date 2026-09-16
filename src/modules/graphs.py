@@ -14,8 +14,14 @@ import numpy as np
 from PySide6.QtWidgets import QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsSimpleTextItem
 from PySide6.QtCore import QObject, Qt, QElapsedTimer, QEvent
 from PySide6.QtGui import QLinearGradient, QBrush, QColor, QTransform
-from PySide6.QtGraphs import QSurface3DSeries, QSurfaceDataProxy, QGraphsTheme, QtGraphs3D
-from PySide6.QtGraphsWidgets import Q3DSurfaceWidgetItem
+try:
+    from PySide6.QtGraphs import QSurface3DSeries, QSurfaceDataProxy, QGraphsTheme, QtGraphs3D
+    from PySide6.QtGraphsWidgets import Q3DSurfaceWidgetItem
+except ImportError:
+    # PySide6 6.7 ships QtGraphs without QtGraphsWidgets / QGraphsTheme.
+    # The 2D spectrum, waterfall, and EMI map still start; 3D waterfall is a no-op.
+    QSurface3DSeries = QSurfaceDataProxy = QGraphsTheme = QtGraphs3D = None
+    Q3DSurfaceWidgetItem = None
 # test
 from PySide6.QtQuickWidgets import QQuickWidget
 # test
@@ -44,9 +50,28 @@ class ResizeEventFilter(QObject):
             self.callback()
         return False  # don't consume the event, let it propagate as normal
 
+class _Null3D:
+    """Stand-in for the QtGraphs 3D surface when the extra widgets are absent."""
+
+    def __getattr__(self, name):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+
 class SurfaceGraph(QObject):
 
     def __init__(self, ui_widget, frequencies, readings):
+        if Q3DSurfaceWidgetItem is None:
+            super().__init__()
+            self.surface = _Null3D()
+            self.updater = _Null3D()
+            logging.info("3D waterfall disabled: this PySide6 build has no QtGraphsWidgets")
+            return
+        self._init_qtgraphs(ui_widget, frequencies, readings)
+
+    def _init_qtgraphs(self, ui_widget, frequencies, readings):
         super().__init__()
         self.surface = Q3DSurfaceWidgetItem()
         ui_widget.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)

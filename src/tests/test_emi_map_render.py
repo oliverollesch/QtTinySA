@@ -11,12 +11,13 @@ Run from the src directory:
 import os
 from pathlib import Path
 
+os.environ["PYQTGRAPH_QT_LIB"] = "PySide6"
+# Must be set before the first QApplication: these tests never want a window
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import pytest
 
 pyqtgraph = pytest.importorskip("pyqtgraph")
-
-# Must be set before the first QApplication: these tests never want a window
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6 import QtCore, QtWidgets  # noqa: E402
 from PySide6.QtCore import QFile  # noqa: E402
@@ -24,6 +25,7 @@ from PySide6.QtUiTools import QUiLoader  # noqa: E402
 
 from modules import emi_map  # noqa: E402
 from test_emi_map import (  # noqa: E402
+    _agree_easy_scan_plane,
     _fake_ui,
     _FakeDevice,
     _FakeMessageBox,
@@ -37,8 +39,8 @@ from test_emi_map import (  # noqa: E402
 class _RenderWizard(emi_map.EMIMapWizard):
     """The real wizard, real canvases, only the printer transport faked."""
 
-    def _printer(self):
-        return self.printer
+    def _printer(self, *, manage_z=None):
+        return self._bind_printer_frame(self.printer)
 
 
 class _Click:
@@ -126,7 +128,666 @@ class TestTheShippedDialog:
     def test_opening_lands_on_setup_in_pcb_mode(self, wizard):
         assert wizard.ui.wizardStack.currentIndex() == emi_map.PAGE_SETUP
         assert wizard.ui.scanMode.currentText() == emi_map.MODE_PCB
-        assert wizard.ui.btnNext.text() == "Next: import board"
+        assert wizard.ui.btnNext.text() == "Next: select fixture"
+
+    def test_easy_pcb_has_visible_fixture_and_scan_setup_workspaces(self, wizard):
+        assert wizard.ui.wizardStack.indexOf(wizard.ui.pageFixtureTeach) == emi_map.PAGE_FIXTURE_TEACH
+        assert wizard.ui.wizardStack.indexOf(wizard.ui.pageEasyScanSetup) == emi_map.PAGE_SCAN_SETUP
+        assert wizard.ui.fixtureTeachScroll.widgetResizable() is True
+        assert wizard.ui.fixtureTeachTable.rowCount() == 1
+        assert wizard.ui.fixtureTeachTable.columnCount() == 5
+        assert len(wizard._workflow_step_labels) == 5
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_FIXTURE_TEACH)
+        assert "Step 2 of 5" in wizard.ui.stepHeader.text()
+        expected_home = (
+            "HOME & SET BOARD ZERO"
+            if wizard._p1_bltouch_commanded_xy() is not None
+            else "HOME XY FOR TEACHING"
+        )
+        assert wizard.ui.btnFixtureHomeXyz.text() == expected_home
+        assert wizard.ui.btnFixtureRetryPrinter.text() == "RETRY PRINTER CONNECTION"
+        assert "without moving" in wizard.ui.btnFixtureRetryPrinter.toolTip()
+        assert "250000" in wizard.ui.btnFixtureRetryPrinter.toolTip()
+        assert wizard.ui.fixtureMaxZChange.value() == pytest.approx(0.20)
+        assert wizard.ui.fixtureMaxZChange.minimum() == pytest.approx(0.05)
+        assert "M119" in wizard.ui.btnFixtureVerify.toolTip()
+        assert "Does not send G30" in wizard.ui.btnFixtureVerify.toolTip()
+        assert "P1 upper-left" in wizard.ui.fixtureReferenceMap.text()
+        assert wizard.ui.btnFixtureClearPoint.objectName() == "btnFixtureClearPoint"
+        assert "config.yaml" in wizard.ui.fixtureConfigNote.text()
+        assert not hasattr(wizard.ui, "emiProbeOffsetX")
+        assert not hasattr(wizard.ui, "grpFixtureCalibrations")
+        assert "A/B" in wizard.ui.chkFixtureProbeClear.text()
+        wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+            emi_probe_offset_x_mm=-104.0,
+            emi_probe_offset_y_mm=1.0,
+            pcb_thickness_mm=0.746,
+            pcb_yaw_deg=0.0,
+            e_probe_tip_z_minus_g30_contact_mm=None,
+        )
+        wizard._machine_fixture_document = lambda: wizard._overlay_fixture_config(
+            {"pcb_thickness_mm": 0.746, "e_probe_tip_z_minus_g30_contact_mm": None}
+        )
+        wizard._apply_operator_mode_ui()
+        wizard._refresh_easy_height_label()
+        assert wizard.ui.btnEasySetHeight.isHidden() is False
+        assert wizard.ui.btnEasySetPcbSurface.isHidden() is False
+        assert wizard.ui.btnEasyResetPcbSurface.isHidden() is False
+        assert wizard.ui.grpEasyManualHeight.isHidden() is False
+        assert wizard.ui.grpScanHeight.isHidden() is True
+        page = wizard.ui.pageFixtureTeach
+        assert page.findChild(QtWidgets.QPushButton, "btnEasySetPcbSurface") is not None
+        assert page.findChild(QtWidgets.QPushButton, "btnEasySetHeight") is not None
+
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN_SETUP)
+        assert wizard.ui.glassboardPlacementSide.count() == 2
+        assert wizard.ui.glassboardPlacementSide.itemData(0) == "top"
+        assert wizard.ui.glassboardPlacementSide.itemData(1) == "bottom"
+        assert wizard.ui.chkScanSetupBoardSeated.isVisible()
+
+    def test_progress_strip_follows_height_readiness(self, wizard):
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN)
+        wizard._refresh_workflow_progress()
+        step2 = wizard._workflow_step_labels[1]
+        assert "#067647" not in step2.styleSheet()
+        _agree_easy_scan_plane(wizard)
+        wizard._refresh_workflow_progress()
+        assert "#067647" in step2.styleSheet()
+
+    def test_scan_setup_offers_only_corner_teaching_and_seating(self, wizard):
+        """Step 4 answers 'where is the PCB' with taught points and nothing else."""
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN_SETUP)
+        for side in emi_map.SCAN_SETUP_SIDES:
+            for letter in "AB":
+                button = getattr(wizard.ui, f"btnTeach{side.capitalize()}Corner{letter}")
+                assert button.isVisible()
+            assert getattr(wizard.ui, f"btnUse{side.capitalize()}Side").isVisible()
+            assert getattr(wizard.ui, f"btnClear{side.capitalize()}Corners").isVisible()
+        assert wizard.ui.chkScanSetupBoardSeated.isVisible()
+        # The face toward the probe follows the taught pair, so it is no longer
+        # an operator choice, and the STL/legacy position controls are gone.
+        assert wizard.ui.glassboardPlacementSide.isVisible() is False
+        for name in (
+            "btnApplyGlassboardPlacement",
+            "btnPreviewPcbCenter",
+            "scanSetupAlignment",
+            "btnScanSetupLoadAlignment",
+            "scanSetupHeightStatus",
+        ):
+            assert not hasattr(wizard.ui, name)
+        assert wizard.ui.pageEasyScanSetup.findChild(
+            QtWidgets.QPushButton, "btnEasySetHeight"
+        ) is None
+        hints = [
+            widget.text()
+            for widget in wizard.ui.pageEasyScanSetup.findChildren(QtWidgets.QLabel)
+            if widget.text()
+        ]
+        assert any(
+            "inner-pocket" in text
+            and "pcb_yaw_deg" in text
+            and "height only" in text
+            for text in hints
+        )
+
+    def test_review_and_measure_no_longer_repeats_the_scan_plan(self, wizard):
+        assert not hasattr(wizard.ui, "scanLivePreviewHost")
+        widget = wizard._scan_preview_widget
+        assert widget is not None
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN)
+        assert widget.parent() is wizard.ui.scanPreviewHost
+
+
+    # -------------------------------------------- Step 4 taught PCB corners
+    def _ready_to_teach(self, wizard, monkeypatch):
+        """A homed machine with an imported board and a recording fixture file."""
+        saved = []
+        wizard._board_model = emi_map.engine_board.rectangular_board(57.7621, 12.54)
+        wizard._apply_board_view(rotation_deg=0)
+        monkeypatch.setattr(wizard, "_fixture_profile_name", lambda: "Glassboard")
+        monkeypatch.setattr(
+            wizard,
+            "_machine_fixture_document",
+            lambda: {
+                "fixture_id": "Glassboard",
+                "fixture_teaching": None,
+                "pcb_yaw_deg": 0.0,
+            },
+        )
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures,
+            "save_taught_pcb_corners",
+            lambda name, side, corners: saved.append(
+                (name, side, [dict(entry) for entry in corners])
+            ),
+        )
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures,
+            "clear_taught_pcb_corners",
+            lambda name, side: saved.append((name, side, [])),
+        )
+        wizard.printer = _FakePrinter()
+        wizard._printer = lambda **_kwargs: wizard.printer
+        wizard._pcb_xy_homed = True
+        return saved
+
+    def _teach(self, wizard, side, origin=(20.0, 40.0)):
+        """Capture both corners of one face at a known translation."""
+        view = wizard._board_view_for_side(side)
+        corners = wizard._pcb_corner_board_points(view)
+        for slot, (board_x, board_y) in enumerate(corners):
+            wizard.printer.position = (origin[0] + board_x, origin[1] + board_y)
+            assert wizard._capture_pcb_corner(side, slot)
+        return corners
+
+    def test_two_captured_corners_position_the_board_without_motion(
+        self, wizard, monkeypatch
+    ):
+        taught = self._ready_to_teach(wizard, monkeypatch)
+        wizard.printer.sent.clear()
+        self._teach(wizard, "top")
+
+        assert wizard._active_taught_side == "top"
+        assert wizard._board_view.side == "top"
+        assert wizard._registration is not None
+        assert len(wizard._landmarks) == 2
+        assert wizard._registration.rms_mm == pytest.approx(0.0, abs=1e-6)
+        assert wizard._registration_problems() == []
+        # Teaching reads M114; it never drives the carriage itself.
+        assert [code for code in wizard.printer.sent if code.startswith("G0")] == []
+        assert [entry[0] for entry in taught] == ["Glassboard", "Glassboard"]
+        assert taught[-1][1] == "top"
+        assert len(taught[-1][2]) == 2
+
+    def test_each_face_is_taught_and_stored_separately(self, wizard, monkeypatch):
+        taught = self._ready_to_teach(wizard, monkeypatch)
+        self._teach(wizard, "top", origin=(20.0, 40.0))
+        self._teach(wizard, "bottom", origin=(25.0, 45.0))
+
+        assert wizard._active_taught_side == "bottom"
+        assert wizard._board_view.side == "bottom"
+        assert wizard._taught_side_complete("top")
+        assert wizard._taught_side_complete("bottom")
+        assert {entry[1] for entry in taught} == {"top", "bottom"}
+        # Switching back reuses the stored pair instead of re-teaching.
+        assert wizard._use_taught_pcb_side("top")
+        assert wizard._board_view.side == "top"
+
+    def test_saved_corners_are_restored_for_the_imported_board(
+        self, wizard, monkeypatch
+    ):
+        taught = self._ready_to_teach(wizard, monkeypatch)
+        self._teach(wizard, "top")
+        payload = {entry[1]: entry[2] for entry in taught if entry[2]}
+        store = {
+            side: {
+                "template_id": emi_map.engine_glassboard_fixture.TAUGHT_POCKET_TEMPLATE_ID,
+                "corners": corners,
+            }
+            for side, corners in payload.items()
+        }
+        monkeypatch.setattr(
+            wizard,
+            "_machine_fixture_document",
+            lambda: {"fixture_id": "Glassboard", "taught_pcb_corners": store},
+        )
+        wizard._taught_pcb_corner_points = {
+            side: {} for side in emi_map.SCAN_SETUP_SIDES
+        }
+        wizard._load_taught_pcb_corners()
+
+        assert wizard._taught_side_complete("top")
+        assert wizard._apply_taught_pcb_corners("top")
+
+    def test_clearing_the_measured_face_drops_the_position_it_produced(
+        self, wizard, monkeypatch
+    ):
+        self._ready_to_teach(wizard, monkeypatch)
+        self._teach(wizard, "top")
+        assert wizard._registration is not None
+
+        wizard._clear_pcb_corners("top")
+
+        assert wizard._taught_pcb_corners("top") == {}
+        assert wizard._active_taught_side is None
+        assert wizard._registration is None
+        assert wizard._approved_scan_fingerprint is None
+        assert wizard._registration_problems() != []
+
+    def test_pocket_diagonal_mismatch_blocks_next(self, wizard, monkeypatch):
+        self._ready_to_teach(wizard, monkeypatch)
+        view = wizard._board_view_for_side("top")
+        a, b = wizard._pcb_corner_board_points(view)
+        wizard.printer.position = (20.0, 40.0)
+        assert wizard._capture_pcb_corner("top", 0)
+        wizard.printer.position = (
+            20.0 + 0.5 * (b[0] - a[0]),
+            40.0 + 0.5 * (b[1] - a[1]),
+        )
+        assert wizard._capture_pcb_corner("top", 1)
+        assert wizard._registration is None
+        assert wizard._pocket_pair_state["top"] == "rejected"
+        assert wizard._face_blocks_stl_fallback("top") is True
+        assert wizard._easy_mode_active()
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN_SETUP)
+        wizard.ui.chkScanSetupBoardSeated.setChecked(True)
+        wizard._update_nav()
+        problems = wizard._registration_problems()
+        assert problems
+        assert any("scale" in item for item in problems)
+        assert wizard.ui.btnNext.isEnabled() is False
+
+    def test_v1_saved_pair_requires_recapture_and_does_not_stl_place(
+        self, wizard, monkeypatch
+    ):
+        self._ready_to_teach(wizard, monkeypatch)
+        monkeypatch.setattr(
+            wizard,
+            "_machine_fixture_document",
+            lambda: {
+                "fixture_id": "Glassboard",
+                "fixture_teaching": {"points": []},
+                "taught_pcb_corners": {
+                    "top": [
+                        {"slot": 0, "machine_x_mm": 75.0, "machine_y_mm": 130.0},
+                        {"slot": 1, "machine_x_mm": 131.0, "machine_y_mm": 142.0},
+                    ]
+                },
+            },
+        )
+        wizard._load_taught_pcb_corners()
+        side = wizard._scan_setup_side()
+        applied = wizard._apply_taught_pcb_corners(side)
+        if not applied:
+            wizard._drop_pocket_scan_xy()
+        assert wizard._pocket_pair_state["top"] == "stale"
+        assert wizard._taught_pcb_corners("top") == {}
+        assert applied is False
+        assert wizard._stl_board_placement is None
+        assert any("older meaning" in item for item in wizard._registration_problems())
+        wizard._fixture_verified_session = True
+        assert wizard._maybe_auto_place_glassboard() is False
+        assert wizard._stl_board_placement is None
+
+    def test_empty_teaching_does_not_stl_fallback(self, wizard, monkeypatch):
+        self._ready_to_teach(wizard, monkeypatch)
+        side = wizard._scan_setup_side()
+        if not wizard._apply_taught_pcb_corners(side):
+            wizard._drop_pocket_scan_xy()
+        assert wizard._easy_mode_active()
+        assert wizard._maybe_auto_place_glassboard() is False
+        assert wizard._registration is None
+        assert wizard._stl_board_placement is None
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN)
+        wizard.ui.chkTravelClearBoard.setChecked(True)
+        with pytest.raises(
+            RuntimeError,
+            match="Capture both inner-pocket|Approve the scan plan|Registration is not fit",
+        ):
+            wizard._pcb_preflight()
+
+    def test_cad_length_ab_installs_even_when_p1_xy_disagrees(
+        self, wizard, monkeypatch
+    ):
+        self._ready_to_teach(wizard, monkeypatch)
+        p1 = emi_map.engine_fixture_teaching.FixtureReferencePoint(
+            "P1", -53.081, 17.0, 80.0, 125.0, 80.0, 125.0, 1.0, 1.0
+        )
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching([p1])
+        monkeypatch.setattr(
+            wizard,
+            "_machine_fixture_document",
+            lambda: {
+                "fixture_id": "Glassboard",
+                "fixture_teaching": teaching,
+                "emi_probe_offset_mm": {"x": -104.0, "y": 1.0},
+                "emi_probe_offset_source": "typed",
+                "emi_probe_offset_convention": "v2_tip_minus_bltouch",
+                "pcb_yaw_deg": 0.0,
+            },
+        )
+        self._teach(wizard, "top")
+        assert wizard._registration is not None
+        assert wizard._pocket_pair_state["top"] == "ok"
+        assert wizard._taught_pocket_placement["placement"] == "taught_pocket"
+        assert not any("disagree" in item for item in wizard._registration_problems())
+        wizard._fixture_verified_session = True
+        wizard._approved_scan_fingerprint = "stale"
+        wizard.ui.chkScanSetupBoardSeated.setChecked(True)
+        wizard.ui.chkBoardSeated.setChecked(True)
+        wizard.ui.chkTravelClearBoard.setChecked(True)
+        _agree_easy_scan_plane(wizard)
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN)
+        with pytest.raises(RuntimeError, match="Approve the scan plan"):
+            wizard._pcb_preflight()
+        wizard._clear_pcb_corners("top")
+        assert wizard._approved_scan_fingerprint is None
+        assert wizard._registration is None
+
+    def test_top_bottom_selection_does_not_stl_place(self, wizard, monkeypatch):
+        self._ready_to_teach(wizard, monkeypatch)
+        self._teach(wizard, "top")
+        assert wizard._registration is not None
+        wizard.ui.glassboardPlacementSide.setCurrentIndex(1)
+        assert wizard._stl_board_placement is None
+        assert wizard._registration is None
+        assert wizard._taught_pocket_placement is None
+        assert wizard._maybe_auto_place_glassboard() is False
+
+    def test_pocket_path_approve_and_start_do_not_move_z(self, wizard, monkeypatch):
+        self._ready_to_teach(wizard, monkeypatch)
+        self._teach(wizard, "top")
+        wizard._fixture_verified_session = True
+        wizard.ui.chkScanSetupBoardSeated.setChecked(True)
+        wizard.ui.chkBoardSeated.setChecked(True)
+        wizard.ui.chkTravelClearBoard.setChecked(True)
+        _agree_easy_scan_plane(wizard)
+        wizard._refresh_scan_preview()
+        printer = wizard.printer
+        printer.sent.clear()
+        widget = wizard._scan_preview_widget
+        widget.approve_plan()
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN)
+        wizard._pcb_preflight()
+        assert not any(
+            cmd.startswith("G1 Z") or cmd.startswith("G0 Z") for cmd in printer.sent
+        )
+
+    def test_teaching_before_homing_is_refused(self, wizard, monkeypatch):
+        self._ready_to_teach(wizard, monkeypatch)
+        wizard._pcb_xy_homed = False
+        _FakeMessageBox.warnings = []
+
+        assert wizard._capture_pcb_corner("top", 0) is False
+        assert wizard._taught_pcb_corners("top") == {}
+        assert "Home X and Y" in _FakeMessageBox.warnings[-1]
+
+    def test_visible_scan_setup_seating_confirmation_controls_next(self, wizard):
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_SCAN_SETUP)
+        wizard._registration_problems = lambda: []
+        wizard._easy_at_scan_plane = lambda: True
+        wizard.ui.chkScanSetupBoardSeated.setChecked(False)
+        wizard._update_nav()
+        assert wizard.ui.chkBoardSeated.isChecked() is False
+        assert wizard.ui.btnNext.isEnabled() is False
+        assert "fully seated" in wizard.ui.btnNext.toolTip()
+
+        wizard.ui.chkScanSetupBoardSeated.setChecked(True)
+        assert wizard.ui.chkBoardSeated.isChecked() is True
+        assert wizard.ui.btnNext.isEnabled() is True
+
+    def test_stl_middle_holder_places_top_or_bottom_without_manual_landmarks(
+        self, wizard, monkeypatch, tmp_path
+    ):
+        points = [
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                name, fixture_x, fixture_y,
+                machine_x, machine_y, machine_x, machine_y, 2.0, 2.0
+            )
+            for name, fixture_x, fixture_y, machine_x, machine_y in (
+                ("P1", -53.081, 17.0, 76.919, 117.0),
+                ("P2", -53.081, -17.0, 76.919, 83.0),
+                ("P3", 53.081, -17.0, 183.081, 83.0),
+                ("P4", 53.081, 17.0, 183.081, 117.0),
+            )
+        ]
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching(points)
+        monkeypatch.setattr(
+            wizard, "_machine_fixture_document", lambda: {
+                "fixture_id": "Glassboard",
+                "fixture_teaching": teaching,
+                "emi_probe_offset_mm": {"x": 32.0, "y": -4.0},
+                "emi_probe_offset_source": "typed",
+                "emi_probe_offset_convention": "v2_tip_minus_bltouch",
+            }
+        )
+        wizard._fixture_verified_session = True
+        wizard._pcb_xy_homed = True
+        wizard._board_model = emi_map.engine_board.rectangular_board(57.762, 12.54)
+        wizard.ui.glassboardPlacementSide.setCurrentIndex(1)
+
+        assert wizard._set_glassboard_middle_placement("bottom", persist=False)
+        assert wizard._board_view.side == "bottom"
+        assert wizard._registration is not None
+        assert wizard._stl_board_placement["placement"] == "middle_glassboard_support"
+        assert wizard._stl_board_placement["board_side_facing_probe"] == "bottom"
+        assert len(wizard._landmarks) == 2
+        assert "BOTTOM faces the probe" in wizard.ui.glassboardPlacementStatus.text()
+        provenance = wizard._provenance()
+        assert provenance["registration_source"] == "glassboard_stl_middle_holder"
+        assert provenance["machine_fixture_document"]["fixture_teaching"] == teaching
+        wizard._write_profile_copy(tmp_path)
+        assert (tmp_path / "machine_fixture.json").exists()
+        assert not (tmp_path / "fixture_profile.json").exists()
+
+    def test_saved_middle_holder_association_restores_for_later_measurements(
+        self, wizard, monkeypatch
+    ):
+        points = [
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                name, x, y, x + 130.0, y + 100.0,
+                x + 130.0, y + 100.0, 2.0, 2.0
+            )
+            for name, (x, y) in
+            emi_map.engine_glassboard_fixture.REFERENCE_FIXTURE_XY.items()
+        ]
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching(points)
+        wizard._board_model = emi_map.engine_board.rectangular_board(57.762, 12.54)
+        top_view = wizard._board_model.view("top", 0)
+        document = {
+            "fixture_id": "Glassboard",
+            "fixture_teaching": teaching,
+            "emi_probe_offset_mm": {"x": 32.0, "y": -4.0},
+            "emi_probe_offset_source": "typed",
+            "emi_probe_offset_convention": "v2_tip_minus_bltouch",
+            "board_placements": {
+                top_view.geometry_hash: {
+                    "template_id": emi_map.engine_glassboard_fixture.TEMPLATE_ID,
+                    "board_side_facing_probe": "top",
+                }
+            },
+        }
+        monkeypatch.setattr(wizard, "_machine_fixture_document", lambda: document)
+        wizard._fixture_verified_session = True
+        wizard._pcb_xy_homed = True
+
+        assert wizard._restore_glassboard_middle_placement()
+        assert wizard._board_view.side == "top"
+        assert wizard._stl_board_placement is not None
+        assert "Restored" in wizard.ui.glassboardPlacementStatus.text()
+
+    def test_emi_probe_offset_shifts_placed_machine_center(self, wizard, monkeypatch):
+        points = [
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                name, fixture_x, fixture_y,
+                machine_x, machine_y, machine_x, machine_y, 2.0, 2.0
+            )
+            for name, fixture_x, fixture_y, machine_x, machine_y in (
+                ("P1", -53.081, 17.0, 76.919, 117.0),
+                ("P2", -53.081, -17.0, 76.919, 83.0),
+                ("P3", 53.081, -17.0, 183.081, 83.0),
+                ("P4", 53.081, 17.0, 183.081, 117.0),
+            )
+        ]
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching(points)
+        wizard._board_model = emi_map.engine_board.rectangular_board(57.762, 12.54)
+        wizard._apply_board_view(rotation_deg=0)
+        monkeypatch.setattr(
+            wizard, "_machine_fixture_document", lambda: {
+                "fixture_id": "Glassboard",
+                "fixture_teaching": teaching,
+                "emi_probe_offset_mm": {"x": 32.0, "y": -4.0},
+            }
+        )
+        wizard._fixture_verified_session = True
+        wizard._pcb_xy_homed = True
+        assert wizard._set_glassboard_middle_placement(
+            "top", persist=False, announce=False
+        )
+        _, expected = emi_map.engine_glassboard_fixture.board_registration_in_middle_holder(
+            wizard._board_view, teaching, emi_probe_offset_mm=(32.0, -4.0)
+        )
+        assert wizard._stl_board_placement["machine_support_center_mm"] == pytest.approx(
+            expected["machine_support_center_mm"]
+        )
+        assert "E-probe offset +32.000, -4.000 mm" in wizard.ui.glassboardPlacementStatus.text()
+
+    def test_place_pcb_warns_when_e_probe_offset_unset(self, wizard, monkeypatch):
+        points = [
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                name, x, y, x + 130.0, y + 100.0,
+                x + 130.0, y + 100.0, 2.0, 2.0
+            )
+            for name, (x, y) in
+            emi_map.engine_glassboard_fixture.REFERENCE_FIXTURE_XY.items()
+        ]
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching(points)
+        monkeypatch.setattr(
+            wizard, "_machine_fixture_document", lambda: {
+                "fixture_id": "Glassboard",
+                "fixture_teaching": teaching,
+            }
+        )
+        wizard._fixture_verified_session = True
+        wizard._pcb_xy_homed = True
+        wizard._board_model = emi_map.engine_board.rectangular_board(57.762, 12.54)
+        emi_map.QMessageBox.warnings = []
+        assert wizard._set_glassboard_middle_placement("top", persist=False) is False
+        assert wizard._stl_board_placement is None
+        assert any(
+            "config.yaml" in text
+            for text in emi_map.QMessageBox.warnings
+        )
+
+    def test_fixture_verify_moves_to_taught_bltouch_xy_not_e_probe_offset(
+        self, wizard, monkeypatch
+    ):
+        points = [
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                name, fixture_x, fixture_y,
+                machine_x, machine_y, machine_x, machine_y, 2.0, 2.0
+            )
+            for name, fixture_x, fixture_y, machine_x, machine_y in (
+                ("P1", -53.081, 17.0, 79.0, 128.0),
+                ("P2", -53.081, -17.0, 79.0, 97.0),
+                ("P3", 53.081, -17.0, 179.0, 97.0),
+                ("P4", 53.081, 17.0, 179.0, 127.0),
+            )
+        ]
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching(points)
+        document = {
+            "fixture_id": "Glassboard",
+            "fixture_teaching": teaching,
+            "emi_probe_offset_mm": {"x": 32.0, "y": -4.0},
+        }
+        printer = _FakePrinter()
+        wizard._printer = lambda **_kwargs: printer
+        monkeypatch.setattr(wizard, "_fixture_profile_name", lambda: "Glassboard")
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures, "read_fixture", lambda _name: document
+        )
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures,
+            "save_verification",
+            lambda *_args, **_kwargs: {
+                **document,
+                "fixture_teaching": {
+                    **teaching,
+                    "latest_verification": {"passed": True},
+                },
+            },
+        )
+        wizard._do_fixture_verify(0.20, 0.10)
+        assert [item for item in printer.sent if item.startswith("G0 ")] == [
+            "G0 X79.0 Y128.0",
+            "G0 X79.0 Y97.0",
+            "G0 X179.0 Y97.0",
+            "G0 X179.0 Y127.0",
+        ]
+        assert printer.sent.count("G28 X Y") == 1
+
+    def test_fixture_verify_skips_home_when_already_homed(self, wizard, monkeypatch):
+        points = [
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                name, fixture_x, fixture_y,
+                machine_x, machine_y, machine_x, machine_y, 2.0, 2.0
+            )
+            for name, fixture_x, fixture_y, machine_x, machine_y in (
+                ("P1", -53.081, 17.0, 79.0, 128.0),
+                ("P2", -53.081, -17.0, 79.0, 97.0),
+                ("P3", 53.081, -17.0, 179.0, 97.0),
+                ("P4", 53.081, 17.0, 179.0, 127.0),
+            )
+        ]
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching(points)
+        document = {"fixture_id": "Glassboard", "fixture_teaching": teaching}
+        printer = _FakePrinter()
+        wizard._printer = lambda **_kwargs: printer
+        wizard._fixture_xyz_homed = True
+        monkeypatch.setattr(wizard, "_fixture_profile_name", lambda: "Glassboard")
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures, "read_fixture", lambda _name: document
+        )
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures,
+            "save_verification",
+            lambda *_args, **_kwargs: {
+                **document,
+                "fixture_teaching": {
+                    **teaching,
+                    "latest_verification": {"passed": True},
+                },
+            },
+        )
+        wizard._do_fixture_verify(0.20, 0.10)
+        assert "G28 X Y" not in printer.sent
+        assert [item for item in printer.sent if item.startswith("G0 ")] == [
+            "G0 X79.0 Y128.0",
+            "G0 X79.0 Y97.0",
+            "G0 X179.0 Y97.0",
+            "G0 X179.0 Y127.0",
+        ]
+
+    def test_fixture_verify_uses_the_limits_visible_to_the_operator(self, wizard):
+        captured = {}
+        wizard._machine_fixture_document = lambda: {"fixture_teaching": {"points": []}}
+        wizard._start_printer_job = lambda work, *_args: captured.update(work=work)
+        wizard.ui.chkFixtureProbeClear.setChecked(True)
+        wizard.ui.fixtureMaxZChange.setValue(0.325)
+        wizard.ui.fixtureMaxResidual.setValue(0.125)
+        wizard._fixture_verify_clicked()
+        assert captured["work"].args == pytest.approx((0.325, 0.125))
+
+    def test_fixture_verification_pass_unlocks_insert_board(self, wizard):
+        points = [
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                name, x, y, x, y, x, y, 10.0, 10.0
+            )
+            for name, x, y in (
+                ("P1", 10.0, 10.0),
+                ("P2", 90.0, 10.0),
+                ("P3", 10.0, 50.0),
+                ("P4", 90.0, 50.0),
+            )
+        ]
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching(points)
+        result = emi_map.engine_fixture_teaching.compare_fixture_verification(
+            teaching, points
+        )
+        teaching["latest_verification"] = result
+        document = {"fixture_teaching": teaching}
+        wizard._machine_fixture_document = lambda: document
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_FIXTURE_TEACH)
+        wizard._on_fixture_verify_ok((document, result))
+        assert wizard._fixture_verified_session is True
+        assert wizard.ui.btnNext.isEnabled() is False
+        assert "FIXTURE READY" not in wizard.ui.fixtureReadySummary.text()
+        _agree_easy_scan_plane(wizard)
+        wizard._update_nav()
+        assert wizard.ui.btnNext.isEnabled() is True
+        assert wizard.ui.btnNext.text() == "Next: insert board"
+        assert wizard.ui.fixtureReadySummary.text().startswith("FIXTURE READY")
+        assert wizard.ui.nextBlockReason.text() == ""
 
     def test_the_rectangle_size_boxes_follow_the_mode(self, wizard):
         assert not wizard.ui.widthMm.isEnabled()
@@ -138,7 +799,7 @@ class TestTheShippedDialog:
 
     def test_next_walks_the_pcb_pages(self, wizard):
         wizard._on_next()
-        assert wizard.ui.wizardStack.currentIndex() == emi_map.PAGE_BOARD
+        assert wizard.ui.wizardStack.currentIndex() == emi_map.PAGE_FIXTURE_TEACH
 
     def test_the_setup_form_scrolls_instead_of_growing(self, wizard):
         scroll = wizard.ui.setupScroll
@@ -153,7 +814,7 @@ class TestTheShippedDialog:
         assert not wizard.ui.btnRotateCw.isEnabled()
 
     def test_the_board_page_has_no_embedded_plot(self, wizard):
-        wizard._on_next()
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_BOARD)
         assert wizard.ui.findChild(QtWidgets.QWidget, "boardPlot") is None
         assert wizard.ui.findChild(QtWidgets.QWidget, "btnFitBoard") is None
         assert wizard.ui.btnOpenBoardSelector.isVisible()
@@ -234,6 +895,7 @@ class TestBoardRendering:
     def test_the_live_map_is_placed_in_board_coordinates(self, wizard):
         wizard._apply_board_view()
         register(wizard)
+        _agree_easy_scan_plane(wizard)
         wizard.ui.chkTravelClearBoard.setChecked(True)
         config = wizard.build_config()
         plan = wizard._preflight(config)
@@ -248,6 +910,7 @@ class TestBoardRendering:
         a paint that raises is retried until the whole application dies."""
         wizard._apply_board_view()
         register(wizard)
+        _agree_easy_scan_plane(wizard)
         wizard.ui.chkTravelClearBoard.setChecked(True)
         config = wizard.build_config()
         wizard._prepare_live_plot(config, wizard._preflight(config))
@@ -256,6 +919,7 @@ class TestBoardRendering:
     def test_the_map_paints_with_only_one_reading_in_it(self, wizard):
         wizard._apply_board_view()
         register(wizard)
+        _agree_easy_scan_plane(wizard)
         wizard.ui.chkTravelClearBoard.setChecked(True)
         config = wizard.build_config()
         wizard._prepare_live_plot(config, wizard._preflight(config))
@@ -566,5 +1230,329 @@ class TestLargeBoardSelector:
             assert after[1] == pytest.approx(zoomed[1], abs=1e-6)
         finally:
             dialog.close()
+
+
+class TestGlassboardAutoSetup:
+    """STL point datums, P1-only origin, and the Step 4 preview gates."""
+
+    @pytest.fixture
+    def wizard(self, real_ui, monkeypatch):
+        monkeypatch.setattr(emi_map, "QMessageBox", _FakeMessageBox)
+        _FakeMessageBox.warnings = []
+        made = emi_map.EMIMapWizard(real_ui, _FakeUsbInstr([_FakeDevice()]), None)
+        made.start()
+        return made
+
+    def test_probed_point_stores_stl_xy_and_m119_datum(self, wizard, monkeypatch):
+        saved = []
+        monkeypatch.setattr(wizard, "_fixture_profile_name", lambda: "Glassboard")
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures,
+            "save_teaching",
+            lambda name, teaching, overwrite=False: saved.append(
+                (name, teaching, overwrite)
+            ) or {"fixture_teaching": teaching},
+        )
+        printer = _FakePrinter(position=(10.0, 20.0))
+        printer.z = 15.0
+        wizard._printer = lambda **_kwargs: printer
+        payload = wizard._do_fixture_probe_point("P1")
+        point = payload["point"]
+        assert (point.fixture_x, point.fixture_y) == (
+            emi_map.engine_glassboard_fixture.REFERENCE_FIXTURE_XY["P1"]
+        )
+        assert (point.commanded_machine_x, point.commanded_machine_y) == pytest.approx(
+            (10.0, 20.0)
+        )
+        assert point.z_datum == "m119_z_probe"
+        assert point.touch_z_raw == pytest.approx(10.0)
+        assert payload["board_zero"] is not None
+        assert payload["board_zero"].board_zero_logical_z_mm == pytest.approx(10.0)
+        assert "G30" not in printer.sent
+        assert "M119" in printer.sent
+        wizard._on_fixture_probe_ok(payload)
+        assert wizard._bltouch_board_zero_z == pytest.approx(10.0)
+        assert "Scan height set:" not in wizard.ui.fixtureTeachStatus.text()
+        assert emi_map.BOARD_ZERO_COMPLETE_TEXT not in wizard.ui.fixtureTeachStatus.text()
+        assert emi_map.EASY_HEIGHT_NEED_BOARD_ZERO in wizard.ui.fixtureTeachStatus.text()
+        assert saved and saved[0][0] == "Glassboard" and saved[0][2] is True
+        assert saved[0][1]["points"][0]["name"] == "P1"
+        assert "next measurement" in wizard.ui.fixtureTeachStatus.text()
+
+    def test_saved_p1_is_restored_when_the_fixture_is_selected(self, wizard):
+        point = emi_map.engine_fixture_teaching.FixtureReferencePoint(
+            "P1", -53.081, 17.0, 79.0, 128.0, 79.0, 128.0, 2.0, 2.0
+        )
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching([point])
+        wizard._fixture_teaching_points = {}
+        wizard._render_fixture_teaching(teaching)
+        assert wizard._p1_bltouch_commanded_xy() == pytest.approx((79.0, 128.0))
+        assert wizard.ui.fixtureTeachTable.item(0, 1).text() == "79.000"
+
+    def test_refresh_selects_a_fixture_when_the_combo_has_no_index(self, wizard, monkeypatch):
+        point = emi_map.engine_fixture_teaching.FixtureReferencePoint(
+            "P1", -53.081, 17.0, 79.0, 128.0, 79.0, 128.0, 2.0, 2.0
+        )
+        teaching = emi_map.engine_fixture_teaching.build_fixture_teaching([point])
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures,
+            "list_fixtures",
+            lambda: [{"name": "Glassboard", "taught": True, "error": ""}],
+        )
+        monkeypatch.setattr(
+            wizard,
+            "_machine_fixture_document",
+            lambda: {"fixture_name": "Glassboard", "fixture_teaching": teaching},
+        )
+        combo = wizard.ui.machineFixtureProfile
+        combo.blockSignals(True)
+        combo.clear()
+        combo.blockSignals(False)
+        wizard._active_machine_fixture_name = ""
+        wizard._refresh_machine_fixtures()
+        assert combo.currentText() == "Glassboard"
+        assert wizard._p1_bltouch_commanded_xy() == pytest.approx((79.0, 128.0))
+
+    def test_config_overlay_outranks_stored_fixture_calibrations(self, wizard):
+        stored = {
+            "fixture_id": "Glassboard",
+            "pcb_thickness_mm": 9.9,
+            "pcb_yaw_deg": 180.0,
+            "e_probe_tip_z_minus_g30_contact_mm": 7.0,
+            "emi_probe_offset_mm": {"x": 1.0, "y": 2.0},
+        }
+        wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+            emi_probe_offset_x_mm=-104.0,
+            emi_probe_offset_y_mm=1.0,
+            pcb_thickness_mm=1.6,
+            pcb_yaw_deg=0.0,
+            e_probe_tip_z_minus_g30_contact_mm=-2.0,
+        )
+        overlaid = wizard._overlay_fixture_config(stored)
+        assert stored["emi_probe_offset_mm"] == {"x": 1.0, "y": 2.0}
+        assert overlaid["emi_probe_offset_mm"] == {"x": -104.0, "y": 1.0}
+        assert overlaid["pcb_thickness_mm"] == pytest.approx(1.6)
+        assert overlaid["pcb_yaw_deg"] == pytest.approx(0.0)
+        assert overlaid["e_probe_tip_z_minus_g30_contact_mm"] == pytest.approx(-2.0)
+
+    def test_blank_yaml_does_not_erase_stored_fixture_calibrations(self, wizard):
+        stored = {
+            "fixture_id": "Glassboard",
+            "pcb_thickness_mm": 1.6,
+            "e_probe_tip_z_minus_g30_contact_mm": 0.0,
+        }
+        wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+            emi_probe_offset_x_mm=-104.0,
+            emi_probe_offset_y_mm=1.0,
+            pcb_thickness_mm=None,
+            pcb_yaw_deg=0.0,
+            e_probe_tip_z_minus_g30_contact_mm=None,
+        )
+        wizard._fixture_config_error = ""
+        overlaid = wizard._overlay_fixture_config(stored)
+        assert overlaid["pcb_thickness_mm"] == pytest.approx(1.6)
+        assert overlaid["e_probe_tip_z_minus_g30_contact_mm"] == pytest.approx(0.0)
+
+    def test_invalid_yaml_does_not_fall_back_to_stored_cal(self, wizard):
+        stored = {
+            "fixture_id": "Glassboard",
+            "pcb_thickness_mm": 1.6,
+            "e_probe_tip_z_minus_g30_contact_mm": 0.0,
+        }
+        wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig()
+        wizard._fixture_config_error = "fixture pcb_thickness_mm must be finite and >= 0"
+        overlaid = wizard._overlay_fixture_config(stored)
+        assert overlaid["pcb_thickness_mm"] is None
+        assert overlaid["e_probe_tip_z_minus_g30_contact_mm"] is None
+        assert "invalid" in wizard._easy_height_block_reason()
+
+    def test_clear_p1_forgets_in_memory_point_and_board_zero(self, wizard):
+        wizard._fixture_teaching_points["P1"] = (
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                "P1", -53.081, 17.0, 79.0, 128.0, 79.0, 128.0, 2.0, 2.0
+            )
+        )
+        wizard._bltouch_board_zero_z = 12.0
+        wizard._bltouch_board_zero_frame = 1
+        wizard._z_logical_frame = 1
+        wizard._pcb_surface_z = 10.0
+        emi_map.QMessageBox.answer = emi_map.QMessageBox.Yes
+        try:
+            wizard._fixture_clear_point_clicked()
+            assert wizard._fixture_teaching_points == {}
+            assert wizard._bltouch_board_zero_z is None
+            assert wizard._pcb_surface_z is None
+            assert wizard._p1_bltouch_commanded_xy() is None
+            assert "P1 cleared" in wizard.ui.fixtureTeachStatus.text()
+        finally:
+            emi_map.QMessageBox.answer = emi_map.QMessageBox.No
+
+    def test_approve_and_play_send_zero_printer_commands(self, wizard):
+        printer = _FakePrinter()
+        wizard._printer = lambda **_kwargs: printer
+        wizard.printer = printer
+        widget = wizard._scan_preview_widget
+        assert widget is not None
+        assert widget.btn_approve.isEnabled() is False
+        printer.sent.clear()
+        widget.play_simulation()
+        widget.stop_simulation()
+        widget.approve_plan()
+        assert printer.sent == []
+        assert "not collision detection" in widget.notice.text().lower()
+
+    def test_scan_preview_uses_plotwidget_not_opengl(self, wizard):
+        import sys
+
+        widget = wizard._scan_preview_widget
+        assert widget is not None
+        assert isinstance(widget._plot, pyqtgraph.PlotWidget)
+        assert "pyqtgraph.opengl" not in sys.modules
+
+    def test_invalidating_the_plan_clears_approval(self, wizard):
+        wizard._approved_scan_fingerprint = "stale-fingerprint"
+        wizard._invalidate_plan()
+        assert wizard._approved_scan_fingerprint is None
+        assert wizard._plan is None
+
+    def test_step_four_does_not_repeat_probe_height(self, wizard):
+        wizard._refresh_calculated_height()
+        assert not hasattr(wizard.ui, "scanSetupHeightStatus")
+        page = wizard.ui.pageEasyScanSetup
+        assert page.findChild(QtWidgets.QGroupBox, "scanSetupHeightStatus") is None
+        assert "not calibrated" not in page.objectName().lower()
+
+    def test_incomplete_step_2_never_says_fixture_ready(self, wizard):
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_FIXTURE_TEACH)
+        wizard._update_nav()
+        assert wizard.ui.btnNext.isEnabled() is False
+        summary = wizard.ui.fixtureReadySummary.text()
+        assert "FIXTURE READY" not in summary
+        assert summary.startswith("Complete Step 2 — ")
+        reason = wizard._fixture_step2_block_reason()
+        assert reason
+        assert reason in summary
+        assert reason in wizard.ui.btnNext.toolTip()
+        assert reason in wizard.ui.nextBlockReason.text()
+        assert "calibration saved" not in summary
+
+    def test_full_height_setup_enables_next_and_says_ready(self, wizard):
+        wizard.ui.wizardStack.setCurrentIndex(emi_map.PAGE_FIXTURE_TEACH)
+        _agree_easy_scan_plane(wizard)
+        wizard._update_nav()
+        assert wizard._easy_height_ready() is True
+        assert wizard.ui.btnNext.isEnabled() is True
+        assert wizard.ui.fixtureReadySummary.text().startswith("FIXTURE READY")
+        assert (
+            emi_map.BOARD_ZERO_COMPLETE_TEXT in wizard.ui.fixtureReadySummary.text()
+            or "Scan height set:" in wizard.ui.fixtureReadySummary.text()
+        )
+        assert wizard.ui.nextBlockReason.text() == ""
+
+    def test_saved_p1_is_loaded_by_a_new_session(self, real_ui, monkeypatch, tmp_path):
+        root = tmp_path / "machine_fixtures"
+        monkeypatch.setattr(emi_map.engine_machine_fixtures, "fixtures_dir", lambda: root)
+        monkeypatch.setattr(emi_map, "QMessageBox", _FakeMessageBox)
+        _FakeMessageBox.warnings = []
+        emi_map.engine_machine_fixtures.create_fixture("Glassboard")
+        emi_map.engine_machine_fixtures.save_fixture_calibrations(
+            "Glassboard",
+            pcb_thickness_mm=0.746,
+        )
+        first = emi_map.EMIMapWizard(real_ui, _FakeUsbInstr([_FakeDevice()]), None)
+        first.start()
+        first.ui.wizardStack.setCurrentIndex(emi_map.PAGE_FIXTURE_TEACH)
+        printer = _FakePrinter(position=(80.0, 125.0))
+        printer.z = 15.0
+        first._printer = lambda **_kwargs: printer
+        first._fixture_xyz_homed = True
+        first.ui.chkFixtureProbeClear.setChecked(True)
+        payload = first._do_fixture_probe_point("P1")
+        first._on_fixture_probe_ok(payload)
+        assert first._fixture_save_plane() is True
+        stored = emi_map.engine_machine_fixtures.read_fixture("Glassboard")
+        points = stored["fixture_teaching"]["points"]
+        assert points[0]["name"] == "P1"
+        assert points[0]["commanded_machine_x"] == pytest.approx(80.0)
+        assert points[0]["commanded_machine_y"] == pytest.approx(125.0)
+        assert stored.get("e_probe_tip_z_minus_g30_contact_mm") in (None, "")
+        assert stored.get("pcb_thickness_mm") == pytest.approx(0.746)
+        assert "PASS — P1 saved on this fixture" in first.ui.fixtureTeachStatus.text()
+        assert "P1 XY saved (80.00, 125.00)" in first.ui.fixtureBoardSummary.text()
+        assert first._bltouch_board_zero_z == pytest.approx(10.0)
+        first.ui.hide()
+
+        handle = QFile(str(Path(emi_map.__file__).with_name("emi_map.ui")))
+        handle.open(QFile.ReadOnly)
+        try:
+            second_ui = _UiLoader().load(handle)
+        finally:
+            handle.close()
+        second = emi_map.EMIMapWizard(second_ui, _FakeUsbInstr([_FakeDevice()]), None)
+        second._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+            emi_probe_offset_x_mm=-104.0,
+            emi_probe_offset_y_mm=1.0,
+            pcb_thickness_mm=0.746,
+            pcb_yaw_deg=0.0,
+            e_probe_tip_z_minus_g30_contact_mm=None,
+        )
+        second._fixture_config_error = ""
+        second._render_emi_probe_offset()
+        second.start()
+        second.ui.wizardStack.setCurrentIndex(emi_map.PAGE_FIXTURE_TEACH)
+        second._update_nav()
+        assert second._fixture_profile_name() == "Glassboard"
+        assert second._p1_bltouch_commanded_xy() == pytest.approx((80.0, 125.0))
+        assert second.ui.btnFixtureHomeXyz.text() == "HOME & SET BOARD ZERO"
+        assert second._bltouch_board_zero_z is None
+        assert second._easy_verified_scan_z is None
+        assert second._easy_height_ready() is False
+        assert second.ui.btnNext.isEnabled() is False
+        summary = second.ui.fixtureReadySummary.text()
+        assert "FIXTURE READY" not in summary
+        assert emi_map.EASY_HEIGHT_NEED_BOARD_ZERO in summary
+        assert emi_map.EASY_HEIGHT_NEED_BOARD_ZERO in second.ui.nextBlockReason.text()
+        assert "P1 XY saved (80.00, 125.00)" in second.ui.fixtureBoardSummary.text()
+        note = second.ui.fixtureConfigNote.text()
+        assert "PCB thickness 0.746 mm (config.yaml override)" in note
+        assert emi_map.EASY_VERTICAL_UNCALIBRATED in note
+        assert "Vertical E-probe calibration 0.000 mm" not in note
+        assert "is missing from config.yaml and the saved fixture" not in note
+        assert "calibration saved" not in summary
+
+        printer2 = _FakePrinter(position=(80.0, 125.0))
+        printer2.z = 15.0
+        second._printer = lambda **_kwargs: printer2
+        second.ui.chkFixtureProbeClear.setChecked(True)
+        second._home_xy()
+        assert second._p1_bltouch_commanded_xy() == pytest.approx((80.0, 125.0))
+        assert second._bltouch_board_zero_z is not None
+        assert second._easy_verified_scan_z is None
+        cals = second._easy_resolved_z_calibrations()
+        assert cals["pcb_thickness_mm"] == pytest.approx(0.746)
+        assert cals["e_probe_tip_z_minus_g30_contact_mm"] is None
+        assert second._easy_height_ready() is False
+        assert second.ui.btnNext.isEnabled() is False
+        assert second._easy_height_block_reason() == emi_map.EASY_HEIGHT_NEED_MANUAL_PLANE
+        assert emi_map.EASY_HEIGHT_NEED_MANUAL_PLANE in second.ui.fixtureReadySummary.text()
+        assert second.ui.btnNext.toolTip() == emi_map.EASY_HEIGHT_NEED_MANUAL_PLANE
+        assert second.ui.nextBlockReason.text() == emi_map.EASY_HEIGHT_NEED_MANUAL_PLANE
+        assert "FIXTURE READY" not in second.ui.fixtureReadySummary.text()
+        assert emi_map.EASY_VERTICAL_UNCALIBRATED in second.ui.fixtureConfigNote.text()
+        _FakeMessageBox.answer = _FakeMessageBox.Yes
+        assert second._easy_set_pcb_surface_manually() is True
+        assert second._p1_bltouch_commanded_xy() == pytest.approx((80.0, 125.0))
+        assert second._easy_scan_plane_cached() is False
+        assert second._easy_set_probe_height() is True
+        second._update_nav()
+        assert second._easy_scan_plane_cached() is True
+        assert second._easy_height_ready() is True
+        assert second.ui.btnNext.isEnabled() is True
+        assert second.ui.btnNext.text() == "Next: insert board"
+        assert second.ui.btnNext.toolTip() == ""
+        assert second.ui.fixtureReadySummary.text().startswith("FIXTURE READY")
+        assert "Scan height set:" in second.ui.fixtureReadySummary.text()
+        assert second.ui.nextBlockReason.text() == ""
+        second.ui.hide()
 
 

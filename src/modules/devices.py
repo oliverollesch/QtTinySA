@@ -23,6 +23,8 @@ threadpool = QThreadPool()
 
 # scanraw option 3 (auto-repeat, ends each sweep with '}{') needs 1.4.177+.
 _SCANRAW_REPEAT_BUILD = 177
+CONNECT_TIMEOUT_S = 0.5
+CONNECT_WRITE_TIMEOUT_S = 2.0
 
 
 def scanraw_auto_repeat_supported(firmware) -> bool:
@@ -89,7 +91,7 @@ class USBdevice(QObject):
                 self.ports.remove(port)
         # only run connect() if new devices were found
         if self.run_connect:
-            self.connect()
+            self.connect_devices()
 
     def identify(self, port):
         # Windows returns no description information to pySerial list_ports.comports()
@@ -98,7 +100,7 @@ class USBdevice(QObject):
         else:
             return 'tinySA4'
 
-    def connect(self):
+    def connect_devices(self):
         # try to set USB connections to different hardware... need to check if it works in Windows now
         self.dev0 = self.dev1 = self.dev2 = self.dev3 = None
         self.devices = [self.dev0, self.dev1, self.dev2, self.dev3]  # all of which are initially set as None above
@@ -119,12 +121,21 @@ class USBdevice(QObject):
                 if description == "CDC-ACM Demo":
                     self.devices[dev_id] = Nano(port.device, description, self.dev_sigs, dev_id)
                 # test using its specific commands and store results in its class instance
-                test = self.devices[dev_id].test(port.device)
+                device = self.devices[dev_id]
+                if device is None:
+                    continue
+                try:
+                    test = device.test(port.device)
+                except (serial.SerialException, OSError, AttributeError, ValueError) as exc:
+                    logging.info(f'test of {port} failed: {exc}')
+                    test = False
                 if test is True:
                     self.set_sa_info(dev_id)
                     self.dev_enable.emit(dev_id, True)
                 else:
                     logging.info(f'test of {port} failed')
+                    device.close()
+                    self.devices[dev_id] = None
                     self.update_info.emit('', dev_id, -1, '') # (name, id, sn, port)
                     self.dev_enable.emit(dev_id, False)
 
@@ -268,7 +279,15 @@ class Tiny(QObject):
     def setDevice(self, usbPort):
         self.setScale()
         try:
-            self.usb = serial.Serial(usbPort, baudrate=576000)
+            # Detection runs from a Qt timer on the GUI thread. Never leave a
+            # read/write unbounded: an unplugged or wedged Windows COM device
+            # must return control to the event loop.
+            self.usb = serial.Serial(
+                usbPort,
+                baudrate=576000,
+                timeout=CONNECT_TIMEOUT_S,
+                write_timeout=CONNECT_WRITE_TIMEOUT_S,
+            )
             logging.debug(f'Serial port {usbPort} open: {self.usb.isOpen()}')
         except serial.SerialException:
             logging.info('Serial port exception. Is your username in the "dialout" group?')
@@ -294,18 +313,19 @@ class Tiny(QObject):
 
     def test(self, usbPort):  # tests tinySA comms
         if self.usb:
-            for i in range(4):  # try 4 times to communicate with tinySA over USB serial
+            version = None
+            for i in range(2):  # bounded: this method runs on Qt's GUI thread
                 version = self.version()
                 logging.debug(f'Tiny {self.id} test {i} version = {version}')
-                if version is not None:
+                if version:
                     firmware = str.splitlines(version)
                     self.firmware = firmware[0].split('_')[-1]
                     logging.debug(f'{usbPort} test {i} reports {self.firmware}')
                     break
                 else:
-                    time.sleep(0.5)
+                    time.sleep(0.1)
                     
-            if version is not None:
+            if version:
                 self.volts = self.battery()
                 info = self.info()
                 self.sn = int(self.serial_num().split(' ')[-1])
@@ -323,6 +343,9 @@ class Tiny(QObject):
         self.setRBW(rbw)
 
     def close(self):
+        timer = getattr(self, 'fifoTimer', None)
+        if timer is not None:
+            timer.stop()
         if self.usb:
             self.usb.close()
             logging.debug(f'Close: Serial port {self.usbPort} open: {self.usb.isOpen()}')
@@ -491,12 +514,17 @@ class Tiny(QObject):
     def serialQuery(self, command):
         try:
             self.usb.write(command.encode())
-            self.usb.read_until(command.encode() + b'\n')  # skip command echo
+            echo = self.usb.read_until(command.encode() + b'\n')  # skip command echo
+            if not echo.endswith(command.encode() + b'\n'):
+                return None
             response = self.usb.read_until(b'ch> ')  # until prompt
+            if not response.endswith(b'ch> '):
+                return None
             logging.debug(f'serialQuery: response = {response}')
             return response[:-6].decode()  # remove prompt
-        except UnicodeDecodeError:
-            logging.info('serialQuery: ignored UnicodeDecodeError')
+        except (UnicodeDecodeError, serial.SerialException, OSError) as exc:
+            logging.info(f'serialQuery failed: {exc}')
+            return None
 
 
     def serialWrite(self, command):

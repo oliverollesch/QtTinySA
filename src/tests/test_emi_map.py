@@ -15,6 +15,9 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
+
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
 
 import numpy as np
 import pytest
@@ -31,12 +34,25 @@ from modules.emi_map import (  # noqa: E402
     OPERATOR_MODE_EASY,
     PAGE_BOARD,
     PAGE_EASY_HEIGHT,
+    PAGE_FIXTURE_TEACH,
     PAGE_ORIGIN,
     PAGE_REGISTER,
     PAGE_RESULTS,
     PAGE_SCAN,
+    PAGE_SCAN_SETUP,
     PAGE_SETUP,
     TRAVEL_WARNING,
+    BOARD_ZERO_COMPLETE_TEXT,
+    PRINTER_HALTED_TEXT,
+    STEP2_AFTER_RECONNECT,
+    EASY_HEIGHT_CLEARANCE,
+    EASY_HEIGHT_MISSING_P1,
+    EASY_HEIGHT_NEED_BOARD_ZERO,
+    EASY_HEIGHT_NEED_MANUAL_PLANE,
+    EASY_HEIGHT_MISSING_THICKNESS,
+    EASY_VERTICAL_UNCALIBRATED,
+    EASY_HEIGHT_NOT_REACHED,
+    EASY_HEIGHT_RESET,
     _MapSerial,
     engine_board,
     engine_config,
@@ -152,6 +168,7 @@ class TestDialogLayout:
         assert "chkRfConfirmed" in on_scan
         assert "liveSpectrum" in on_scan
         assert "btnStartScan" in on_scan
+        assert "scanStartReason" in on_scan
         rf = properties(emi_widgets["chkRfConfirmed"])["text"].find("string").text
         assert "overload" in rf.lower()
 
@@ -262,6 +279,7 @@ class TestWidgetReferences:
             "operatorMode",
             "pageEasyHeight",
             "grpEasyHeight",
+            "grpEasyManualHeight",
             "easyJogStep",
             "easyStatusLabel",
             "easyHeightLabel",
@@ -277,6 +295,65 @@ class TestWidgetReferences:
             "btnEasyJogXMinus",
             "btnEasyJogYPlus",
             "btnEasyJogYMinus",
+            "pageFixtureTeach",
+            "fixtureTeachScroll",
+            "fixtureReferenceMap",
+            "chkFixtureProbeClear",
+            "btnFixtureRetryPrinter",
+            "fixturePrinterConnectionStatus",
+            "btnFixtureHomeXyz",
+            "fixtureTeachTable",
+            "btnFixtureProbePoint",
+            "fixtureMaxZChange",
+            "fixtureMaxResidual",
+            "fixtureJogStep",
+            "btnFixtureJogXPlus",
+            "btnFixtureJogXMinus",
+            "btnFixtureJogYPlus",
+            "btnFixtureJogYMinus",
+            "btnFixtureSavePlane",
+            "btnFixtureVerify",
+            "btnFixtureClearPoint",
+            "fixtureConfigNote",
+            "fixtureTeachStatus",
+            "fixtureBoardSummary",
+            "fixtureReadySummary",
+            "nextBlockReason",
+            "machineFixtureProfile",
+            "btnNewMachineFixture",
+            "btnRefreshMachineFixtures",
+            "pageEasyScanSetup",
+            "scanSetupBoardSummary",
+            "scanSetupAreaSummary",
+            "scanSetupReview",
+            "scanSetupLocateStatus",
+            "scanPreviewHost",
+            "btnPlayScanSimulation",
+            "btnStopScanSimulation",
+            "btnApproveScanPlan",
+            "scanPreviewStatus",
+            "scanPreviewNotice",
+            "scanPreviewFallback",
+            "scanPreviewGhostLabel",
+            "glassboardPlacementCard",
+            "glassboardPlacementSide",
+            "glassboardPlacementStatus",
+            "chkScanSetupBoardSeated",
+            "scanSetupJogStep",
+            "btnScanSetupJogXPlus",
+            "btnScanSetupJogXMinus",
+            "btnScanSetupJogYPlus",
+            "btnScanSetupJogYMinus",
+            "btnTeachTopCornerA",
+            "btnTeachTopCornerB",
+            "btnTeachBottomCornerA",
+            "btnTeachBottomCornerB",
+            "btnUseTopSide",
+            "btnUseBottomSide",
+            "btnClearTopCorners",
+            "btnClearBottomCorners",
+            "teachTopCornerSummary",
+            "teachBottomCornerSummary",
         }
         declared = set(emi_widgets) | builtin | cube_runtime | easy_runtime
         assert referenced <= declared, sorted(referenced - declared)
@@ -561,6 +638,136 @@ class TestEngineConfig:
         assert "20.000 MHz" in wizard.ui.cubeSpectrumLabel.text
         assert "40.000 MHz" in wizard.ui.cubeSpectrumLabel.text
 
+    def test_live_xy_cell_switches_to_delta(self, wizard):
+        _init_live_grids(wizard, background_kind="xy_grid")
+        wizard._on_point({"pass": "background", "iy": 0, "ix": 1, "power_dbm": -60.0})
+        assert wizard._live_background_grid[0, 1] == pytest.approx(-60.0)
+        assert wizard._live_map_caption == "DUT OFF / ambient"
+        wizard._on_point({"pass": "dut", "iy": 0, "ix": 1, "power_dbm": -40.0})
+        assert wizard._live_delta_grid[0, 1] == pytest.approx(20.0)
+        assert wizard._grid is wizard._live_delta_grid
+        assert wizard._live_units == "dB"
+        assert wizard._live_map_caption == "DUT ON − DUT OFF"
+
+    def test_live_stationary_hold_enables_delta_without_an_xy_off_pass(self, wizard):
+        _init_live_grids(wizard, background_kind="stationary")
+        freqs = np.array([1e6, 2e6, 3e6])
+        wizard._on_spectrum(
+            {
+                "freqs": freqs,
+                "power_dbm": np.array([-70.0, -50.0, -80.0]),
+                "label": "hold",
+                "pass": "background",
+            }
+        )
+        assert wizard._live_stationary_background_dbm == pytest.approx(-50.0)
+        wizard._on_point({"pass": "dut", "iy": 0, "ix": 0, "power_dbm": -30.0})
+        assert wizard._live_delta_grid[0, 0] == pytest.approx(20.0)
+        assert "stationary" in wizard._live_map_caption
+        assert "DUT ON − DUT OFF" != wizard._live_map_caption
+
+    def test_live_spectrum_without_matching_off_stays_raw(self, wizard):
+        _init_live_grids(wizard, background_kind="xy_grid")
+        wizard._on_spectrum(
+            {
+                "freqs": np.array([1e6, 2e6, 3e6]),
+                "power_dbm": np.array([-40.0, -30.0, -45.0]),
+                "label": "cell",
+                "pass": "dut",
+                "iy": 0,
+                "ix": 0,
+            }
+        )
+        assert (0, 0) not in wizard._live_background_spectra
+        assert wizard._live_background_spectra == {}
+
+    def test_results_default_kind_is_dut_on_minus_dut_off(self, wizard):
+        combo = _FakeCombo()
+        combo.addItem("DUT ON − DUT OFF", "dut_on_minus_dut_off")
+        combo.addItem("Peak in band", "band_max")
+        combo.setCurrentIndex(0)
+        wizard.ui.cubeMapKind = combo
+        assert wizard._cube_map_kind_value() == "dut_on_minus_dut_off"
+
+    def test_results_view_labels_a_stationary_reference(self, wizard):
+        combo = _FakeCombo()
+        combo.addItem("DUT ON − DUT OFF", "dut_on_minus_dut_off")
+        combo.setCurrentIndex(0)
+        wizard.ui.cubeMapKind = combo
+        wizard.ui.cubeFreqSlider = _FakeWidget(value=0)
+        wizard.ui.cubeBandwidthMhz = _FakeWidget(value=0.0)
+        wizard.ui.cubeFreqLabel = _FakeWidget()
+        wizard._cube_data = {
+            "freqs": np.array([20e6, 40e6]),
+            "dut": np.array([[[-10.0, -20.0]]]),
+            "dut_completed": np.array([[True]]),
+            "background_reference": np.array([-40.0, -50.0]),
+        }
+        wizard._refresh_cube_view()
+        assert wizard._results_values[0, 0] == pytest.approx(30.0)
+        assert "stationary" in wizard._results_title.lower()
+        assert wizard._results_units == "dB"
+
+    def test_results_view_uses_xy_background_when_saved(self, wizard):
+        combo = _FakeCombo()
+        combo.addItem("DUT ON − DUT OFF", "dut_on_minus_dut_off")
+        combo.setCurrentIndex(0)
+        wizard.ui.cubeMapKind = combo
+        wizard.ui.cubeFreqSlider = _FakeWidget(value=0)
+        wizard.ui.cubeBandwidthMhz = _FakeWidget(value=0.0)
+        wizard.ui.cubeFreqLabel = _FakeWidget()
+        wizard._cube_data = {
+            "freqs": np.array([20e6, 40e6]),
+            "dut": np.array([[[-10.0, -20.0]]]),
+            "background": np.array([[[-40.0, -50.0]]]),
+            "dut_completed": np.array([[True]]),
+        }
+        wizard._refresh_cube_view()
+        assert wizard._results_values[0, 0] == pytest.approx(30.0)
+        assert wizard._results_title == "DUT ON − DUT OFF"
+        assert "stationary" not in wizard._results_title.lower()
+
+    def test_results_cell_pick_uses_the_drawn_map_rect(self, wizard):
+        wizard._cube_data = {"dut": np.zeros((2, 3))}
+        wizard._results_values = np.zeros((2, 3))
+        wizard._results_map_rect = emi_map.QtCore.QRectF(0, 0, 30, 20)
+
+        class _Pos:
+            def __init__(self, x, y):
+                self._x, self._y = x, y
+
+            def x(self):
+                return self._x
+
+            def y(self):
+                return self._y
+
+        assert wizard._results_cell_from_pos(_Pos(5, 5)) == (1, 0)
+        assert wizard._results_cell_from_pos(_Pos(25, 15)) == (0, 2)
+
+
+def _init_live_grids(wizard, *, ny=2, nx=2, background_kind="xy_grid"):
+    shape = (ny, nx)
+    wizard._live_background_grid = np.full(shape, np.nan)
+    wizard._live_dut_grid = np.full(shape, np.nan)
+    wizard._live_delta_grid = np.full(shape, np.nan)
+    wizard._live_background_spectra = {}
+    wizard._live_background_kind = background_kind
+    wizard._live_stationary_background_dbm = np.nan
+    wizard._live_last_pass = ""
+    wizard._live_label_items = {}
+    wizard._grid = wizard._live_background_grid
+    wizard._live_units = "dBm"
+    wizard._live_map_caption = (
+        "DUT OFF / stationary reference"
+        if background_kind == "stationary"
+        else "DUT OFF / ambient"
+    )
+    wizard._done = 0
+    wizard._pending_updates = 0
+    wizard._cube_live = False
+    wizard.image = None
+
 
 # --------------------------------------------------------------- PCB harness
 # The wizard itself is exercised here, not just its helpers, because the PCB
@@ -651,6 +858,9 @@ class _FakeWidget:
     def isVisible(self):
         return self.visible
 
+    def isHidden(self):
+        return not self.visible
+
     def setValue(self, value):
         self._value = value
 
@@ -696,6 +906,7 @@ class _FakeMessageBox:
         cls.warnings.append(message)
 
     critical = warning
+    information = warning
 
     @classmethod
     def question(cls, _parent, _title, message, *_args):
@@ -711,6 +922,9 @@ class _FakePrinter:
         self.home_error = home_error
         self.xy_error = xy_error
         self.sent = []
+        self.m114_count = 0
+        self.z_logical_frame = 0
+        self.config = SimpleNamespace(probe_clearance_mm=3.0)
 
     def drain(self):
         pass
@@ -723,6 +937,7 @@ class _FakePrinter:
             raise self.home_error
         self.sent.append("G28 X Y")
         self.position = (0.0, 0.0)
+        self.z_logical_frame += 1
 
     def set_origin(self):
         self.sent.append("G92 X0 Y0")
@@ -733,6 +948,7 @@ class _FakePrinter:
         return self.position
 
     def get_xyz(self):
+        self.m114_count = getattr(self, "m114_count", 0) + 1
         if self.xy_error is not None:
             raise self.xy_error
         return (self.position[0], self.position[1], self.z)
@@ -740,6 +956,81 @@ class _FakePrinter:
     def move_xy(self, x_mm, y_mm):
         self.sent.append(f"G0 X{x_mm} Y{y_mm}")
         self.position = (x_mm, y_mm)
+
+    def home_xyz(self, lift_mm=None):
+        if lift_mm:
+            self.move_z(self.z + float(lift_mm))
+        self.home_xy()
+
+    def approach_board_with_standoff(self, max_descent_mm=None, standoff_mm=None):
+        # The real approach steps down under M119 supervision; probe_point_g30
+        # below already models the board 5 mm under the current Z, so this fake
+        # only has to record that the gap was closed before G30.
+        self.sent.append("approach")
+        return 0.0
+
+    def probe_pin_until_contact(
+        self,
+        retract_mm=None,
+        max_descent_mm=None,
+        step_mm=None,
+        **_kwargs,
+    ):
+        z_before = float(self.z)
+        self.sent.append("M280 P0 S160")
+        contact = z_before - 5.0
+        self.z = contact
+        self.sent.append("M119")
+        extra = (
+            float(retract_mm)
+            if retract_mm is not None
+            else float(self.config.probe_clearance_mm)
+        )
+        hop = max(extra, 3.0)
+        self.z = contact + hop
+        self.sent.append(f"G1 Z{self.z}")
+        return SimpleNamespace(
+            probe_x_mm=self.position[0],
+            probe_y_mm=self.position[1],
+            touch_z_raw_mm=contact,
+            carriage_x_mm=self.position[0],
+            carriage_y_mm=self.position[1],
+            carriage_z_mm=contact,
+            logical_surface_z_mm=contact,
+            replies=(),
+            m114_z_before_mm=z_before,
+            trace=None,
+        )
+
+    def probe_point_g30(
+        self,
+        retract_mm=None,
+        expected_touch_z_mm=None,
+        same_logical_frame=False,
+        close_unknown_gap=False,
+        **_kwargs,
+    ):
+        if close_unknown_gap:
+            self.approach_board_with_standoff()
+        z_before = float(self.z)
+        contact = z_before - 5.0
+        self.z = contact
+        self.sent.append("G30")
+        extra = (
+            float(retract_mm)
+            if retract_mm is not None
+            else float(self.config.probe_clearance_mm)
+        )
+        hop = max(extra, 3.0)
+        self.z = contact + hop
+        self.sent.append(f"G1 Z{self.z}")
+        return SimpleNamespace(
+            probe_x_mm=self.position[0],
+            probe_y_mm=self.position[1],
+            touch_z_raw_mm=2.0,
+            carriage_z_mm=contact,
+            logical_surface_z_mm=contact,
+        )
 
     def move_z(self, z_mm):
         self.sent.append(f"G1 Z{z_mm}")
@@ -777,7 +1068,7 @@ class _HeadlessWizard(emi_map.EMIMapWizard):
         pass
 
     def _printer(self, *, manage_z=None):
-        return self.printer
+        return self._bind_printer_frame(self.printer)
 
 
 def _checked_in_ui(widget):
@@ -832,6 +1123,12 @@ def _fake_ui():
         setattr(ui, name, _FakeWidget(value=value))
     for name, value in texts.items():
         setattr(ui, name, _FakeWidget(text=value))
+    ui.chkFixtureProbeClear = _FakeWidget(checked=False)
+    ui.fixtureTeachStatus = _FakeWidget()
+    ui.nextBlockReason = _FakeWidget()
+    ui.fixtureConfigNote = _FakeWidget()
+    ui.fixtureBoardSummary = _FakeWidget()
+    ui.fixtureReadySummary = _FakeWidget()
     return ui
 
 
@@ -932,6 +1229,24 @@ class _MarlinPort(_SilentPort):
         return chunk
 
 
+class _TemperatureOnlyMarlinPort(_SilentPort):
+    """A vendor build that omits M115 but answers normal Marlin status."""
+
+    def __init__(self):
+        super().__init__()
+        self._out = bytearray()
+
+    def write(self, data):
+        if b"M105" in data:
+            self._out += b"ok T:20.0 /0.0 B:20.0 /0.0\n"
+        return len(data)
+
+    def read(self, size=1):
+        chunk = bytes(self._out[:size])
+        del self._out[:size]
+        return chunk
+
+
 class TestChoosingThePrinterPort:
     """Windows advertises every paired Bluetooth profile as a COM port. Opening
     one stalls, then answers nothing, so picking the wrong port looks exactly
@@ -981,13 +1296,113 @@ class TestRefusingAPortThatIsNotAPrinter:
     def quick(self, monkeypatch):
         monkeypatch.setattr(emi_map, "PRINTER_BOOT_S", 0.0)
         monkeypatch.setattr(emi_map, "PRINTER_GREET_S", 0.05)
+        monkeypatch.setattr(emi_map, "PRINTER_BAUD_SETTLE_S", 0.0)
+        monkeypatch.setattr(emi_map, "PRINTER_SYNC_QUIET_S", 0.0)
 
     def test_a_silent_port_is_rejected_by_name(self, wizard):
-        with pytest.raises(RuntimeError, match="COM7 did not answer"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"COM7.*timeout \(no bytes received\).*RETRY PRINTER CONNECTION",
+        ):
             wizard._greet_marlin(_SilentPort(), "COM7")
+
+    def test_a_halted_controller_is_reported_from_its_bytes(self, wizard):
+        class Halted(_SilentPort):
+            def __init__(self):
+                super().__init__()
+                self.baudrate = 115200
+                self._out = bytearray()
+
+            def write(self, data):
+                self._out += b"Error:Printer halted. kill() called!\n"
+                return len(data)
+
+            def read(self, size=1):
+                chunk = bytes(self._out[:size])
+                del self._out[:size]
+                return chunk
+
+        with pytest.raises(
+            engine_printer.PrinterHalted,
+            match=r"Printer halted.*COM7.*115200.*kill\(\) called",
+        ):
+            wizard._greet_marlin(Halted(), "COM7")
+
+    def test_a_silent_port_is_not_reported_as_a_halt(self, wizard, monkeypatch):
+        """The advice text names a halt; only the exception type may latch one."""
+        wizard.ui.printerPort.setCurrentText("COM7")
+        wizard.ui.printerBaud.setValue(115200)
+        monkeypatch.setattr(
+            wizard, "_open_serial", lambda _port, _baud: _SilentPort()
+        )
+        with pytest.raises(RuntimeError) as caught:
+            wizard._do_fixture_retry_printer()
+        assert not isinstance(caught.value, engine_printer.PrinterHalted)
+        assert wizard._is_printer_halt(caught.value) is False
+        wizard.ui.fixturePrinterConnectionStatus = _FakeWidget()
+        wizard._on_fixture_operation_failed(caught.value)
+        assert wizard._printer_halted is False
+
+    def test_a_halt_during_retry_stops_before_the_next_baud(self, wizard, monkeypatch):
+        wizard.ui.printerPort.setCurrentText("COM7")
+        wizard.ui.printerBaud.setValue(115200)
+        attempts = []
+
+        def connect(_port, baud):
+            attempts.append(baud)
+            raise engine_printer.PrinterHalted(PRINTER_HALTED_TEXT)
+
+        monkeypatch.setattr(wizard, "_connect_printer", connect)
+        with pytest.raises(engine_printer.PrinterHalted):
+            wizard._do_fixture_retry_printer()
+        assert attempts == [115200]
+
+    def test_opening_the_port_releases_the_controller_reset_lines(
+        self, wizard, monkeypatch
+    ):
+        import serial as serial_mod
+
+        class FakeSerial:
+            def __init__(self, port=None, baudrate=9600, **kwargs):
+                self.kwargs = kwargs
+                self.is_open = True
+                self.lines = []
+                self.buffer_reset = False
+
+            @property
+            def dtr(self):
+                return None
+
+            @dtr.setter
+            def dtr(self, value):
+                self.lines.append(("dtr", value))
+
+            @property
+            def rts(self):
+                return None
+
+            @rts.setter
+            def rts(self, value):
+                self.lines.append(("rts", value))
+
+            def reset_input_buffer(self):
+                self.buffer_reset = True
+
+        monkeypatch.setattr(serial_mod, "Serial", FakeSerial)
+        monkeypatch.setattr(emi_map.time, "sleep", lambda _seconds: None)
+        handle = wizard._open_serial("COM7", 115200)
+        assert handle.kwargs["dsrdtr"] is False
+        assert handle.kwargs["rtscts"] is False
+        # Asserted for the pulse, then released: a held reset reads as silence.
+        assert handle.lines[-2:] == [("dtr", False), ("rts", False)]
+        assert ("dtr", True) in handle.lines
+        assert handle.buffer_reset is True
 
     def test_marlin_is_accepted_through_its_reboot_banner(self, wizard):
         wizard._greet_marlin(_MarlinPort(), "COM11")
+
+    def test_vendor_marlin_without_m115_is_accepted_via_m105(self, wizard):
+        wizard._greet_marlin(_TemperatureOnlyMarlinPort(), "COM11")
 
     def test_a_refused_port_is_not_left_open(self, wizard, monkeypatch):
         opened = _SilentPort()
@@ -996,6 +1411,169 @@ class TestRefusingAPortThatIsNotAPrinter:
             wizard._open_printer()
         assert opened.closed
         assert wizard.printer_serial is None
+
+    def test_a_busy_port_has_an_actionable_retry_message(self, wizard, monkeypatch):
+        def busy(_port, _baud):
+            raise OSError("access denied")
+
+        monkeypatch.setattr(wizard, "_open_serial", busy)
+        with pytest.raises(RuntimeError, match="Close Cura.*RETRY PRINTER CONNECTION"):
+            wizard._open_printer()
+
+    def test_retry_auto_detects_the_other_common_marlin_baud(self, wizard, monkeypatch):
+        wizard.ui.printerPort.setCurrentText("COM7")
+        wizard.ui.printerBaud.setValue(115200)
+        attempts = []
+
+        def connect(_port, baud):
+            attempts.append(baud)
+            if baud != 250000:
+                raise RuntimeError("silent")
+            return _MarlinPort()
+
+        monkeypatch.setattr(wizard, "_connect_printer", connect)
+        payload = wizard._do_fixture_retry_printer()
+        assert payload == ("COM7", 250000, True)
+        assert attempts == [115200, 250000]
+        assert wizard.printer_serial is not None
+        wizard.ui.fixturePrinterConnectionStatus = _FakeWidget()
+        wizard.ui.fixtureTeachStatus = _FakeWidget()
+        wizard._on_fixture_retry_printer_ok(payload)
+        assert wizard.ui.printerBaud.value() == 250000
+        assert wizard.ui.fixtureTeachStatus.text() == STEP2_AFTER_RECONNECT
+        assert wizard._printer_halted is False
+
+    def test_identify_uses_the_full_greet_timeout(self, wizard, monkeypatch):
+        monkeypatch.setattr(emi_map, "PRINTER_GREET_S", 7.5)
+        seen = []
+
+        def fake(handle, port, *, boot_s, greet_s):
+            seen.append((boot_s, greet_s))
+
+        monkeypatch.setattr(emi_map, "greet_marlin_handle", fake)
+        wizard._greet_marlin(_MarlinPort(), "COM11")
+        assert seen == [(emi_map.PRINTER_BOOT_S, 7.5)]
+
+    def test_firmware_name_without_a_lone_ok_is_marlin(self, wizard):
+        class Port(_SilentPort):
+            def __init__(self):
+                super().__init__()
+                self._out = bytearray()
+
+            def write(self, data):
+                self._out += b"FIRMWARE_NAME:Marlin bugfix-2.0.x\nCap:Z_PROBE:1\n"
+                return len(data)
+
+            def read(self, size=1):
+                chunk = bytes(self._out[:size])
+                del self._out[:size]
+                return chunk
+
+        wizard._greet_marlin(Port(), "COM7")
+
+    def test_greet_drains_the_rest_of_m115_before_returning(self, wizard, monkeypatch):
+        monkeypatch.setattr(emi_map, "PRINTER_SYNC_QUIET_S", 0.05)
+
+        class Port(_SilentPort):
+            def __init__(self):
+                super().__init__()
+                self._phase = 0
+                self.leftover_ok_read = False
+
+            def write(self, data):
+                self._phase = 1
+                return len(data)
+
+            def read(self, size=1):
+                if self._phase == 1:
+                    self._phase = 2
+                    return b"FIRMWARE_NAME:Marlin\n"
+                if self._phase == 2:
+                    self._phase = 3
+                    self.leftover_ok_read = True
+                    return b"Cap:EEPROM:1\nok\n"
+                return b""
+
+        port = Port()
+        wizard._greet_marlin(port, "COM7")
+        assert port.leftover_ok_read is True
+        assert port.read(256) == b""
+
+    def test_auto_detect_keeps_the_first_baud_failure(self, wizard, monkeypatch):
+        wizard.ui.printerPort.setCurrentText("COM7")
+        wizard.ui.printerBaud.setValue(115200)
+
+        def connect(_port, baud):
+            raise RuntimeError(
+                f"COM7 opened, but the printer controller sent no Marlin "
+                f"response at {baud} baud."
+            )
+
+        monkeypatch.setattr(wizard, "_connect_printer", connect)
+        with pytest.raises(RuntimeError, match="tried 115200, 250000.*115200 baud"):
+            wizard._do_fixture_retry_printer()
+
+    def test_retry_closes_the_old_port_and_waits_for_controller_startup(
+        self, wizard, monkeypatch
+    ):
+        monkeypatch.setattr(emi_map, "PRINTER_BOOT_S", 0.4)
+        slept = []
+        monkeypatch.setattr(emi_map.time, "sleep", lambda seconds: slept.append(seconds))
+        old = _SilentPort()
+        wizard.printer_serial = old
+        wizard.ui.printerPort.setCurrentText("COM7")
+        wizard.ui.printerBaud.setValue(115200)
+        monkeypatch.setattr(wizard, "_connect_printer", lambda _port, _baud: _MarlinPort())
+        payload = wizard._do_fixture_retry_printer()
+        assert old.closed is True
+        assert 0.4 in slept
+        assert payload == ("COM7", 115200, False)
+
+    def test_retry_is_allowed_after_a_halt(self, wizard, monkeypatch):
+        wizard._printer_halted = True
+        wizard.ui.printerPort.setCurrentText("COM7")
+        wizard.ui.printerBaud.setValue(115200)
+        monkeypatch.setattr(wizard, "_connect_printer", lambda _port, _baud: _MarlinPort())
+        payload = wizard._do_fixture_retry_printer()
+        wizard.ui.fixturePrinterConnectionStatus = _FakeWidget()
+        wizard.ui.fixtureTeachStatus = _FakeWidget()
+        wizard._on_fixture_retry_printer_ok(payload)
+        assert wizard._printer_halted is False
+        assert wizard.ui.fixtureTeachStatus.text() == STEP2_AFTER_RECONNECT
+
+    def test_halted_session_does_not_open_the_port(self, wizard, monkeypatch):
+        wizard._printer_halted = True
+        opened = []
+        monkeypatch.setattr(
+            wizard, "_open_serial", lambda *_args, **_kwargs: opened.append(True)
+        )
+        with pytest.raises(engine_printer.PrinterHalted, match=PRINTER_HALTED_TEXT):
+            wizard._open_printer()
+        assert opened == []
+
+    def test_printer_serial_uses_a_printer_read_timeout(self, wizard, monkeypatch):
+        import serial as serial_mod
+
+        created = {}
+
+        class FakeSerial:
+            def __init__(
+                self, port=None, baudrate=9600, timeout=None, write_timeout=None, **kwargs
+            ):
+                created["port"] = port
+                created["baudrate"] = baudrate
+                created["timeout"] = timeout
+                created["write_timeout"] = write_timeout
+                self.port = port
+                self.is_open = True
+
+        monkeypatch.setattr(serial_mod, "Serial", FakeSerial)
+        handle = wizard._open_serial("COM7", 115200)
+        assert created["port"] == "COM7"
+        assert created["baudrate"] == 115200
+        assert created["timeout"] == emi_map.PRINTER_SERIAL_TIMEOUT_S
+        assert created["write_timeout"] == 2.0
+        assert handle.port == "COM7"
 
 
 def board_50x30(sha=""):
@@ -1022,13 +1600,50 @@ def register(wizard, offsets=((0.0, 0.0), (50.0, 30.0)), machine_origin=(60.0, 4
 
 
 def _agree_easy_scan_plane(wizard, surface_z=53.0):
-    """Session PCB datum with the probe already at the Easy Mode A target."""
-    wizard._pcb_surface_z = float(surface_z)
-    target = emi_map.engine_height.easy_scan_target_z(
-        surface_z, wizard._default_probe_gap_mm()
+    """Mark Step 2 height complete with the probe already at the Easy target."""
+    gap = wizard._default_probe_gap_mm()
+    target = emi_map.engine_height.easy_scan_target_z(surface_z, gap)
+    thickness = 1.6
+    vertical = 0.0
+    ledge = emi_map.engine_glassboard_fixture.PCB_BOTTOM_ABOVE_HOLDER_TOP_MM
+    contact = float(surface_z) - ledge - thickness - vertical
+    wizard._fixture_config_error = ""
+    wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+        emi_probe_offset_x_mm=-104.0,
+        emi_probe_offset_y_mm=1.0,
+        pcb_thickness_mm=None,
+        e_probe_tip_z_minus_g30_contact_mm=None,
     )
-    wizard.printer.z = target
+    previous = wizard._machine_fixture_document
+
+    def document():
+        try:
+            base = previous() or {}
+        except Exception:
+            base = {}
+        if not isinstance(base, dict):
+            base = {}
+        merged = dict(base)
+        merged.setdefault("fixture_id", merged.get("fixture_id") or "test-fixture")
+        merged["pcb_thickness_mm"] = thickness
+        merged["e_probe_tip_z_minus_g30_contact_mm"] = vertical
+        return wizard._overlay_fixture_config(merged)
+
+    wizard._machine_fixture_document = document
+    clear = getattr(wizard.ui, "chkFixtureProbeClear", None)
+    if clear is not None:
+        clear.setChecked(True)
+    wizard._bltouch_board_zero_z = contact
+    wizard._bltouch_board_zero_frame = int(getattr(wizard, "_z_logical_frame", 0))
+    wizard._pcb_surface_z = float(surface_z)
+    wizard._pcb_surface_from_fixture = True
+    wizard._easy_height_lost_to_reset = False
     wizard._last_commanded_scan_z = target
+    wizard._easy_verified_scan_z = float(target)
+    handle = getattr(wizard, "printer", None)
+    if handle is not None:
+        handle.z = target
+    wizard._easy_height_identity = wizard._easy_height_identity_now()
 
 
 def register_points(wizard, pairs, machine_origin=(60.0, 40.0)):
@@ -1074,18 +1689,21 @@ class TestModeNavigation:
     def test_pcb_next_reaches_the_board_page_and_skips_the_origin(self, pcb_wizard):
         pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SETUP)
         pcb_wizard._on_next()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_FIXTURE_TEACH
+        # Headless fixture tests have no standalone fixture combo; mark this
+        # setup stage complete to exercise the remaining navigation.
+        pcb_wizard._fixture_gate_ready = lambda: True
+        pcb_wizard._on_next()
         assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_BOARD
         pcb_wizard._on_next()
-        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_REGISTER
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_SCAN_SETUP
         register(pcb_wizard)
-        pcb_wizard._on_next()
-        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_EASY_HEIGHT
         _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard._on_next()
         assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_SCAN
 
     def test_back_returns_along_the_same_sequence(self, pcb_wizard):
-        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_REGISTER)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SCAN_SETUP)
         pcb_wizard._on_back()
         assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_BOARD
 
@@ -1097,7 +1715,7 @@ class TestModeNavigation:
     def test_next_names_the_pcb_import_page(self, pcb_wizard):
         pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SETUP)
         pcb_wizard._update_nav()
-        assert pcb_wizard.ui.btnNext.text() == "Next: select board"
+        assert pcb_wizard.ui.btnNext.text() == "Next: select fixture"
 
     def test_the_origin_page_says_it_is_not_the_pcb_path(self, emi_widgets):
         text = properties(emi_widgets["originIntro"])["text"].find("string").text
@@ -1427,10 +2045,12 @@ class TestAnalyserBorrowedLast:
         pcb_wizard._update_nav()
         assert pcb_wizard.ui.btnStartScan.isEnabled() is False
         assert "clear" in pcb_wizard.ui.scanStatus.text().lower()
+        assert "clear" in pcb_wizard.ui.scanStartReason.text().lower()
         pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
         pcb_wizard._update_nav()
         assert pcb_wizard.ui.btnStartScan.isEnabled() is True
         assert pcb_wizard.ui.scanStatus.text() == "Ready to scan."
+        assert pcb_wizard.ui.scanStartReason.text() == ""
 
     def test_cube_start_stays_off_until_the_rf_chain_is_confirmed(self, pcb_wizard):
         pcb_wizard.ui.chkSpectrumCube.setChecked(True)
@@ -1442,12 +2062,14 @@ class TestAnalyserBorrowedLast:
         assert pcb_wizard.ui.btnStartScan.isEnabled() is False
         reason = pcb_wizard.ui.scanStatus.text().lower()
         assert "overload" in reason
+        assert "overload" in pcb_wizard.ui.scanStartReason.text().lower()
         assert pcb_wizard.build_config().rf_configuration_confirmed is False
         pcb_wizard.ui.chkRfConfirmed.setChecked(True)
         pcb_wizard._update_nav()
         assert pcb_wizard.ui.btnStartScan.isEnabled() is True
         assert pcb_wizard.build_config().rf_configuration_confirmed is True
         assert pcb_wizard.ui.scanStatus.text() == "Ready to scan."
+        assert pcb_wizard.ui.scanStartReason.text() == ""
 
     def test_cube_start_does_not_take_the_analyser_without_rf_confirm(
         self, pcb_wizard
@@ -1500,11 +2122,9 @@ class TestEndToEndBoardScan:
         assert measured.shape == (plan.ny, plan.nx)
         # Off-board cells are never driven to and stay NaN
         assert int(np.isfinite(measured).sum()) == plan.point_count
-        for name in ("board_json", "board_png", "board_html", "heatmap_csv"):
+        for name in ("board_json", "board_png", "heatmap_csv"):
             assert Path(result.files[name]).stat().st_size > 0
-        # And the results page can offer the overlay off that key
         pcb_wizard.result = result
-        assert pcb_wizard.result.files.get("board_html")
 
 
 # ------------------------------------------------------- saved profiles
@@ -2376,7 +2996,7 @@ def _scan_result(**overrides):
         delta=None,
         files={
             "heatmap_png": "heatmap.png",
-            "board_html": "board_overlay.html",
+            "analyzer_html": "EMI_Analyzer.html",
             "spectra": "spectra.npz",
         },
         snapshot={
@@ -2419,6 +3039,139 @@ class TestResultsOverview:
         assert "resultsBanner" in emi_widgets
         assert "resultsSummary" in emi_widgets
         assert "resultsText" not in emi_widgets
+
+    def test_results_button_is_labelled_open_emi_analyzer(self, emi_widgets):
+        text = properties(emi_widgets["btnOpenOverlay"])["text"].find("string").text
+        assert text == "Open EMI Analyzer"
+
+    def test_analyzer_button_opens_the_generated_html(
+        self, pcb_wizard, monkeypatch, tmp_path
+    ):
+        opened = []
+        result = _scan_result()
+        built = tmp_path / "EMI_Analyzer.html"
+        built.write_text("<html></html>", encoding="utf-8")
+        result.files = {"analyzer_html": built}
+        result.output_dir = tmp_path
+        pcb_wizard.result = result
+
+        class FakeDesktop:
+            @staticmethod
+            def openUrl(url):
+                opened.append(url.toLocalFile())
+                return True
+
+        monkeypatch.setattr(emi_map.QtGui, "QDesktopServices", FakeDesktop)
+        pcb_wizard._show_board_artifacts(result)
+        pcb_wizard._update_nav()
+        assert pcb_wizard.ui.btnOpenOverlay.isEnabled()
+        pcb_wizard._open_analyzer()
+        assert Path(opened[0]).name == "EMI_Analyzer.html"
+
+    def test_analyzer_button_stays_enabled_while_the_scan_thread_winds_down(
+        self, pcb_wizard, tmp_path
+    ):
+        result = _scan_result()
+        result.output_dir = tmp_path
+        result.files = {}
+        pcb_wizard.result = result
+        pcb_wizard.thread = object()
+        pcb_wizard._show_board_artifacts(result)
+        pcb_wizard._update_nav()
+        assert pcb_wizard.ui.btnOpenOverlay.isEnabled()
+        assert pcb_wizard.ui.btnOpenFolder.isEnabled()
+        pcb_wizard.thread = None
+
+    def test_analyzer_button_opens_html_already_on_disk(
+        self, pcb_wizard, monkeypatch, tmp_path
+    ):
+        opened = []
+        result = _scan_result()
+        result.output_dir = tmp_path
+        result.files = {}
+        (tmp_path / "EMI_Analyzer.html").write_text("<html></html>", encoding="utf-8")
+        pcb_wizard.result = result
+
+        class FakeDesktop:
+            @staticmethod
+            def openUrl(url):
+                opened.append(url.toLocalFile())
+                return True
+
+        monkeypatch.setattr(emi_map.QtGui, "QDesktopServices", FakeDesktop)
+        built = []
+        monkeypatch.setattr(
+            pcb_wizard, "_build_analyzer", lambda: built.append(True)
+        )
+        pcb_wizard._show_board_artifacts(result)
+        assert pcb_wizard.ui.btnOpenOverlay.isEnabled()
+        assert pcb_wizard.ui.btnOpenOverlay.toolTip() == ""
+        pcb_wizard._open_analyzer()
+        assert built == []
+        assert Path(opened[0]).name == "EMI_Analyzer.html"
+
+    def test_a_scan_that_skipped_the_analyzer_can_still_build_it(
+        self, pcb_wizard, monkeypatch, tmp_path
+    ):
+        """The scan swallows analyzer failures, so the button must not go dead."""
+        opened = []
+        result = _scan_result()
+        result.output_dir = tmp_path
+        result.files = {}
+        pcb_wizard.result = result
+        built = tmp_path / "EMI_Analyzer.html"
+
+        def build():
+            built.write_text("<html></html>", encoding="utf-8")
+            return built
+
+        monkeypatch.setattr(pcb_wizard, "_build_analyzer", build)
+        monkeypatch.setattr(
+            pcb_wizard, "_open_local_path", lambda path: opened.append(Path(path)) or True
+        )
+        pcb_wizard._show_board_artifacts(result)
+        assert pcb_wizard.ui.btnOpenOverlay.isEnabled()
+        assert "build it" in pcb_wizard.ui.btnOpenOverlay.toolTip()
+        pcb_wizard._open_analyzer()
+        assert Path(opened[0]).name == "EMI_Analyzer.html"
+
+    def test_a_missing_plotting_dependency_is_named_not_silent(
+        self, pcb_wizard, monkeypatch, tmp_path
+    ):
+        result = _scan_result()
+        result.output_dir = tmp_path
+        result.files = {}
+        pcb_wizard.result = result
+
+        def explode(_scan_dir):
+            raise ImportError("No module named 'plotly'")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "EMI_Mapper.analyzer",
+            SimpleNamespace(write_analyzer=explode),
+        )
+        assert pcb_wizard._build_analyzer() is None
+        assert any("plotly" in text for text in _FakeMessageBox.warnings)
+
+    def test_a_bad_scan_folder_is_reported_with_its_path(
+        self, pcb_wizard, monkeypatch, tmp_path
+    ):
+        result = _scan_result()
+        result.output_dir = tmp_path
+        result.files = {}
+        pcb_wizard.result = result
+
+        def explode(_scan_dir):
+            raise ValueError("Missing spectra.npz")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "EMI_Mapper.analyzer",
+            SimpleNamespace(write_analyzer=explode),
+        )
+        assert pcb_wizard._build_analyzer() is None
+        assert any("Missing spectra.npz" in text for text in _FakeMessageBox.warnings)
 
     def test_overview_names_what_was_measured(self):
         text = emi_map.results_overview(_scan_result())
@@ -2536,6 +3289,7 @@ class TestScanHeightBoardPage:
         assert _FakeMessageBox.warnings
 
     def test_surface_and_move_to_scan_height_call_the_engine(self, pcb_wizard):
+        pcb_wizard._set_operator_mode(emi_map.OPERATOR_MODE_ADVANCED)
         pcb_wizard._board_model = _board_with_height(8.0)
         pcb_wizard._apply_board_view()
         pcb_wizard.ui.chkAllowSetupZ.setChecked(True)
@@ -2615,7 +3369,7 @@ class TestScanHeightBoardPage:
         assert pcb_wizard.printer.z == pytest.approx(2.0)
         assert not any(cmd.startswith("G1 Z13") for cmd in pcb_wizard.printer.sent)
 
-    def test_home_xy_restores_the_agreed_plane(self, pcb_wizard):
+    def test_home_xy_does_not_restore_the_agreed_plane(self, pcb_wizard):
         _agree_six_mm_plane(pcb_wizard)
         pcb_wizard.ui.chkHomeClear.setChecked(True)
 
@@ -2626,9 +3380,10 @@ class TestScanHeightBoardPage:
 
         pcb_wizard.printer.home_xy = home_xy
         pcb_wizard._home_xy()
-        assert pcb_wizard.printer.z == pytest.approx(8.0)
+        assert pcb_wizard.printer.z == pytest.approx(20.0)
         assert any(cmd.startswith("G28") for cmd in pcb_wizard.printer.sent)
-        assert any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+        assert not any(cmd.startswith("G1 Z8") for cmd in pcb_wizard.printer.sent)
+        assert pcb_wizard._bltouch_board_zero_z is None
 
     def test_start_refuses_when_not_at_the_agreed_plane(self, pcb_wizard):
         _agree_six_mm_plane(pcb_wizard, allow_z=False)
@@ -2691,6 +3446,26 @@ class TestEasyModeGates:
         assert pcb_wizard._easy_mode_active() is True
         assert pcb_wizard.ui.operatorMode.currentText() == OPERATOR_MODE_EASY
 
+    def test_easy_flow_names_teaching_before_scan(self, pcb_wizard):
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SETUP)
+        assert pcb_wizard._next_caption() == "Next: select fixture"
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_FIXTURE_TEACH)
+        pcb_wizard._update_header()
+        assert "Step 2 of 5" in pcb_wizard.ui.stepHeader.text()
+        assert "Home & Set Board Zero" in pcb_wizard.ui.stepHeader.text()
+
+    def test_taught_p1_xy_is_enough_without_fast_verify(
+        self, pcb_wizard, profile_home
+    ):
+        pcb_wizard._machine_fixture_document = lambda: {"fixture_teaching": {"points": []}}
+        assert pcb_wizard._fixture_scan_ready() is False
+        pcb_wizard._fixture_teaching_points["P1"] = (
+            emi_map.engine_fixture_teaching.FixtureReferencePoint(
+                "P1", -53.081, 17.0, 80.0, 125.0, 80.0, 125.0, 2.0, 2.0
+            )
+        )
+        assert pcb_wizard._fixture_scan_ready() is True
+
     def test_easy_skips_landmark_confirms_when_seated_and_verified(
         self, pcb_wizard, profile_home
     ):
@@ -2725,9 +3500,9 @@ class TestEasyModeGates:
         )
         assert pcb_wizard._sequence() == (
             PAGE_SETUP,
+            PAGE_FIXTURE_TEACH,
             PAGE_BOARD,
-            PAGE_REGISTER,
-            PAGE_EASY_HEIGHT,
+            PAGE_SCAN_SETUP,
             PAGE_SCAN,
             PAGE_RESULTS,
         )
@@ -2735,11 +3510,12 @@ class TestEasyModeGates:
         _mark_xy_verified(pcb_wizard)
         pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SETUP)
         pcb_wizard._on_next()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_FIXTURE_TEACH
+        pcb_wizard._fixture_gate_ready = lambda: True
+        pcb_wizard._on_next()
         assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_BOARD
         pcb_wizard._on_next()
-        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_REGISTER
-        pcb_wizard._on_next()
-        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_EASY_HEIGHT
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_SCAN_SETUP
 
     def test_easy_mode_and_current_step_survive_hide_and_reopen(
         self, pcb_wizard, monkeypatch
@@ -2748,24 +3524,29 @@ class TestEasyModeGates:
         pcb_wizard.ui.show = lambda: None
         pcb_wizard.ui.raise_ = lambda: None
         pcb_wizard.ui.activateWindow = lambda: None
-        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_EASY_HEIGHT)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_FIXTURE_TEACH)
         pcb_wizard._on_close()
         monkeypatch.setattr(pcb_wizard, "_refresh_ports", lambda: None)
         monkeypatch.setattr(pcb_wizard, "_refresh_profiles", lambda: None)
         monkeypatch.setattr(pcb_wizard, "_fit_dialog_to_screen", lambda: None)
         pcb_wizard.start()
         assert pcb_wizard._easy_mode_active() is True
-        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_EASY_HEIGHT
-        assert "Probe Height" in pcb_wizard.ui.stepHeader.text()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_FIXTURE_TEACH
+        assert "Home & Set Board Zero" in pcb_wizard.ui.stepHeader.text()
 
-    def test_easy_z_controls_remain_available_after_page_round_trip(self, pcb_wizard):
+    def test_easy_manual_height_buttons_stay_hidden_after_page_round_trip(self, pcb_wizard):
+        _stub_saved_z_cals(pcb_wizard, thickness=1.6, vertical=0.0)
+        pcb_wizard._apply_operator_mode_ui()
         pcb_wizard._pcb_surface_z = None
-        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_EASY_HEIGHT)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SCAN_SETUP)
         pcb_wizard._on_back()
+        pcb_wizard._board_view = board_50x30().view("top")
         pcb_wizard._on_next()
-        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_EASY_HEIGHT
-        assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is True
-        assert "SET PCB SURFACE" in pcb_wizard.ui.easyHeightLabel.text()
+        assert pcb_wizard.ui.wizardStack.currentIndex() == PAGE_SCAN_SETUP
+        assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is False
+        assert pcb_wizard.ui.btnEasySetHeight.isVisible() is False
+        assert pcb_wizard.ui.btnEasyResetPcbSurface.isVisible() is False
+        assert "SET PCB SURFACE" not in pcb_wizard.ui.easyHeightLabel.text()
 
     def test_scan_start_still_needs_travel_clearance(self, pcb_wizard, profile_home):
         prepared_profile(pcb_wizard)
@@ -2782,16 +3563,16 @@ class TestEasyModeGates:
         assert any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
         assert not any("G91" in cmd for cmd in pcb_wizard.printer.sent)
 
-    def test_easy_home_moves_to_the_effective_landmark(self, pcb_wizard, profile_home):
+    def test_easy_home_without_p1_does_not_move_to_a_guessed_xy(
+        self, pcb_wizard, profile_home
+    ):
         prepared_profile(pcb_wizard)
         _mark_xy_verified(pcb_wizard)
-        base = emi_map.engine_profiles.primary_reference_machine(
-            pcb_wizard._profile.document
-        )
-        pcb_wizard._commit_easy_xy_from_machine(base[0] + 0.32, base[1] - 0.18)
         pcb_wizard.ui.chkHomeClear.setChecked(True)
         pcb_wizard._home_xy()
-        assert pcb_wizard.printer.position == pytest.approx((base[0] + 0.32, base[1] - 0.18))
+        assert pcb_wizard.printer.position == pytest.approx((0.0, 0.0))
+        assert pcb_wizard._bltouch_board_zero_z is None
+        assert pcb_wizard._fixture_gate_ready() is False
 
     def test_easy_set_height_refused_until_session_datum(self, pcb_wizard):
         pcb_wizard._pcb_surface_z = None
@@ -2818,6 +3599,564 @@ class TestEasyModeGates:
         pcb_wizard._jog_z(-1)
         assert pcb_wizard.printer.z == pytest.approx(10.0)
         assert any("Z reference required" in text for text in _FakeMessageBox.warnings)
+
+
+def _teach_p1(wizard, x=76.919, y=117.0):
+    wizard._fixture_teaching_points["P1"] = (
+        emi_map.engine_fixture_teaching.FixtureReferencePoint(
+            "P1", -53.081, 17.0, x, y, x, y, 2.0, 2.0
+        )
+    )
+
+
+def _blank_yaml_z_cals(wizard):
+    wizard._fixture_config_error = ""
+    wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+        emi_probe_offset_x_mm=-104.0,
+        emi_probe_offset_y_mm=1.0,
+        pcb_thickness_mm=None,
+        e_probe_tip_z_minus_g30_contact_mm=None,
+    )
+
+
+def _stub_saved_z_cals(wizard, *, thickness=1.6, vertical=0.0, yaml_error=""):
+    wizard._fixture_config_error = yaml_error
+    wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+        emi_probe_offset_x_mm=-104.0,
+        emi_probe_offset_y_mm=1.0,
+        pcb_thickness_mm=None,
+        e_probe_tip_z_minus_g30_contact_mm=None,
+    )
+    stored = {
+        "fixture_name": "Glassboard",
+        "fixture_id": "glass",
+        "pcb_thickness_mm": thickness,
+        "e_probe_tip_z_minus_g30_contact_mm": vertical,
+        "emi_probe_offset_mm": {"x": -104.0, "y": 1.0},
+    }
+    wizard._machine_fixture_document = lambda: wizard._overlay_fixture_config(dict(stored))
+    return stored
+
+
+def _ack_scan_height_clearance(wizard):
+    wizard.ui.chkHomeClear.setChecked(True)
+    wizard.ui.chkFixtureProbeClear.setChecked(True)
+
+
+def _complete_easy_manual_height(wizard):
+    """Step 2 SET PCB SURFACE MANUALLY then SET PROBE HEIGHT. Plane ready after the second."""
+    p1 = wizard._p1_bltouch_commanded_xy()
+    _FakeMessageBox.answer = _FakeMessageBox.Yes
+    assert wizard._easy_set_pcb_surface_manually() is True
+    _FakeMessageBox.answer = _FakeMessageBox.No
+    assert wizard._easy_scan_plane_cached() is False
+    assert wizard._easy_set_probe_height() is True
+    assert wizard._easy_scan_plane_cached() is True
+    assert wizard._p1_bltouch_commanded_xy() == p1
+    return p1
+
+
+class TestBoardZeroStep2:
+    def test_halt_stops_homing_keeps_p1_and_does_not_retry(self, pcb_wizard):
+        _blank_yaml_z_cals(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        _teach_p1(pcb_wizard)
+        pcb_wizard._pcb_xy_homed = True
+        pcb_wizard._fixture_xyz_homed = True
+        pcb_wizard._bltouch_board_zero_z = 5.0
+        pcb_wizard._bltouch_board_zero_frame = 0
+        pcb_wizard._easy_verified_scan_z = 8.0
+        pcb_wizard._last_commanded_scan_z = 8.0
+        pcb_wizard.printer.home_error = engine_printer.PrinterHalted(
+            "Error:Heating failed\nError:Printer halted. kill() called!"
+        )
+        pcb_wizard._home_xy()
+        assert pcb_wizard._printer_halted is True
+        assert pcb_wizard._p1_bltouch_commanded_xy() == (76.919, 117.0)
+        assert pcb_wizard._pcb_xy_homed is False
+        assert pcb_wizard._fixture_xyz_homed is False
+        assert pcb_wizard._bltouch_board_zero_z is None
+        assert pcb_wizard._easy_scan_plane_cached() is False
+        assert pcb_wizard.ui.posLabel.text() == PRINTER_HALTED_TEXT
+        assert any(PRINTER_HALTED_TEXT in text for text in _FakeMessageBox.warnings)
+        sent = list(pcb_wizard.printer.sent)
+        pcb_wizard._home_xy()
+        pcb_wizard._home_xy_clicked()
+        assert pcb_wizard.printer.sent == sent
+        pcb_wizard.ui.fixturePrinterConnectionStatus = _FakeWidget()
+        pcb_wizard._on_fixture_retry_printer_ok(("COM7", 115200, False))
+        assert pcb_wizard._printer_halted is False
+        assert pcb_wizard.ui.fixtureTeachStatus.text() == STEP2_AFTER_RECONNECT
+        assert pcb_wizard._p1_bltouch_commanded_xy() == (76.919, 117.0)
+
+    def test_saved_p1_xy_asks_for_board_zero_not_recapture(self, pcb_wizard):
+        _stub_saved_z_cals(pcb_wizard)
+        pcb_wizard._bltouch_board_zero_z = None
+        pcb_wizard._bltouch_board_zero_frame = None
+        assert pcb_wizard._easy_height_block_reason() == EASY_HEIGHT_MISSING_P1
+        _teach_p1(pcb_wizard)
+        assert pcb_wizard._easy_height_block_reason() == EASY_HEIGHT_NEED_BOARD_ZERO
+        assert pcb_wizard._fixture_gate_ready() is False
+
+    def test_teaching_home_works_without_p1(self, pcb_wizard):
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard.printer.z = 4.0
+        pcb_wizard._home_xy()
+        assert pcb_wizard._pcb_xy_homed is True
+        assert pcb_wizard._fixture_xyz_homed is True
+        assert pcb_wizard._bltouch_board_zero_z is None
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard.printer.position == pytest.approx((0.0, 0.0))
+        assert "G30" not in pcb_wizard.printer.sent
+        assert pcb_wizard.ui.btnHomeXy.text() == "HOME XY FOR TEACHING"
+
+    def test_recalibrate_requires_p1_and_sets_board_zero(self, pcb_wizard):
+        _blank_yaml_z_cals(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_FIXTURE_TEACH)
+        pcb_wizard._update_nav()
+        assert pcb_wizard._home_kind() == "teaching"
+        _teach_p1(pcb_wizard)
+        pcb_wizard._update_nav()
+        assert pcb_wizard._home_kind() == "board_zero"
+        assert pcb_wizard.ui.btnHomeXy.text() == "HOME & SET BOARD ZERO"
+        pcb_wizard._home_xy()
+        assert pcb_wizard._bltouch_board_zero_z == pytest.approx(5.0)
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard.printer.position == pytest.approx((76.919, 117.0))
+        assert pcb_wizard.printer.sent.count("G30") == 0
+        assert "M119" in pcb_wizard.printer.sent
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+        assert EASY_HEIGHT_MISSING_THICKNESS in pcb_wizard.ui.posLabel.text()
+        assert BOARD_ZERO_COMPLETE_TEXT not in pcb_wizard.ui.posLabel.text()
+
+    def test_missing_cal_is_detected_before_the_downward_scan_move(self, pcb_wizard):
+        _blank_yaml_z_cals(pcb_wizard)
+        _teach_p1(pcb_wizard)
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        assert pcb_wizard._bltouch_board_zero_z == pytest.approx(5.0)
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+        assert pcb_wizard._easy_verified_scan_z is None
+        assert pcb_wizard._easy_height_block_reason() == EASY_HEIGHT_MISSING_THICKNESS
+
+    def test_blank_yaml_keeps_saved_fixture_calibrations(self, pcb_wizard):
+        stored = {
+            "pcb_thickness_mm": 1.6,
+            "e_probe_tip_z_minus_g30_contact_mm": 0.0,
+        }
+        pcb_wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig()
+        pcb_wizard._fixture_config_error = ""
+        overlaid = pcb_wizard._overlay_fixture_config(stored)
+        assert overlaid["pcb_thickness_mm"] == pytest.approx(1.6)
+        assert overlaid["e_probe_tip_z_minus_g30_contact_mm"] == pytest.approx(0.0)
+
+    def test_explicit_invalid_yaml_does_not_fall_back_to_saved_cal(self, pcb_wizard):
+        stored = {
+            "pcb_thickness_mm": 1.6,
+            "e_probe_tip_z_minus_g30_contact_mm": 0.0,
+        }
+        pcb_wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig()
+        pcb_wizard._fixture_config_error = "fixture pcb_thickness_mm must be finite and >= 0"
+        overlaid = pcb_wizard._overlay_fixture_config(stored)
+        assert overlaid["pcb_thickness_mm"] is None
+        assert overlaid["e_probe_tip_z_minus_g30_contact_mm"] is None
+        assert "invalid" in pcb_wizard._easy_height_block_reason()
+
+    def test_invalid_yaml_blocks_home_and_p1_before_motion(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig()
+        pcb_wizard._fixture_config_error = "fixture pcb_thickness_mm must be finite and >= 0"
+        pcb_wizard.printer.sent.clear()
+        pcb_wizard._home_xy()
+        assert pcb_wizard._bltouch_board_zero_z is None
+        assert "M119" not in pcb_wizard.printer.sent
+        assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+        assert any("invalid" in text.lower() for text in _FakeMessageBox.warnings)
+
+    def test_fixture_reset_explains_remaining_yaml_override(self, pcb_wizard, monkeypatch):
+        _agree_easy_scan_plane(pcb_wizard)
+        pcb_wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+            emi_probe_offset_x_mm=-104.0,
+            emi_probe_offset_y_mm=1.0,
+            pcb_thickness_mm=1.6,
+            e_probe_tip_z_minus_g30_contact_mm=0.0,
+        )
+        pcb_wizard._fixture_config_error = ""
+        monkeypatch.setattr(pcb_wizard, "_ensure_fixture_selected", lambda: "Glassboard")
+        cleared = {
+            "pcb_thickness_mm": None,
+            "e_probe_tip_z_minus_g30_contact_mm": None,
+        }
+        monkeypatch.setattr(
+            emi_map.engine_machine_fixtures,
+            "clear_z_calibrations",
+            lambda _name: cleared,
+        )
+        pcb_wizard._reset_fixture_z_calibrations()
+        assert pcb_wizard._easy_verified_scan_z is None
+        assert pcb_wizard._fixture_gate_ready() is True
+        note = pcb_wizard.ui.fixtureTeachStatus.text()
+        assert "fixture file was cleared" in note
+        assert "config.yaml still provides" in note
+        overlaid = pcb_wizard._overlay_fixture_config(cleared)
+        assert overlaid["pcb_thickness_mm"] == pytest.approx(1.6)
+        assert overlaid["e_probe_tip_z_minus_g30_contact_mm"] == pytest.approx(0.0)
+
+    def test_zero_vertical_offset_is_accepted(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard, thickness=1.6, vertical=0.0)
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        assert pcb_wizard._fixture_gate_ready() is True
+        cals = pcb_wizard._easy_resolved_z_calibrations()
+        assert cals["e_probe_tip_z_minus_g30_contact_mm"] == pytest.approx(0.0)
+
+    def test_unset_vertical_offset_does_not_block_step_2(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard, thickness=0.746, vertical=None)
+        pcb_wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+            emi_probe_offset_x_mm=-104.0,
+            emi_probe_offset_y_mm=1.0,
+            pcb_thickness_mm=0.746,
+            e_probe_tip_z_minus_g30_contact_mm=None,
+        )
+        pcb_wizard._apply_operator_mode_ui()
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_FIXTURE_TEACH)
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        pcb_wizard._update_nav()
+        assert pcb_wizard._board_zero_committed() is True
+        assert pcb_wizard._easy_p1_in_current_frame() is True
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard._easy_height_block_reason() == EASY_HEIGHT_NEED_MANUAL_PLANE
+        assert pcb_wizard.ui.btnNext.isEnabled() is False
+        assert pcb_wizard.ui.btnNext.toolTip() == EASY_HEIGHT_NEED_MANUAL_PLANE
+        assert pcb_wizard.ui.nextBlockReason.text() == EASY_HEIGHT_NEED_MANUAL_PLANE
+        assert pcb_wizard._easy_verified_scan_z is None
+        assert pcb_wizard._easy_scan_plane_cached() is False
+        cals = pcb_wizard._easy_resolved_z_calibrations()
+        assert cals["pcb_thickness_mm"] == pytest.approx(0.746)
+        assert cals["e_probe_tip_z_minus_g30_contact_mm"] is None
+        note = pcb_wizard.ui.fixtureConfigNote.text()
+        assert EASY_VERTICAL_UNCALIBRATED in note
+        assert "0.000" not in note
+        summary = pcb_wizard.ui.fixtureReadySummary.text()
+        assert summary.startswith("Complete Step 2")
+        assert EASY_HEIGHT_NEED_MANUAL_PLANE in summary
+        assert EASY_VERTICAL_UNCALIBRATED not in summary
+        assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is True
+        with pytest.raises(RuntimeError, match=re.escape(EASY_HEIGHT_NEED_MANUAL_PLANE)):
+            pcb_wizard._ensure_at_agreed_scan_plane()
+
+    def test_manual_probe_height_establishes_scan_plane_without_vertical(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard, thickness=0.746, vertical=None)
+        pcb_wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+            emi_probe_offset_x_mm=-104.0,
+            emi_probe_offset_y_mm=1.0,
+            pcb_thickness_mm=0.746,
+            e_probe_tip_z_minus_g30_contact_mm=None,
+        )
+        pcb_wizard._apply_operator_mode_ui()
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_FIXTURE_TEACH)
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        pcb_wizard._update_nav()
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard._easy_scan_plane_cached() is False
+        p1 = _complete_easy_manual_height(pcb_wizard)
+        pcb_wizard._update_nav()
+        assert p1 is not None
+        assert pcb_wizard._fixture_gate_ready() is True
+        assert pcb_wizard.ui.btnNext.isEnabled() is True
+        assert pcb_wizard.ui.btnNext.toolTip() == ""
+        assert pcb_wizard.ui.nextBlockReason.text() == ""
+        assert pcb_wizard._easy_resolved_z_calibrations()[
+            "e_probe_tip_z_minus_g30_contact_mm"
+        ] is None
+        pcb_wizard._glassboard_fixture_selected = lambda: False
+        pcb_wizard._landmarks = [
+            engine_registration.RegistrationPoint(
+                board_x_mm=0.0, board_y_mm=0.0,
+                machine_x_mm=60.0, machine_y_mm=40.0,
+            ),
+            engine_registration.RegistrationPoint(
+                board_x_mm=50.0, board_y_mm=30.0,
+                machine_x_mm=110.0, machine_y_mm=70.0,
+            ),
+        ]
+        pcb_wizard._refit_registration()
+        pcb_wizard.ui.chkBoardSeated.setChecked(True)
+        pcb_wizard.ui.chkTravelClearBoard.setChecked(True)
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SCAN)
+        pcb_wizard._update_nav()
+        assert pcb_wizard.ui.btnStartScan.isEnabled() is True
+        assert pcb_wizard.ui.scanStartReason.text() == ""
+        pcb_wizard.printer.sent.clear()
+        pcb_wizard._ensure_at_agreed_scan_plane()
+        assert not any(
+            cmd.startswith("G1 Z") or cmd.startswith("G0 Z")
+            for cmd in pcb_wizard.printer.sent
+        )
+
+    def test_printer_reset_after_manual_height_asks_to_repeat_step_2(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard, thickness=0.746, vertical=None)
+        pcb_wizard._fixture_config_cache = emi_map.engine_config.FixtureConfig(
+            emi_probe_offset_x_mm=-104.0,
+            emi_probe_offset_y_mm=1.0,
+            pcb_thickness_mm=0.746,
+            e_probe_tip_z_minus_g30_contact_mm=None,
+        )
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        _complete_easy_manual_height(pcb_wizard)
+        assert pcb_wizard._fixture_gate_ready() is True
+        pcb_wizard._on_printer_reset()
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_FIXTURE_TEACH)
+        pcb_wizard._update_nav()
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard._easy_height_block_reason() == EASY_HEIGHT_RESET
+        assert EASY_HEIGHT_RESET in pcb_wizard.ui.fixtureReadySummary.text()
+        assert pcb_wizard.ui.btnNext.toolTip() == EASY_HEIGHT_RESET
+        assert pcb_wizard.ui.nextBlockReason.text() == EASY_HEIGHT_RESET
+
+    def test_without_clearance_ack_no_downward_z(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard.ui.chkFixtureProbeClear.setChecked(False)
+        pcb_wizard._home_xy()
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+        assert pcb_wizard._easy_verified_scan_z is None
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard._easy_height_block_reason() == EASY_HEIGHT_CLEARANCE
+
+    def test_offset_does_not_authorize_scan_height_z(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard.ui.chkFixtureProbeClear.setChecked(False)
+        pcb_wizard._home_xy()
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+        assert not any(
+            cmd.startswith("G1 Z") and "8.4" in cmd for cmd in pcb_wizard.printer.sent
+        )
+
+    def test_verified_clearance_move_and_matching_m114_complete_step_2(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard)
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        surface = emi_map.engine_glassboard_fixture.pcb_surface_from_p1_contact_mm(
+            5.0, pcb_thickness_mm=1.6, e_probe_tip_z_minus_g30_contact_mm=0.0
+        )
+        target = emi_map.engine_height.easy_scan_target_z(
+            surface, pcb_wizard._default_probe_gap_mm()
+        )
+        assert pcb_wizard.printer.position == pytest.approx((76.919, 117.0))
+        assert pcb_wizard.printer.z == pytest.approx(target)
+        assert pcb_wizard._easy_verified_scan_z == pytest.approx(target)
+        assert pcb_wizard._fixture_gate_ready() is True
+        assert "Scan height set:" in pcb_wizard.ui.posLabel.text()
+        assert "3.00" in pcb_wizard.ui.posLabel.text()
+
+    def test_m114_mismatch_does_not_complete_step_2(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard)
+        _ack_scan_height_clearance(pcb_wizard)
+        real_move = pcb_wizard.printer.move_z
+
+        def lie(z_mm):
+            real_move(z_mm)
+            pcb_wizard.printer.z = float(z_mm) + 1.0
+
+        pcb_wizard.printer.move_z = lie
+        pcb_wizard._home_xy()
+        assert pcb_wizard._board_zero_committed() is True
+        assert pcb_wizard._easy_verified_scan_z is None
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard._easy_scan_plane_cached() is False
+
+    def test_z_move_failure_leaves_completion_false(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard)
+        _ack_scan_height_clearance(pcb_wizard)
+
+        real_move = pcb_wizard.printer.move_z
+
+        def boom(z_mm):
+            if pcb_wizard._bltouch_board_zero_z is not None:
+                raise engine_printer.PrinterError("z rejected")
+            real_move(z_mm)
+
+        pcb_wizard.printer.move_z = boom
+        pcb_wizard._home_xy()
+        assert pcb_wizard._board_zero_committed() is True
+        assert pcb_wizard.printer.z == pytest.approx(8.0)
+        assert pcb_wizard._easy_verified_scan_z is None
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard._easy_scan_plane_cached() is False
+
+    def test_capture_p1_sets_board_zero_without_g30(self, pcb_wizard):
+        _blank_yaml_z_cals(pcb_wizard)
+        pcb_wizard._fixture_xyz_homed = True
+        pcb_wizard.printer.z = 15.0
+        pcb_wizard.printer.position = (10.0, 20.0)
+        payload = pcb_wizard._do_fixture_probe_point("P1")
+        assert "G30" not in pcb_wizard.printer.sent
+        assert "M119" in pcb_wizard.printer.sent
+        assert payload["board_zero"] is not None
+        pcb_wizard._fixture_teaching_points[payload["point"].name] = payload["point"]
+        pcb_wizard._commit_board_zero(payload["board_zero"])
+        assert pcb_wizard._bltouch_board_zero_z == pytest.approx(10.0)
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard._easy_height_block_reason() == EASY_HEIGHT_MISSING_THICKNESS
+
+    def test_capture_p1_with_cal_and_clearance_completes_height(self, pcb_wizard):
+        pcb_wizard._fixture_xyz_homed = True
+        pcb_wizard.printer.z = 15.0
+        pcb_wizard.printer.position = (10.0, 20.0)
+        _stub_saved_z_cals(pcb_wizard)
+        _ack_scan_height_clearance(pcb_wizard)
+        payload = pcb_wizard._do_fixture_probe_point("P1")
+        pcb_wizard._on_fixture_probe_ok(payload)
+        surface = emi_map.engine_glassboard_fixture.pcb_surface_from_p1_contact_mm(
+            10.0, pcb_thickness_mm=1.6, e_probe_tip_z_minus_g30_contact_mm=0.0
+        )
+        target = emi_map.engine_height.easy_scan_target_z(
+            surface, pcb_wizard._default_probe_gap_mm()
+        )
+        assert pcb_wizard._fixture_gate_ready() is True
+        assert pcb_wizard.printer.z == pytest.approx(target)
+        assert "Scan height set:" in pcb_wizard.ui.fixtureTeachStatus.text()
+
+    def test_probe_failure_leaves_step_2_incomplete(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+
+        def fail_probe(**_kwargs):
+            raise engine_printer.ProbeFailed("no trigger")
+
+        pcb_wizard.printer.probe_pin_until_contact = fail_probe
+        pcb_wizard._home_xy()
+        assert pcb_wizard._bltouch_board_zero_z is None
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert any("no trigger" in text for text in _FakeMessageBox.warnings)
+
+    def test_retract_failure_leaves_usable_datum_unset(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+
+        def stuck_retract(**_kwargs):
+            pcb_wizard.printer.sent.append("M119")
+            pcb_wizard.printer.z = float(pcb_wizard.printer.z) - 5.0
+            contact = pcb_wizard.printer.z
+            return SimpleNamespace(
+                probe_x_mm=pcb_wizard.printer.position[0],
+                probe_y_mm=pcb_wizard.printer.position[1],
+                touch_z_raw_mm=contact,
+                carriage_z_mm=contact,
+                logical_surface_z_mm=contact,
+            )
+
+        pcb_wizard.printer.probe_pin_until_contact = stuck_retract
+        pcb_wizard._home_xy()
+        assert pcb_wizard._bltouch_board_zero_z is None
+        assert pcb_wizard._fixture_gate_ready() is False
+
+    def test_second_recalibrate_replaces_the_previous_surface(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        pcb_wizard.ui.chkHomeClear.setChecked(True)
+        pcb_wizard._home_xy()
+        first = pcb_wizard._bltouch_board_zero_z
+        pcb_wizard.printer.z = 20.0
+        pcb_wizard._home_xy()
+        assert pcb_wizard._bltouch_board_zero_z == pytest.approx(25.0)
+        assert pcb_wizard._bltouch_board_zero_z != pytest.approx(first)
+
+    def test_later_g92_invalidates_committed_board_zero(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard)
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        assert pcb_wizard._fixture_gate_ready() is True
+        pcb_wizard.printer.z_logical_frame += 1
+        pcb_wizard._capture_printer_frame(pcb_wizard.printer)
+        assert pcb_wizard._bltouch_board_zero_z is None
+        assert pcb_wizard._fixture_gate_ready() is False
+        assert pcb_wizard._easy_height_block_reason() == EASY_HEIGHT_RESET
+
+    def test_approve_and_review_preserve_valid_height(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard)
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        verified = pcb_wizard._easy_verified_scan_z
+        p1 = pcb_wizard.printer.position
+        pcb_wizard.ui.chkBoardSeated.setChecked(True)
+        pcb_wizard._refresh_calculated_height()
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SCAN)
+        pcb_wizard._refresh_easy_height_label()
+        assert pcb_wizard._easy_verified_scan_z == pytest.approx(verified)
+        assert pcb_wizard._fixture_gate_ready() is True
+        assert "Scan height set:" in pcb_wizard.ui.easyHeightLabel.text()
+        assert pcb_wizard.printer.position == pytest.approx(p1)
+
+    def test_cal_change_invalidates_completion(self, pcb_wizard):
+        _teach_p1(pcb_wizard)
+        _stub_saved_z_cals(pcb_wizard, thickness=1.6, vertical=0.0)
+        _ack_scan_height_clearance(pcb_wizard)
+        pcb_wizard._home_xy()
+        assert pcb_wizard._fixture_gate_ready() is True
+        pcb_wizard._machine_fixture_document = lambda: pcb_wizard._overlay_fixture_config(
+            {"pcb_thickness_mm": 2.0, "e_probe_tip_z_minus_g30_contact_mm": 0.0}
+        )
+        assert pcb_wizard._fixture_gate_ready() is True
+        assert pcb_wizard._easy_verified_height_applies() is False
+
+    def test_label_refresh_does_not_query_m114(self, pcb_wizard):
+        _agree_easy_scan_plane(pcb_wizard)
+        pcb_wizard.printer.m114_count = 0
+        pcb_wizard.printer.sent.clear()
+        pcb_wizard._refresh_easy_height_label()
+        pcb_wizard._refresh_height_ui()
+        pcb_wizard._update_nav()
+        assert pcb_wizard.printer.m114_count == 0
+        assert not any(cmd.startswith("G1 Z") or cmd.startswith("G0 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_start_queries_m114_and_sends_no_z(self, pcb_wizard):
+        _agree_easy_scan_plane(pcb_wizard)
+        pcb_wizard.printer.m114_count = 0
+        pcb_wizard.printer.sent.clear()
+        pcb_wizard._ensure_at_agreed_scan_plane()
+        assert pcb_wizard.printer.m114_count >= 1
+        assert not any(cmd.startswith("G1 Z") or cmd.startswith("G0 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_start_m114_mismatch_invalidates_height(self, pcb_wizard):
+        _agree_easy_scan_plane(pcb_wizard)
+        pcb_wizard.printer.z = 66.0
+        pcb_wizard.printer.sent.clear()
+        with pytest.raises(RuntimeError, match=re.escape(EASY_HEIGHT_NOT_REACHED)):
+            pcb_wizard._ensure_at_agreed_scan_plane()
+        assert pcb_wizard._easy_verified_scan_z is None
+        assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+
+    def test_progress_follows_readiness_not_page_index(self, pcb_wizard):
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_SCAN)
+        assert pcb_wizard._easy_progress_step_complete(PAGE_FIXTURE_TEACH) is False
+        _agree_easy_scan_plane(pcb_wizard)
+        assert pcb_wizard._easy_progress_step_complete(PAGE_FIXTURE_TEACH) is True
+
+    def test_easy_manual_height_buttons_stay_hidden(self, pcb_wizard):
+        _stub_saved_z_cals(pcb_wizard, thickness=1.6, vertical=0.0)
+        pcb_wizard._apply_operator_mode_ui()
+        pcb_wizard._refresh_easy_height_label()
+        assert pcb_wizard.ui.btnEasySetHeight.isVisible() is False
+        assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is False
+        assert pcb_wizard.ui.btnEasyResetPcbSurface.isVisible() is False
 
 
 class TestEasyXyCalibration:
@@ -2921,12 +4260,18 @@ class TestEasyZLifecycle:
         _FakeMessageBox.answer = _FakeMessageBox.Yes
         assert pcb_wizard._easy_set_pcb_surface_manually() is True
         assert pcb_wizard._pcb_surface_z == pytest.approx(53.0)
-        assert pcb_wizard.printer.z == pytest.approx(56.0)
+        assert pcb_wizard.printer.z == pytest.approx(53.0)
+        assert pcb_wizard._easy_scan_plane_cached() is False
         assert "M18 Z" in pcb_wizard.printer.sent
         assert "M17 Z" in pcb_wizard.printer.sent
         assert not any(cmd.startswith("M18 X") for cmd in pcb_wizard.printer.sent)
         assert not any("G92" in cmd and "Z" in cmd.split() for cmd in pcb_wizard.printer.sent)
+        assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
+        pcb_wizard.printer.sent.clear()
+        assert pcb_wizard._easy_set_probe_height() is True
+        assert pcb_wizard.printer.z == pytest.approx(56.0)
         assert any(cmd.startswith("G1 Z56") for cmd in pcb_wizard.printer.sent)
+        assert pcb_wizard._easy_scan_plane_cached() is True
 
     def test_manual_touch_cancel_re_enables_z_and_stores_nothing(
         self, pcb_wizard, profile_home
@@ -2952,11 +4297,10 @@ class TestEasyZLifecycle:
         assert pcb_wizard._pcb_surface_z is None
 
     def test_real_port_change_clears_session_datum(self, pcb_wizard):
-        pcb_wizard._pcb_surface_z = 53.0
-        pcb_wizard._last_commanded_scan_z = 56.0
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard._on_printer_port_changed("COM12")
         assert pcb_wizard._pcb_surface_z is None
-        assert "SET PCB SURFACE" in pcb_wizard.ui.easyHeightLabel.text()
+        assert EASY_HEIGHT_RESET in pcb_wizard.ui.easyHeightLabel.text()
 
     def test_reconnect_cannot_move_to_a_target_from_the_stale_datum(
         self, pcb_wizard, monkeypatch
@@ -2982,7 +4326,7 @@ class TestEasyZLifecycle:
             pcb_wizard._refreshing_ports = False
         assert pcb_wizard._pcb_surface_z == pytest.approx(53.0)
 
-    def test_home_restores_only_if_already_at_scan_plane(self, pcb_wizard, profile_home):
+    def test_home_does_not_restore_scan_height(self, pcb_wizard, profile_home):
         prepared_profile(pcb_wizard)
         _mark_xy_verified(pcb_wizard)
         pcb_wizard._pcb_surface_z = 53.0
@@ -2990,10 +4334,10 @@ class TestEasyZLifecycle:
         pcb_wizard.ui.chkHomeClear.setChecked(True)
         pcb_wizard.printer.sent.clear()
         pcb_wizard._home_xy()
-        assert pcb_wizard.printer.z == pytest.approx(56.0)
+        assert pcb_wizard.printer.z == pytest.approx(66.0)
         z_moves = [cmd for cmd in pcb_wizard.printer.sent if cmd.startswith("G1 Z")]
         assert any(cmd.startswith("G1 Z66") for cmd in z_moves)
-        assert any(cmd.startswith("G1 Z56") for cmd in z_moves)
+        assert not any(cmd.startswith("G1 Z56") for cmd in z_moves)
         assert "G28 X Y" in pcb_wizard.printer.sent
         assert "G91" not in pcb_wizard.printer.sent
         assert not any("G28 Z" in cmd for cmd in pcb_wizard.printer.sent)
@@ -3012,28 +4356,26 @@ class TestEasyZLifecycle:
         assert not any(cmd.startswith("G1 Z56") for cmd in pcb_wizard.printer.sent)
 
     def test_start_at_plane_never_moves_z(self, pcb_wizard):
-        pcb_wizard._pcb_surface_z = 53.0
-        pcb_wizard.printer.z = 56.0
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard.printer.sent.clear()
         pcb_wizard._ensure_at_agreed_scan_plane()
         assert pcb_wizard.printer.z == pytest.approx(56.0)
         assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
 
-    def test_set_probe_height_immediately_enables_next(self, pcb_wizard):
-        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_EASY_HEIGHT)
-        pcb_wizard._pcb_surface_z = 53.0
-        pcb_wizard.printer.z = 66.0
+    def test_completed_step_2_enables_next_from_fixture_page(self, pcb_wizard):
+        pcb_wizard.ui.wizardStack.setCurrentIndex(PAGE_FIXTURE_TEACH)
         pcb_wizard._update_nav()
         assert pcb_wizard.ui.btnNext.isEnabled() is False
-        assert pcb_wizard._easy_set_probe_height() is True
-        assert pcb_wizard.printer.z == pytest.approx(56.0)
+        _agree_easy_scan_plane(pcb_wizard)
+        pcb_wizard._update_nav()
+        assert pcb_wizard._fixture_gate_ready() is True
         assert pcb_wizard.ui.btnNext.isEnabled() is True
 
     def test_start_high_blocks_without_moving_z(self, pcb_wizard):
-        pcb_wizard._pcb_surface_z = 53.0
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard.printer.z = 66.0
         pcb_wizard.printer.sent.clear()
-        with pytest.raises(RuntimeError, match="SET PROBE HEIGHT"):
+        with pytest.raises(RuntimeError, match=re.escape(EASY_HEIGHT_NOT_REACHED)):
             pcb_wizard._ensure_at_agreed_scan_plane()
         assert pcb_wizard.printer.z == pytest.approx(66.0)
         assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
@@ -3041,39 +4383,34 @@ class TestEasyZLifecycle:
     def test_start_without_datum_blocks(self, pcb_wizard):
         pcb_wizard._pcb_surface_z = None
         pcb_wizard.printer.sent.clear()
-        with pytest.raises(RuntimeError, match="SET PCB SURFACE"):
+        with pytest.raises(RuntimeError, match="Step 2 incomplete"):
             pcb_wizard._ensure_at_agreed_scan_plane()
         assert not any(cmd.startswith("G1 Z") for cmd in pcb_wizard.printer.sent)
 
-    def test_reset_clears_datum_and_shows_manual_surface(self, pcb_wizard):
-        pcb_wizard._pcb_surface_z = 53.0
-        pcb_wizard._last_commanded_scan_z = 56.0
+    def test_reset_clears_datum_and_asks_to_repeat_step_2(self, pcb_wizard):
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard._on_printer_reset()
         assert pcb_wizard._pcb_surface_z is None
         pcb_wizard._refresh_easy_height_label()
         text = pcb_wizard.ui.easyHeightLabel.text()
-        assert "SET PCB SURFACE" in text
+        assert EASY_HEIGHT_RESET in text
         assert "53" not in text
 
     def test_easy_height_copy_hides_raw_z(self, pcb_wizard):
-        pcb_wizard._pcb_surface_z = 53.0
-        pcb_wizard.printer.z = 56.0
+        _agree_easy_scan_plane(pcb_wizard)
         pcb_wizard._refresh_easy_height_label()
         text = pcb_wizard.ui.easyHeightLabel.text()
+        assert "Scan height set:" in text
         assert "3.00" in text
         assert "53" not in text
         assert "56" not in text
         assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is False
-        assert pcb_wizard.ui.btnEasyResetPcbSurface.isVisible() is True
-        pcb_wizard.printer.z = 66.0
+        assert pcb_wizard.ui.btnEasyResetPcbSurface.isVisible() is False
+        assert pcb_wizard.ui.btnEasySetHeight.isVisible() is False
+        pcb_wizard._invalidate_easy_verified_height()
         pcb_wizard._refresh_easy_height_label()
         raised = pcb_wizard.ui.easyHeightLabel.text()
-        assert "SET PROBE HEIGHT" in raised
+        assert "Scan height set:" in raised
+        assert EASY_HEIGHT_NOT_REACHED not in raised
         assert "53" not in raised
-        pcb_wizard._pcb_surface_z = None
-        pcb_wizard._refresh_easy_height_label()
-        unknown = pcb_wizard.ui.easyHeightLabel.text()
-        assert "SET PCB SURFACE" in unknown
-        assert pcb_wizard.ui.btnEasySetPcbSurface.isVisible() is True
-        assert pcb_wizard.ui.btnEasySetHeight.isVisible() is False
 

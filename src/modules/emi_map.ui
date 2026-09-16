@@ -1728,7 +1728,7 @@ To scan a board: Back, set Scan mode to PCB aligned, then Next. That path is Set
      </widget>
      <!-- Page 4: Scan -->
      <widget class="QWidget" name="pageScan">
-      <layout class="QVBoxLayout" name="scanLayout" stretch="0,0,0,0,0,0,1,1">
+      <layout class="QVBoxLayout" name="scanLayout" stretch="0,0,0,0,0,0,0,1,1">
        <item>
         <widget class="QLabel" name="scanIntro">
          <property name="text">
@@ -1792,6 +1792,19 @@ To scan a board: Back, set Scan mode to PCB aligned, then Next. That path is Set
           </widget>
          </item>
         </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="scanStartReason">
+         <property name="text">
+          <string></string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string>color:#B42318;</string>
+         </property>
+        </widget>
        </item>
        <item>
         <widget class="QProgressBar" name="scanProgress">
@@ -1913,7 +1926,7 @@ To scan a board: Back, set Scan mode to PCB aligned, then Next. That path is Set
          <item>
           <widget class="QPushButton" name="btnOpenOverlay">
            <property name="text">
-            <string>Open PCB overlay</string>
+            <string>Open EMI Analyzer</string>
            </property>
            <property name="enabled">
             <bool>false</bool>

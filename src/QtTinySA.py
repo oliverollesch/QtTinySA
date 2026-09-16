@@ -26,24 +26,73 @@ TinySA commands are based on Erik's Python examples: http://athome.kaashoek.com/
 Serial communication commands are based on Martin's Python NanoVNA/TinySA Toolset: https://github.com/Ho-Ro"""
 
 import os
+import sys
 import time
 import logging
+
+# pyqtgraph must bind to PySide6. If PyQt6 is also installed it will otherwise
+# pick that binding and the process later aborts in mixed Qt DLLs.
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
+
+# pytest sets QT_QPA_PLATFORM=offscreen. That value sticks in the same
+# PowerShell session, so a later GUI launch would run with no window and
+# print "This plugin does not support propagateSizeHints()".
+_HEADLESS_QT_PLATFORMS = {"offscreen", "minimal", "null"}
+
+
+def _want_visible_window():
+    if os.environ.get("QT_TINYSA_ALLOW_OFFSCREEN"):
+        return False
+    return "pytest" not in sys.modules
+
+
+def _drop_headless_qt_platform():
+    plugin = os.environ.get("QT_QPA_PLATFORM", "").strip().split(":", 1)[0].lower()
+    if plugin in _HEADLESS_QT_PLATFORMS and _want_visible_window():
+        print(
+            f"Ignoring QT_QPA_PLATFORM={os.environ['QT_QPA_PLATFORM']} "
+            "so the QtTinySA window can appear.",
+            flush=True,
+        )
+        del os.environ["QT_QPA_PLATFORM"]
+
+
+_drop_headless_qt_platform()
 
 from platform import system
 from PySide6 import QtCore
 from PySide6 import QtWidgets
 from PySide6.QtUiTools import QUiLoader
-from PySide6.QtCore import QFile, Slot, QSignalBlocker
+from PySide6.QtCore import QFile, QLockFile, Slot, QSignalBlocker
 from PySide6.QtWidgets import QMessageBox, QDataWidgetMapper, QFileDialog, QApplication
 from PySide6.QtWidgets import QTableWidgetItem, QInputDialog, QLineEdit
 from PySide6.QtSql import QSqlDatabase, QSqlRelation, QSqlRelationalTableModel, QSqlRelationalDelegate, QSqlQuery
 from PySide6.QtGui import QPixmap, QIcon
+import PySide6
 
 import shutil
 import platformdirs
 import csv
 import numpy as np
 import pyqtgraph
+
+
+def _ensure_pyside_font_dir():
+    """PySide6 no longer ships fonts; a missing dir prints a startup warning."""
+    fonts = os.path.join(os.path.dirname(PySide6.__file__), "lib", "fonts")
+    if os.path.isdir(fonts) and os.listdir(fonts):
+        return
+    try:
+        os.makedirs(fonts, exist_ok=True)
+        src = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segoeui.ttf")
+        dst = os.path.join(fonts, "segoeui.ttf")
+        if os.path.isfile(src) and not os.path.isfile(dst):
+            shutil.copyfile(src, dst)
+    except OSError:
+        pass
+
+
+_ensure_pyside_font_dir()
 
 from io import BytesIO
 
@@ -72,6 +121,47 @@ if not app:
     app = QApplication([])
 app.setApplicationName('QtTinySA')
 app.setApplicationVersion(' v2.0.0')
+
+def _lock_holder_pid(lock):
+    try:
+        info = lock.getLockInfo()
+    except Exception:
+        return None
+    if isinstance(info, tuple) and info:
+        for item in info:
+            if isinstance(item, int) and item > 0:
+                return item
+        return None
+    return int(info) if isinstance(info, int) and info > 0 else None
+
+
+def _ensure_single_instance(application):
+    """A second copy steals COM ports and can abort both windows."""
+    data_dir = platformdirs.user_data_dir("QtTinySA", False)
+    os.makedirs(data_dir, exist_ok=True)
+    lock = QLockFile(os.path.join(data_dir, "qt-tinysa.instance.lock"))
+    lock.setStaleLockTime(8000)
+    if not lock.tryLock(2000):
+        pid = _lock_holder_pid(lock)
+        detail = f" (PID {pid})" if pid else ""
+        print(
+            f"QtTinySA is already running{detail}. "
+            "Close that python.exe copy in Task Manager, then start again.",
+            flush=True,
+        )
+        QMessageBox.warning(
+            None,
+            application.applicationName(),
+            "QtTinySA is already running" + detail + ".\n\n"
+            "A second copy steals the tinySA serial port and can crash both windows.\n"
+            "Close the other python.exe running QtTinySA.py, then start again.",
+        )
+        raise SystemExit(0)
+    return lock
+
+
+# Keep the lock object alive for the process lifetime.
+_instance_lock = _ensure_single_instance(app)
 
 # pyqtgraph custom exporters
 WWBExporter.register()
@@ -1860,6 +1950,9 @@ numbers.dwm.setCurrentIndex(0)
 QtTSA.show()
 QtTSA.setWindowTitle(app.applicationName() + app.applicationVersion())
 QtTSA.setWindowIcon(QIcon(os.path.join(basedir, 'tinySAsmall.png')))
+QtTSA.setWindowState(QtTSA.windowState() & ~QtCore.Qt.WindowState.WindowMinimized)
+QtTSA.raise_()
+QtTSA.activateWindow()
 
 # try to open a USB connection to hardware....... need to check if it works in Windows now
 usbInstr = USBdevice()
@@ -1890,5 +1983,4 @@ if settings.ui.auto_run.isChecked():
 try:
     app.exec()
 finally:
-    exit_handler()  # close cleanly
-    app.quit()
+    exit_handler()  # close cleanly; do not app.quit() after exec already returned

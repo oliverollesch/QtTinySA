@@ -44,13 +44,172 @@ PORT_EXCLUDE_HINTS = ("bluetooth",)
 # USB-serial bridges the Ender's mainboard is actually built around
 PORT_PRINTER_HINTS = ("ch340", "ch341", "cp210", "ft232", "usb-serial", "wch")
 
-# Opening the port pulses DTR and reboots the mainboard, so Marlin cannot answer
-# for the first couple of seconds. M115 then proves the port really is a
-# printer; without it, the wrong port costs one 30 s ok timeout per command.
-PRINTER_BOOT_S = 2.0
+# Opening a Creality CH340 port can pulse DTR and reboot Marlin. Identify from
+# raw bytes (Marlin/ok), not only a newline-terminated 'ok' line: Windows CH340
+# often delivers FIRMWARE_NAME before a lone ok, and a 0.05 s engine timeout
+# can miss the line split. Use the full greet window; do not hold DTR down
+# (that can look like a silent port on this board).
+PRINTER_BOOT_S = 5.0
 PRINTER_GREET_S = 8.0
+PRINTER_BAUD_SETTLE_S = 1.5
+PRINTER_SERIAL_TIMEOUT_S = 0.25
+# After FIRMWARE_NAME, the rest of M115 (Cap: lines and ok) is still in flight.
+# Returning before that idle gap lets Printer.send steal the leftover ok and
+# the next real command times out with an empty buffer.
+PRINTER_SYNC_QUIET_S = 0.25
 
 DIALOG_TITLE = "EMI Near-Field Map"
+PRINTER_HALTED_TEXT = "Printer halted — reset the printer, then reconnect."
+_NO_BYTES_TEXT = "timeout (no bytes received)"
+STEP2_AFTER_RECONNECT = (
+    "Printer connected. Saved P1 XY is kept. Session homing, board-zero, and "
+    "scan height were cleared. Finish P1 and Z setup on Step 2."
+)
+
+
+class _FixtureMotionRefused(RuntimeError):
+    """A fixture XY/Z gate failed; session homing stays valid."""
+
+
+def _marlin_identity_text(buf: bytes) -> bool:
+    """True when the buffer is a Marlin identify reply, even without a lone ok line."""
+    text = buf.decode("latin1", errors="replace").lower()
+    if "firmware_name:marlin" in text:
+        return True
+    if "ok" in text and " t:" in text:
+        return True
+    if text.lstrip().startswith("ok t:"):
+        return True
+    return False
+
+
+def _controller_text_is_halt(text: str) -> bool:
+    """True only for firmware halt replies. Never applied to this app's own advice."""
+    lowered = str(text).lower()
+    return "printer halted" in lowered or "kill() called" in lowered
+
+
+def _halt_error(message):
+    """A halt is carried by type, so wizard prose can never be mistaken for one."""
+    if engine_printer is not None:
+        return engine_printer.PrinterHalted(message)
+    return RuntimeError(message)
+
+
+def _controller_preview(buf: bytes) -> str:
+    text = buf.decode("latin1", errors="replace").replace("\r", "\n")
+    compact = " ".join(line.strip() for line in text.splitlines() if line.strip())
+    if not compact:
+        return _NO_BYTES_TEXT
+    if len(compact) > 240:
+        return compact[:240] + "…"
+    return compact
+
+
+def _drain_serial(handle, quiet_s: float) -> None:
+    """Read until the port is idle so a later Printer.send is not desynced."""
+    idle_s = max(float(quiet_s), 0.0)
+    deadline = time.monotonic() + idle_s
+    while True:
+        chunk = handle.read(256)
+        if chunk:
+            deadline = time.monotonic() + idle_s
+            continue
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.02)
+
+
+def greet_marlin_handle(handle, port, *, boot_s: float, greet_s: float) -> None:
+    """Identify Marlin on an open serial handle without requiring Printer.send.
+
+    Printer.send waits for a newline-terminated ``ok``. This board answers M115
+    with FIRMWARE_NAME first; treating that as identity avoids a false
+    timeout when the ok line is delayed, coalesced, or uses CR only.
+    After identity, drain the rest of that reply or the next G-code times out
+    with an empty buffer (``no reply from the printer: b''``). Halted
+    firmware is reported from the bytes received, not guessed as power-off.
+    """
+    baud = getattr(handle, "baudrate", None)
+    baud_text = f" at {baud} baud" if baud not in (None, "") else ""
+    deadline = time.monotonic() + boot_s
+    leftover = bytearray()
+    while time.monotonic() < deadline:
+        chunk = handle.read(256)
+        if chunk:
+            leftover += chunk
+            logging.info("printer RX %s boot: %s", port, _controller_preview(chunk))
+            if _controller_text_is_halt(leftover.decode("latin1", errors="replace")):
+                raise _halt_error(
+                    f"{PRINTER_HALTED_TEXT} Controller response on {port}{baud_text}: "
+                    f"{_controller_preview(bytes(leftover))}"
+                )
+            if _marlin_identity_text(bytes(leftover)):
+                _drain_serial(handle, PRINTER_SYNC_QUIET_S)
+                return
+        else:
+            time.sleep(0.02)
+    probes = []
+    for command in (b"M115\n", b"M105\n"):
+        logging.info("printer TX %s: %s", port, command.decode("ascii", errors="replace").strip())
+        handle.write(command)
+        flush = getattr(handle, "flush", None)
+        if callable(flush):
+            flush()
+        buf = bytearray()
+        end = time.monotonic() + greet_s
+        while time.monotonic() < end:
+            chunk = handle.read(256)
+            if chunk:
+                buf += chunk
+                logging.info("printer RX %s: %s", port, _controller_preview(chunk))
+                if _controller_text_is_halt(buf.decode("latin1", errors="replace")):
+                    raise _halt_error(
+                        f"{PRINTER_HALTED_TEXT} Controller response on {port}{baud_text} "
+                        f"after {command.decode('ascii', errors='replace').strip()}: "
+                        f"{_controller_preview(bytes(buf))}"
+                    )
+                if _marlin_identity_text(bytes(buf)):
+                    _drain_serial(handle, PRINTER_SYNC_QUIET_S)
+                    return
+            else:
+                time.sleep(0.02)
+        probes.append(
+            f"after {command.decode('ascii', errors='replace').strip()}: "
+            f"{_controller_preview(bytes(buf))}"
+        )
+    description = _serial_port_description(port)
+    boot_preview = _controller_preview(bytes(leftover))
+    silent = not leftover and all(_NO_BYTES_TEXT in probe for probe in probes)
+    advice = (
+        # Zero bytes is the USB bridge answering alone: the CH340 enumerates
+        # from USB 5 V even when the controller is not running or is held in
+        # reset, so baud is not the first thing to suspect.
+        "The USB bridge answered but the controller sent nothing at all. "
+        "Press the printer's reset button and wait for the boot screen, "
+        "check that the printer is switched on at the PSU, and close any "
+        "other program holding this port, then click RETRY PRINTER "
+        "CONNECTION."
+        if silent
+        else "Press the printer's reset button and wait for the boot screen, "
+        "then click RETRY PRINTER CONNECTION. If bytes arrive but do not "
+        "identify, confirm the firmware baud (normally 115200 or 250000) "
+        "and the USB cable."
+    )
+    raise RuntimeError(
+        f"{port}{f' ({description})' if description else ''} opened{baud_text}, "
+        f"but Marlin did not identify. Boot-window response: {boot_preview}. "
+        + " ".join(probes)
+        + ". "
+        + advice
+    )
+
+
+def _serial_port_description(device):
+    for info in list_ports.comports():
+        if str(getattr(info, "device", "")).upper() == str(device).upper():
+            return str(getattr(info, "description", "") or "").strip()
+    return ""
 
 # TinySA Ultra has no firmware overload USB command. Cube preflight will
 # refuse unless the operator acknowledges the RF chain on the Scan page.
@@ -71,6 +230,8 @@ PAGE_RESULTS = 5
 # Runtime-only Easy page. Keeping the existing .ui indices stable avoids
 # disturbing Rectangle and Advanced workflows.
 PAGE_EASY_HEIGHT = 6
+PAGE_FIXTURE_TEACH = 7
+PAGE_SCAN_SETUP = 8
 
 MODE_RECTANGLE = "Rectangle"
 MODE_PCB = "PCB aligned"
@@ -84,9 +245,9 @@ MODE_PAGES = {
 }
 EASY_PCB_PAGES = (
     PAGE_SETUP,
+    PAGE_FIXTURE_TEACH,
     PAGE_BOARD,
-    PAGE_REGISTER,
-    PAGE_EASY_HEIGHT,
+    PAGE_SCAN_SETUP,
     PAGE_SCAN,
     PAGE_RESULTS,
 )
@@ -95,6 +256,39 @@ OPERATOR_MODE_EASY = "Easy"
 OPERATOR_MODE_ADVANCED = "Advanced"
 EASY_JOG_STEPS_MM = (0.05, 0.10, 0.25, 0.50, 1.00)
 LOGICAL_Z_MAX_MM = 250.0
+BOARD_ZERO_COMPLETE_TEXT = "Board zero set at P1. Step 2 complete."
+EASY_HEIGHT_MISSING_THICKNESS = "Step 2 incomplete: PCB thickness is missing."
+EASY_HEIGHT_MISSING_VERTICAL = (
+    "Step 2 incomplete: vertical E-probe calibration is missing."
+)
+EASY_VERTICAL_UNCALIBRATED = "E-probe vertical offset not calibrated."
+EASY_HEIGHT_NOT_REACHED = "Scan height was not reached."
+EASY_HEIGHT_CLEARANCE = (
+    "Automatic scan-height Z needs clearance at P1 and the A/B teaching route."
+)
+EASY_HEIGHT_RESET = "Height reference invalidated by printer reset. Repeat Step 2."
+EASY_HEIGHT_MISSING_P1 = "Step 2 incomplete: P1 contact datum is missing."
+EASY_HEIGHT_NEED_BOARD_ZERO = (
+    "Step 2 incomplete: Home & Set Board Zero at the saved P1."
+)
+EASY_HEIGHT_NEED_MANUAL_PLANE = (
+    "Set PCB surface manually, then set probe height."
+)
+EASY_MANUAL_HEIGHT_BUTTONS = (
+    "btnEasySetHeight",
+    "btnEasySetPcbSurface",
+    "btnEasyResetPcbSurface",
+)
+# Step 2 teaches P1 only: it locates the fixture origin and gives board zero.
+# The STL supplies the rest of the holder geometry, with the fixture taken as
+# square to X/Y. Teaching all four corners is what would measure that angle.
+TEACHING_POINT_NAMES = ("P1",)
+# Step 4 locates the inner pocket by teaching its two diagonal corners, once
+# per board face. v2 pairs are pocket CAD corners; v1 PCB-extrema pairs are
+# ignored and must be recaptured.
+TAUGHT_CORNER_TEMPLATE_ID = "taught_pocket_corners_v2"
+TAUGHT_CORNER_LABELS = ("Corner A", "Corner B")
+SCAN_SETUP_SIDES = ("top", "bottom")
 ORIENTATION_DRIFT_HINT = (
     "Orientation may have changed.\n"
     "Use Advanced → Recalibrate Fixture\n"
@@ -160,14 +354,18 @@ def _load_engine():
     from EMI_Mapper import board as engine_board
     from EMI_Mapper import config as engine_config
     from EMI_Mapper import fixture_profiles as engine_profiles
+    from EMI_Mapper import fixture_teaching as engine_fixture_teaching
+    from EMI_Mapper import glassboard_fixture as engine_glassboard_fixture
     from EMI_Mapper import geometry as engine_geometry
     from EMI_Mapper import height as engine_height
+    from EMI_Mapper import machine_fixtures as engine_machine_fixtures
     from EMI_Mapper import odbpp as engine_odbpp
     from EMI_Mapper import overlay as engine_overlay
     from EMI_Mapper import printer as engine_printer
     from EMI_Mapper import registration as engine_registration
     from EMI_Mapper import scanner as engine_scanner
     from EMI_Mapper import selection as engine_selection
+    from EMI_Mapper import scan_preview as engine_scan_preview
 
     return (
         engine_board,
@@ -177,10 +375,14 @@ def _load_engine():
         engine_overlay,
         engine_printer,
         engine_profiles,
+        engine_fixture_teaching,
+        engine_glassboard_fixture,
+        engine_machine_fixtures,
         engine_registration,
         engine_scanner,
         engine_geometry,
         engine_selection,
+        engine_scan_preview,
     )
 
 
@@ -193,16 +395,22 @@ try:
         engine_overlay,
         engine_printer,
         engine_profiles,
+        engine_fixture_teaching,
+        engine_glassboard_fixture,
+        engine_machine_fixtures,
         engine_registration,
         engine_scanner,
         engine_geometry,
         engine_selection,
+        engine_scan_preview,
     ) = _load_engine()
     ENGINE_ERROR = ""
 except Exception as exc:  # pragma: no cover - depends on deployment layout
     engine_board = engine_config = engine_height = engine_odbpp = engine_overlay = None
     engine_printer = engine_profiles = engine_registration = engine_scanner = None
-    engine_geometry = engine_selection = None
+    engine_geometry = engine_selection = engine_fixture_teaching = None
+    engine_glassboard_fixture = engine_machine_fixtures = None
+    engine_scan_preview = None
     ENGINE_ERROR = str(exc)
     logging.info(f"EMI map engine unavailable: {exc}")
 
@@ -345,6 +553,7 @@ class ScanWorker(QtCore.QObject):
     # to know the machine frame is gone, and a formatted message loses the type.
     printer_reset = QtCore.Signal()
     ended = QtCore.Signal()
+    cell_begin = QtCore.Signal(dict)
 
     def __init__(
         self,
@@ -398,6 +607,7 @@ class ScanWorker(QtCore.QObject):
                 on_row=self.row.emit,
                 on_status=self.status.emit,
                 on_spectrum=self.spectrum.emit,
+                on_cell_begin=self.cell_begin.emit,
                 should_abort=self._abort.is_set,
                 prompt_dut_off=self._prompt_dut_off,
                 prompt_dut_on=self._prompt_dut_on,
@@ -610,6 +820,7 @@ class EMIMapWizard(QtCore.QObject):
         self.main = main_window
 
         self.printer_serial = None
+        self._printer_halted = False
         self.origin_set = False
         self.thread = None
         self.worker = None
@@ -636,6 +847,14 @@ class EMIMapWizard(QtCore.QObject):
         self._pcb_surface_z = None
         self._height_override_mm = None
         self._last_commanded_scan_z = None
+        self._easy_verified_scan_z = None
+        self._easy_height_identity = None
+        self._easy_height_lost_to_reset = False
+        self._fixture_z_calibrations_cleared = False
+        self._fixture_config_error = ""
+        self._bltouch_board_zero_z = None
+        self._bltouch_board_zero_frame = None
+        self._z_logical_frame = 0
 
         # Verification of a loaded profile, tracked against two revisions
         # rather than a flag.  A bare boolean lets the operator move to a
@@ -654,6 +873,26 @@ class EMIMapWizard(QtCore.QObject):
         self._easy_adjust_saved_xy = None
         self._easy_z_unlocked = False
         self._easy_touch_logical_z = None
+        self._fixture_xyz_homed = False
+        self._fixture_teaching_points = {}
+        self._fixture_verified_session = False
+        self._fixture_config_cache = None
+        self._fixture_config_error = ""
+        self._syncing_glassboard_side = False
+        self._stl_board_placement = None
+        # Step 4 taught inner-pocket corners, per board face: {side: {slot: (x, y)}}.
+        self._taught_pcb_corner_points = {side: {} for side in SCAN_SETUP_SIDES}
+        self._active_taught_side = None
+        self._pocket_pair_state = {side: "missing" for side in SCAN_SETUP_SIDES}
+        self._pocket_block_reason = ""
+        self._corner_teach_labels = {}
+        self._taught_pocket_placement = None
+        self._active_machine_fixture_name = ""
+        self._approved_scan_fingerprint = None
+        self._scan_preview_widget = None
+        self._pcb_surface_from_fixture = False
+        self._machine_xy_at = 0.0
+        self._pending_preview_cell = None
         self._refreshing_ports = False
         self._last_page_by_mode = {
             MODE_RECTANGLE: PAGE_SETUP,
@@ -673,10 +912,37 @@ class EMIMapWizard(QtCore.QObject):
         self._live_spectrum = None
         self._live_spectrum_curve = None
 
+        # Live-map presentation state.  Keep the raw OFF and ON maps separate so
+        # the UI can switch to the requested DUT ON - DUT OFF view as soon as
+        # the matching ON cell is measured.  The scanner remains the source of
+        # truth; this is presentation-only and never changes acquisition data.
+        self._live_background_grid = None
+        self._live_dut_grid = None
+        self._live_delta_grid = None
+        self._live_background_spectra = {}
+        self._live_background_kind = "xy_grid"
+        self._live_stationary_background_dbm = np.nan
+        self._live_label_items = {}
+        self._live_colorbar = None
+        self._live_units = "dBm"
+        self._live_map_caption = "Measured level"
+        self._live_last_pass = ""
+
+        # Results are rendered directly at the QLabel's current size rather than
+        # scaling a 31x8 RGB bitmap.  This keeps cell edges/text crisp and also
+        # gives eventFilter an exact rectangle for hover/click picking.
+        self._results_values = None
+        self._results_units = "dBm"
+        self._results_title = "EMI near-field map"
+        self._results_map_rect = None
+
         self._wire_ui()
         self._install_cube_controls()
         self._install_easy_height_page()
+        self._install_fixture_teaching_page()
+        self._install_scan_setup_page()
         self._install_easy_mode_controls()
+        self._install_workflow_progress()
         self._apply_simple_survey_defaults()
         self._setup_plot()
         self._setup_board_plots()
@@ -698,15 +964,20 @@ class EMIMapWizard(QtCore.QObject):
         u.btnBack.clicked.connect(self._on_back)
         u.btnNext.clicked.connect(self._on_next)
         u.btnCancel.clicked.connect(self._on_close)
+        self._install_next_reason_label()
         u.btnBrowse.clicked.connect(self._browse_folder)
         u.btnSetOrigin.clicked.connect(self._set_origin_clicked)
         u.btnStartScan.clicked.connect(self._start_scan)
         u.btnAbortScan.clicked.connect(self._abort_scan)
         u.btnContinueDut.clicked.connect(self._continue_dut)
         u.btnOpenFolder.clicked.connect(self._open_folder)
-        u.btnOpenOverlay.clicked.connect(self._open_overlay)
+        u.btnOpenOverlay.clicked.connect(self._open_analyzer)
         if hasattr(u, "boardImage") and hasattr(u.boardImage, "installEventFilter"):
             u.boardImage.installEventFilter(self)
+            if hasattr(u.boardImage, "setMouseTracking"):
+                u.boardImage.setMouseTracking(True)
+            if hasattr(u.boardImage, "setCursor"):
+                u.boardImage.setCursor(QtCore.Qt.CrossCursor)
 
         u.chkTravelClear.stateChanged.connect(self._update_nav)
         for spin in (u.widthMm, u.heightMm, u.stepMm):
@@ -885,16 +1156,16 @@ class EMIMapWizard(QtCore.QObject):
             return
         controls = QtWidgets.QHBoxLayout()
         u.cubeMapKind = QtWidgets.QComboBox()
-        u.cubeMapKind.addItems(
-            [
-                "band_max",
-                "single_frequency",
-                "sum_of_measured_bin_powers",
-                "dB_above_stationary_reference",
-            ]
-        )
+        # Human-facing names stay short; stable machine keys live in itemData so
+        # processing code and saved tests do not have to parse UI wording.
+        u.cubeMapKind.addItem("DUT ON − DUT OFF", "dut_on_minus_dut_off")
+        u.cubeMapKind.addItem("Peak in band", "band_max")
+        u.cubeMapKind.addItem("Single frequency", "single_frequency")
+        u.cubeMapKind.addItem("Integrated band power", "sum_of_measured_bin_powers")
+        u.cubeMapKind.addItem("Above stationary reference", "dB_above_stationary_reference")
         u.cubeQuantity = QtWidgets.QComboBox()
-        u.cubeQuantity.addItems(["raw_dbm", "characterized"])
+        u.cubeQuantity.addItem("Raw", "raw_dbm")
+        u.cubeQuantity.addItem("Characterized", "characterized")
         u.cubeFreqSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         u.cubeBandwidthMhz = QtWidgets.QDoubleSpinBox()
         u.cubeBandwidthMhz.setRange(0.0, 100.0)
@@ -908,7 +1179,9 @@ class EMIMapWizard(QtCore.QObject):
         controls.addWidget(QtWidgets.QLabel("BW MHz"))
         controls.addWidget(u.cubeBandwidthMhz)
         u.cubeAnimate = QtWidgets.QCheckBox("Animate")
-        u.cubeSpectrumLabel = QtWidgets.QLabel("Click a cell for its spectrum")
+        u.cubeSpectrumLabel = QtWidgets.QLabel(
+            "Hover for a value; click up to two completed cells to compare spectra"
+        )
         u.cubeSpectrumLabel.setWordWrap(True)
         controls.addWidget(u.cubeAnimate)
         results.insertLayout(2, controls)
@@ -921,6 +1194,18 @@ class EMIMapWizard(QtCore.QObject):
                 widget.currentTextChanged.connect(self._refresh_cube_view)
         self._set_advanced_visible(False)
 
+    _EASY_HEIGHT_SETUP_WIDGETS = (
+        "heightCadLabel",
+        "chkHeightOverride",
+        "heightOverrideMm",
+        "heightGapMm",
+        "chkHeightReference",
+        "chkAllowSetupZ",
+        "btnJogZUp",
+        "btnJogZDown",
+        "chkHeightClearance",
+        "btnMoveToScanHeight",
+    )
     _EASY_HIDDEN_WIDGETS = (
         "btnRecordLandmark",
         "btnRemoveLandmark",
@@ -934,16 +1219,7 @@ class EMIMapWizard(QtCore.QObject):
         "fixtureId",
         "machineId",
         "probeSetupId",
-        "heightCadLabel",
-        "chkHeightOverride",
-        "heightOverrideMm",
-        "heightGapMm",
-        "chkHeightReference",
-        "chkAllowSetupZ",
-        "btnJogZUp",
-        "btnJogZDown",
-        "chkHeightClearance",
-        "btnMoveToScanHeight",
+        *_EASY_HEIGHT_SETUP_WIDGETS,
         "btnSaveAsProfile",
         "btnUpdateProfile",
         "chkAdvanced",
@@ -954,9 +1230,6 @@ class EMIMapWizard(QtCore.QObject):
         "btnEasyMoveToRef",
         "btnEasyFineAdjust",
         "btnEasyResetXy",
-        "btnEasySetHeight",
-        "btnEasySetPcbSurface",
-        "btnEasyResetPcbSurface",
         "easyHeightLabel",
     )
 
@@ -970,13 +1243,13 @@ class EMIMapWizard(QtCore.QObject):
         page.setObjectName("pageEasyHeight")
         layout = QtWidgets.QVBoxLayout(page)
         intro = QtWidgets.QLabel(
-            "Set the session PCB surface, then place the probe at the fixed "
-            "measurement height. Start and scan never move Z."
+            "Scan height is set in Step 2. This page only reports that status. "
+            "Start and scan never move Z."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
         group = QtWidgets.QGroupBox("Probe Height (Z)")
-        group_layout = QtWidgets.QVBoxLayout(group)
+        QtWidgets.QVBoxLayout(group)
         layout.addWidget(group)
         layout.addStretch(1)
         index = stack.addWidget(page)
@@ -986,7 +1259,492 @@ class EMIMapWizard(QtCore.QObject):
             )
         self.ui.pageEasyHeight = page
         self.ui.grpEasyHeight = group
-        self._easy_height_layout = group_layout
+
+    def _install_fixture_teaching_page(self):
+        """Create the Glassboard four-point teaching page at runtime."""
+        stack = getattr(self.ui, "wizardStack", None)
+        if not isinstance(stack, QtWidgets.QStackedWidget):
+            return
+        page = QtWidgets.QWidget()
+        page.setObjectName("pageFixtureTeach")
+        page.setStyleSheet(
+            "QGroupBox{font-weight:600;border:1px solid #667085;border-radius:8px;"
+            "margin-top:10px;padding:12px} QGroupBox::title{subcontrol-origin:margin;"
+            "left:12px;padding:0 5px} QPushButton{min-height:32px;padding:4px 12px}"
+            "QTableWidget{border:1px solid #98A2B3;border-radius:6px;gridline-color:#D0D5DD}"
+        )
+        page_layout = QtWidgets.QVBoxLayout(page)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setObjectName("fixtureTeachScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll)
+        title = QtWidgets.QLabel("Home & Set Board Zero")
+        title.setStyleSheet("font-size:18px;font-weight:700")
+        layout.addWidget(title)
+        intro = QtWidgets.QLabel(
+            "Teach P1 so the machine knows the fixture origin. Home XY for "
+            "Teaching, jog the BLTouch onto the mark, then CAPTURE P1. Capture "
+            "steps the pin down under M119 until it touches — that contact is "
+            "the fixture Z reference. Until P1 exists, use Home XY for Teaching "
+            "so you can jog. CLEAR P1 forgets it so you can recapture. Home & "
+            "Set Board Zero re-homes and recaptures a saved P1; that session "
+            "board-zero is enough for Next. Automatic scan-height Z at P1 runs "
+            "only when vertical E-probe calibration is present and clearance is "
+            "verified. Fast Verify is optional; it is not required for Next."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        selector_group = QtWidgets.QGroupBox("Choose the physical fixture")
+        selector_layout = QtWidgets.QHBoxLayout(selector_group)
+        machine_fixture = QtWidgets.QComboBox()
+        machine_fixture.setObjectName("machineFixtureProfile")
+        new_fixture = QtWidgets.QPushButton("NEW FIXTURE")
+        new_fixture.setObjectName("btnNewMachineFixture")
+        refresh_fixture = QtWidgets.QPushButton("REFRESH")
+        refresh_fixture.setObjectName("btnRefreshMachineFixtures")
+        selector_layout.addWidget(machine_fixture, 1)
+        selector_layout.addWidget(new_fixture)
+        selector_layout.addWidget(refresh_fixture)
+        layout.addWidget(selector_group)
+        summary = QtWidgets.QLabel("Fixture: not selected  •  Calibration: not taught")
+        summary.setObjectName("fixtureBoardSummary")
+        summary.setStyleSheet("padding:8px;background:#344054;color:white;border-radius:6px")
+        layout.addWidget(summary)
+        calibration = QtWidgets.QGroupBox("Teach P1 — fixture origin")
+        calibration_layout = QtWidgets.QVBoxLayout(calibration)
+        layout.addWidget(calibration)
+        clear = QtWidgets.QCheckBox(
+            "Bed, DUT, fixture, BLTouch, clamps and cables are clear for the Z "
+            "lift, XY motion, the scan-height move at P1, and jogging from P1 "
+            "toward A/B at that height"
+        )
+        clear.setObjectName("chkFixtureProbeClear")
+        calibration_layout.addWidget(clear)
+        connection_row = QtWidgets.QHBoxLayout()
+        retry_printer = QtWidgets.QPushButton("RETRY PRINTER CONNECTION")
+        retry_printer.setObjectName("btnFixtureRetryPrinter")
+        retry_printer.setToolTip(
+            "Reconnect without moving any axis. Tries the selected baud, then "
+            "the common Marlin rates 115200 and 250000."
+        )
+        connection_status = QtWidgets.QLabel("Printer connection not checked.")
+        connection_status.setObjectName("fixturePrinterConnectionStatus")
+        connection_status.setWordWrap(True)
+        connection_status.setStyleSheet(
+            "padding:7px;background:#F2F4F7;color:#344054;border-radius:6px"
+        )
+        connection_row.addWidget(retry_printer)
+        connection_row.addWidget(connection_status, 1)
+        calibration_layout.addLayout(connection_row)
+        home = QtWidgets.QPushButton("HOME XY FOR TEACHING")
+        home.setObjectName("btnFixtureHomeXyz")
+        home.setToolTip(
+            "When P1 is taught: home X/Y, step the BLTouch pin to P1 contact "
+            "under M119, retract, then move to the calculated scan height at "
+            "P1 if thickness, vertical calibration, and this clearance tick "
+            "are present. When P1 is not taught: lift Z and home X/Y so you "
+            "can jog to capture P1. It never homes Z downward, never sends "
+            "G30, and never uses CAD boxes or the E-probe XY offset to "
+            "authorize a downward move."
+        )
+        calibration_layout.addWidget(home)
+        reference_map = QtWidgets.QLabel(
+            "<b>Central-holder origin (viewed from above)</b><br>"
+            "<span style='font-family:monospace'>"
+            "P1 upper-left of the 106.162 × 34.000 mm holder"
+            "</span><br>"
+            "Jog the BLTouch to P1, then capture it. The STL supplies the rest of "
+            "the holder with the fixture taken as square to X/Y. CLEAR P1 forgets "
+            "the taught point so you can recapture it."
+        )
+        reference_map.setObjectName("fixtureReferenceMap")
+        reference_map.setWordWrap(True)
+        reference_map.setStyleSheet(
+            "padding:10px;border:1px solid #84ADFF;border-radius:7px;"
+            "background:#EFF8FF;color:#1849A9"
+        )
+        calibration_layout.addWidget(reference_map)
+        jog_group = QtWidgets.QGroupBox("Jog BLTouch to the selected physical mark")
+        jog_layout = QtWidgets.QGridLayout(jog_group)
+        jog_step = QtWidgets.QDoubleSpinBox()
+        jog_step.setObjectName("fixtureJogStep")
+        jog_step.setRange(0.05, 10.0)
+        jog_step.setDecimals(2)
+        jog_step.setValue(1.0)
+        jog_layout.addWidget(QtWidgets.QLabel("Step (mm)"), 0, 0)
+        jog_layout.addWidget(jog_step, 0, 1, 1, 2)
+        jog_buttons = {}
+        for name, label, row, column, dx, dy in (
+            ("btnFixtureJogYPlus", "Y+", 1, 1, 0, 1),
+            ("btnFixtureJogXMinus", "X−", 2, 0, -1, 0),
+            ("btnFixtureJogXPlus", "X+", 2, 2, 1, 0),
+            ("btnFixtureJogYMinus", "Y−", 3, 1, 0, -1),
+        ):
+            button = QtWidgets.QPushButton(label)
+            button.setObjectName(name)
+            button.clicked.connect(partial(self._fixture_jog, dx, dy))
+            jog_layout.addWidget(button, row, column)
+            jog_buttons[name] = button
+        calibration_layout.addWidget(jog_group)
+        table = QtWidgets.QTableWidget(len(TEACHING_POINT_NAMES), 5)
+        table.setObjectName("fixtureTeachTable")
+        table.setHorizontalHeaderLabels(
+            ["Point", "Machine X", "Machine Y", "Taught Z", "Latest check / Δ"]
+        )
+        for row, name in enumerate(TEACHING_POINT_NAMES):
+            item = QtWidgets.QTableWidgetItem(name)
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 0, item)
+            for column in (1, 2, 3, 4):
+                value = QtWidgets.QTableWidgetItem("Pending")
+                value.setFlags(value.flags() & ~QtCore.Qt.ItemIsEditable)
+                table.setItem(row, column, value)
+        table.horizontalHeader().setStretchLastSection(True)
+        calibration_layout.addWidget(table)
+        table.selectRow(0)
+        probe = QtWidgets.QPushButton("CAPTURE P1 — PROBE AND SAVE XYZ")
+        probe.setObjectName("btnFixtureProbePoint")
+        calibration_layout.addWidget(probe)
+        clear_point = QtWidgets.QPushButton("CLEAR P1 — FORGET THE TAUGHT POINT")
+        clear_point.setObjectName("btnFixtureClearPoint")
+        clear_point.setToolTip(
+            "Discard taught P1 so it can be re-jogged and captured again. "
+            "Board zero and the calculated height depend on P1, so both are "
+            "invalidated too. No motion."
+        )
+        calibration_layout.addWidget(clear_point)
+        tolerance_row = QtWidgets.QHBoxLayout()
+        z_limit = QtWidgets.QDoubleSpinBox()
+        z_limit.setRange(0.05, 5.0)
+        z_limit.setDecimals(3)
+        z_limit.setValue(0.20)
+        residual_limit = QtWidgets.QDoubleSpinBox()
+        residual_limit.setRange(0.01, 5.0)
+        residual_limit.setDecimals(3)
+        residual_limit.setValue(0.10)
+        z_limit.setToolTip(
+            "Maximum point-to-point shape or tilt change after removing the common "
+            "Marlin Z-reference shift. Recommended: 0.200 mm."
+        )
+        residual_limit.setToolTip(
+            "Maximum deviation of a measured point from the newly fitted fixture plane."
+        )
+        tolerance_row.addWidget(QtWidgets.QLabel("Max point / tilt change (mm)"))
+        tolerance_row.addWidget(z_limit)
+        tolerance_row.addWidget(QtWidgets.QLabel("Max plane residual (mm)"))
+        tolerance_row.addWidget(residual_limit)
+        calibration_layout.addLayout(tolerance_row)
+        save = QtWidgets.QPushButton("SAVE TAUGHT P1")
+        save.setToolTip(
+            "CAPTURE P1 already writes the fixture file. Use this only if that "
+            "write failed and you want to retry."
+        )
+        verify = QtWidgets.QPushButton("FAST VERIFY — RE-PROBE P1")
+        verify.setToolTip(
+            "Re-probe saved P1 with the same M119 pin-contact descent used by "
+            "CAPTURE P1. Does not send G30. Does not repeat Home XY when that "
+            "already ran this session."
+        )
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.addWidget(save)
+        action_row.addWidget(verify)
+        calibration_layout.addLayout(action_row)
+        firmware_note = QtWidgets.QLabel(
+            "CAPTURE P1 deploys the BLTouch pin and steps down 1 mm at a time "
+            "until M119 z_probe triggers. That contact is the new board zero. "
+            "G30 is never sent — this firmware's G30 stroke cannot reach the "
+            "board from the post-home height and does not stop on the pin. "
+            "FAST VERIFY re-probes saved P1 the same way. Carriage XY offset, "
+            "PCB thickness, yaw, and E-probe Z live in EMI_Mapper/config.yaml, "
+            "not on this page."
+        )
+        firmware_note.setWordWrap(True)
+        firmware_note.setStyleSheet(
+            "padding:8px;border-radius:6px;background:#EFF8FF;color:#175CD3"
+        )
+        calibration_layout.addWidget(firmware_note)
+        config_note = QtWidgets.QLabel()
+        config_note.setObjectName("fixtureConfigNote")
+        config_note.setWordWrap(True)
+        config_note.setStyleSheet(
+            "padding:8px;border-radius:6px;background:#F2F4F7;color:#344054"
+        )
+        calibration_layout.addWidget(config_note)
+        manual_height = QtWidgets.QGroupBox("E-probe scan height")
+        manual_height.setObjectName("grpEasyManualHeight")
+        manual_height_layout = QtWidgets.QVBoxLayout(manual_height)
+        calibration_layout.addWidget(manual_height)
+        self.ui.grpEasyManualHeight = manual_height
+        self._easy_height_layout = manual_height_layout
+        status = QtWidgets.QLabel("Fixture not taught.")
+        status.setWordWrap(True)
+        status.setStyleSheet("padding:8px;border-radius:6px;background:#F2F4F7")
+        calibration_layout.addWidget(status)
+        ready = QtWidgets.QLabel(
+            "Ready check: CAPTURE P1 (or Home & Set Board Zero at a saved P1). "
+            "Home XY for Teaching is available until P1 exists."
+        )
+        ready.setObjectName("fixtureReadySummary")
+        ready.setWordWrap(True)
+        layout.addWidget(ready)
+        layout.addStretch(1)
+        index = stack.addWidget(page)
+        if index != PAGE_FIXTURE_TEACH:
+            raise RuntimeError(
+                f"Fixture teaching page index changed: expected {PAGE_FIXTURE_TEACH}, got {index}"
+            )
+        self.ui.pageFixtureTeach = page
+        self.ui.fixtureTeachScroll = scroll
+        self.ui.fixtureReferenceMap = reference_map
+        self.ui.chkFixtureProbeClear = clear
+        self.ui.btnFixtureRetryPrinter = retry_printer
+        self.ui.fixturePrinterConnectionStatus = connection_status
+        self.ui.btnFixtureHomeXyz = home
+        self.ui.fixtureTeachTable = table
+        self.ui.btnFixtureProbePoint = probe
+        self.ui.fixtureJogStep = jog_step
+        for name, button in jog_buttons.items():
+            setattr(self.ui, name, button)
+        self.ui.fixtureMaxZChange = z_limit
+        self.ui.fixtureMaxResidual = residual_limit
+        self.ui.btnFixtureSavePlane = save
+        self.ui.btnFixtureVerify = verify
+        self.ui.btnFixtureClearPoint = clear_point
+        self.ui.fixtureConfigNote = config_note
+        self.ui.fixtureTeachStatus = status
+        self.ui.machineFixtureProfile = machine_fixture
+        self.ui.btnNewMachineFixture = new_fixture
+        self.ui.btnRefreshMachineFixtures = refresh_fixture
+        self.ui.fixtureBoardSummary = summary
+        self.ui.fixtureReadySummary = ready
+        home.clicked.connect(self._fixture_home_xyz_clicked)
+        retry_printer.clicked.connect(self._fixture_retry_printer_clicked)
+        probe.clicked.connect(self._fixture_probe_selected_clicked)
+        table.currentCellChanged.connect(self._on_fixture_point_selected)
+        save.clicked.connect(self._fixture_save_plane)
+        verify.clicked.connect(self._fixture_verify_clicked)
+        clear_point.clicked.connect(self._fixture_clear_point_clicked)
+        clear.toggled.connect(self._update_nav)
+        machine_fixture.currentTextChanged.connect(self._on_machine_fixture_changed)
+        new_fixture.clicked.connect(self._create_machine_fixture)
+        refresh_fixture.clicked.connect(self._refresh_machine_fixtures)
+        self._refresh_machine_fixtures()
+
+    def _install_scan_setup_page(self):
+        """Easy Step 4: locate the PCB insert from two taught corners per face.
+
+        Step 3 already decided *what* is measured, so this page only answers
+        *where* the PCB sits. Everything the operator can change here is a
+        taught point: two diagonal corners for the top face and two for the
+        bottom face, captured once and reused. The probe height is shown, not
+        re-derived, because Step 2 established it from BLTouch pin contact.
+        """
+        stack = getattr(self.ui, "wizardStack", None)
+        if not isinstance(stack, QtWidgets.QStackedWidget):
+            return
+        page = QtWidgets.QWidget()
+        page.setObjectName("pageEasyScanSetup")
+        page.setStyleSheet(
+            "QGroupBox{font-weight:600;border:1px solid #667085;border-radius:8px;"
+            "margin-top:10px;padding:12px} QGroupBox::title{subcontrol-origin:margin;"
+            "left:12px;padding:0 5px} QPushButton{min-height:32px;padding:4px 12px}"
+        )
+        page_layout = QtWidgets.QVBoxLayout(page)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(content)
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll)
+        title = QtWidgets.QLabel("Locate the PCB insert")
+        title.setStyleSheet("font-size:18px;font-weight:700")
+        layout.addWidget(title)
+        intro = QtWidgets.QLabel(
+            "Jog the E-field probe onto two diagonal corners of the PCB and "
+            "capture them. Teach each face once; the pair is saved with the "
+            "fixture and reused. Step 3 decides what is measured."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        board_summary = QtWidgets.QLabel("Board file: not selected")
+        board_summary.setObjectName("scanSetupBoardSummary")
+        board_summary.setWordWrap(True)
+        area_summary = QtWidgets.QLabel("Scan area: entire imported board")
+        area_summary.setObjectName("scanSetupAreaSummary")
+        area_summary.setWordWrap(True)
+        summary_card = QtWidgets.QFrame()
+        summary_card.setStyleSheet(
+            "QFrame{background:#F2F4F7;border-radius:6px;padding:8px}"
+        )
+        summary_layout = QtWidgets.QVBoxLayout(summary_card)
+        summary_layout.setContentsMargins(8, 6, 8, 6)
+        summary_layout.addWidget(board_summary)
+        summary_layout.addWidget(area_summary)
+        layout.addWidget(summary_card)
+
+        placement_card = QtWidgets.QFrame()
+        placement_card.setObjectName("glassboardPlacementCard")
+        placement_card.setStyleSheet(
+            "QFrame#glassboardPlacementCard{background:#F8FAFC;border:1px solid #CBD5E1;"
+            "border-radius:8px;padding:8px}"
+        )
+        placement_layout = QtWidgets.QVBoxLayout(placement_card)
+        # The face toward the probe is no longer an operator setting: it
+        # follows whichever taught pair is applied. The combo stays as the one
+        # place that answers "which side", so the STL fallback and the board
+        # view cannot disagree about it.
+        placement_side = QtWidgets.QComboBox()
+        placement_side.setObjectName("glassboardPlacementSide")
+        placement_side.addItem("Top side facing probe", "top")
+        placement_side.addItem("Bottom side facing probe", "bottom")
+        placement_side.setVisible(False)
+        placement_side.currentIndexChanged.connect(self._on_glassboard_side_changed)
+        placement_layout.addWidget(placement_side)
+
+        jog_group = QtWidgets.QGroupBox("Jog the E-field probe")
+        jog_layout = QtWidgets.QGridLayout(jog_group)
+        jog_step = QtWidgets.QDoubleSpinBox()
+        jog_step.setObjectName("scanSetupJogStep")
+        jog_step.setRange(0.05, 10.0)
+        jog_step.setDecimals(2)
+        jog_step.setValue(1.0)
+        jog_layout.addWidget(QtWidgets.QLabel("Step (mm)"), 0, 0)
+        jog_layout.addWidget(jog_step, 0, 1, 1, 2)
+        for name, label, row, column, dx, dy in (
+            ("btnScanSetupJogYPlus", "Y+", 1, 1, 0, 1),
+            ("btnScanSetupJogXMinus", "X−", 2, 0, -1, 0),
+            ("btnScanSetupJogXPlus", "X+", 2, 2, 1, 0),
+            ("btnScanSetupJogYMinus", "Y−", 3, 1, 0, -1),
+        ):
+            button = QtWidgets.QPushButton(label)
+            button.setObjectName(name)
+            button.clicked.connect(partial(self._scan_setup_jog, dx, dy))
+            jog_layout.addWidget(button, row, column)
+            setattr(self.ui, name, button)
+        placement_layout.addWidget(jog_group)
+
+        self._corner_teach_labels = {}
+        for side in SCAN_SETUP_SIDES:
+            group = QtWidgets.QGroupBox(f"{side.capitalize()} side of the PCB")
+            group_layout = QtWidgets.QVBoxLayout(group)
+            hint = QtWidgets.QLabel(
+                "Jog the E-field probe tip onto the inner-pocket lower-left "
+                "corner, capture A, then the opposite corner for B. Capture "
+                "reads M114 only. A/B are the E-probe scan XY. P1 is fixture "
+                "height only. Which face is MEASURE THE TOP/BOTTOM; 0°/180° "
+                "yaw is fixture.pcb_yaw_deg in config.yaml, not these two corners."
+            )
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color:#475467")
+            group_layout.addWidget(hint)
+            capture_row = QtWidgets.QHBoxLayout()
+            for slot, corner_label in enumerate(TAUGHT_CORNER_LABELS):
+                name = f"btnTeach{side.capitalize()}Corner{'AB'[slot]}"
+                button = QtWidgets.QPushButton(f"CAPTURE {corner_label.upper()}")
+                button.setObjectName(name)
+                button.setToolTip(
+                    "Record the E-field probe's M114 as this inner-pocket "
+                    "corner. No motion."
+                )
+                button.clicked.connect(
+                    partial(self._capture_pcb_corner, side, slot)
+                )
+                capture_row.addWidget(button)
+                setattr(self.ui, name, button)
+            group_layout.addLayout(capture_row)
+            taught = QtWidgets.QLabel()
+            taught.setObjectName(f"teach{side.capitalize()}CornerSummary")
+            taught.setWordWrap(True)
+            taught.setStyleSheet("font-family:monospace;padding:4px")
+            group_layout.addWidget(taught)
+            self._corner_teach_labels[side] = taught
+            action_row = QtWidgets.QHBoxLayout()
+            use_name = f"btnUse{side.capitalize()}Side"
+            use_button = QtWidgets.QPushButton(f"MEASURE THE {side.upper()} SIDE")
+            use_button.setObjectName(use_name)
+            use_button.setToolTip(
+                "Fit this face's taught pocket corners and seat the board in "
+                "that insert. Face and yaw are not inferred from A/B. No motion."
+            )
+            use_button.clicked.connect(partial(self._use_taught_pcb_side, side))
+            clear_name = f"btnClear{side.capitalize()}Corners"
+            clear_button = QtWidgets.QPushButton("CLEAR")
+            clear_button.setObjectName(clear_name)
+            clear_button.setToolTip(
+                "Forget this face's taught corners so they can be recaptured."
+            )
+            clear_button.clicked.connect(partial(self._clear_pcb_corners, side))
+            action_row.addWidget(use_button)
+            action_row.addWidget(clear_button)
+            group_layout.addLayout(action_row)
+            setattr(self.ui, use_name, use_button)
+            setattr(self.ui, clear_name, clear_button)
+            placement_layout.addWidget(group)
+
+        placement_status = QtWidgets.QLabel(
+            "Capture both corners of a face to position the board."
+        )
+        placement_status.setObjectName("glassboardPlacementStatus")
+        placement_status.setWordWrap(True)
+        placement_status.setStyleSheet(
+            "padding:8px;background:#EFF8FF;color:#175CD3;border-radius:6px"
+        )
+        placement_layout.addWidget(placement_status)
+        locate_status = QtWidgets.QLabel("")
+        locate_status.setObjectName("scanSetupLocateStatus")
+        locate_status.setWordWrap(True)
+        placement_layout.addWidget(locate_status)
+        seated = QtWidgets.QCheckBox(
+            "PCB is inserted in the holder and fully seated"
+        )
+        seated.setObjectName("chkScanSetupBoardSeated")
+        seated.setToolTip(
+            "Software cannot sense seating, and taught corners are reused from "
+            "disk, so this physical confirmation is still required each time."
+        )
+        seated.setStyleSheet("font-weight:600;padding:6px")
+        placement_layout.addWidget(seated)
+        layout.addWidget(placement_card)
+
+        preview_group = QtWidgets.QGroupBox("Scan plan")
+        preview_layout = QtWidgets.QVBoxLayout(preview_group)
+        preview_host = QtWidgets.QWidget()
+        preview_host.setObjectName("scanPreviewHost")
+        preview_host_layout = QtWidgets.QVBoxLayout(preview_host)
+        preview_host_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addWidget(preview_host)
+        layout.addWidget(preview_group)
+        review = QtWidgets.QLabel("Teach a face and confirm seating to continue.")
+        review.setObjectName("scanSetupReview")
+        review.setWordWrap(True)
+        review.setStyleSheet("padding:10px;background:#F2F4F7;border-radius:6px")
+        layout.addWidget(review)
+        layout.addStretch(1)
+        index = stack.addWidget(page)
+        if index != PAGE_SCAN_SETUP:
+            raise RuntimeError(
+                f"Easy scan setup page index changed: expected {PAGE_SCAN_SETUP}, got {index}"
+            )
+        self.ui.pageEasyScanSetup = page
+        self.ui.scanSetupBoardSummary = board_summary
+        self.ui.scanSetupAreaSummary = area_summary
+        self.ui.glassboardPlacementCard = placement_card
+        self.ui.glassboardPlacementSide = placement_side
+        self.ui.glassboardPlacementStatus = placement_status
+        self.ui.scanSetupLocateStatus = locate_status
+        self.ui.scanSetupJogStep = jog_step
+        self.ui.chkScanSetupBoardSeated = seated
+        self.ui.scanSetupReview = review
+        self.ui.scanPreviewHost = preview_host
+        seated.toggled.connect(self._scan_setup_seated_changed)
+        self.ui.chkBoardSeated.toggled.connect(self._advanced_board_seated_changed)
+        self._install_scan_preview_widget(preview_host)
+        self._refresh_corner_teach_ui()
 
     def _install_easy_mode_controls(self):
         """Easy|Advanced toggle and Fine Adjust controls; headless-safe stubs."""
@@ -1145,6 +1903,59 @@ class EMIMapWizard(QtCore.QObject):
         self._set_easy_adjust_visible(False)
         self._apply_operator_mode_ui()
 
+    def _install_workflow_progress(self):
+        """Persistent five-step strip for the Easy operator path."""
+        self._workflow_step_labels = []
+        root = self.ui.layout() if callable(getattr(self.ui, "layout", None)) else None
+        if not isinstance(root, QtWidgets.QVBoxLayout):
+            return
+        row = QtWidgets.QHBoxLayout()
+        for number, text in enumerate(
+            ("Setup", "Board zero", "Board", "Scan setup", "Measure"), start=1
+        ):
+            label = QtWidgets.QLabel(f"{number}  {text}")
+            label.setAlignment(QtCore.Qt.AlignCenter)
+            label.setMinimumHeight(30)
+            row.addWidget(label, 1)
+            self._workflow_step_labels.append(label)
+        root.insertLayout(2, row)
+        self._refresh_workflow_progress()
+
+    def _refresh_workflow_progress(self):
+        labels = getattr(self, "_workflow_step_labels", ())
+        if not labels:
+            return
+        page = self.ui.wizardStack.currentIndex()
+        pages = (PAGE_SETUP, PAGE_FIXTURE_TEACH, PAGE_BOARD, PAGE_SCAN_SETUP, PAGE_SCAN)
+        current = pages.index(page) if page in pages else len(pages)
+        visible = self._easy_mode_active()
+        for index, label in enumerate(labels):
+            label.setVisible(visible)
+            if index == current:
+                style = "background:#175CD3;color:white;border-radius:6px;font-weight:700"
+            elif index < current and self._easy_progress_step_complete(pages[index]):
+                style = "background:#067647;color:white;border-radius:6px;font-weight:600"
+            else:
+                style = "background:#EAECF0;color:#344054;border-radius:6px"
+            label.setStyleSheet(style)
+
+    def _easy_progress_step_complete(self, page):
+        """Prior-step green is readiness, not 'the operator has visited later'."""
+        if page == PAGE_SETUP:
+            return True
+        if page == PAGE_FIXTURE_TEACH:
+            return self._fixture_gate_ready()
+        if page == PAGE_BOARD:
+            return self._board_view is not None
+        if page == PAGE_SCAN_SETUP:
+            return (
+                not self._registration_problems()
+                and self.ui.chkBoardSeated.isChecked()
+            )
+        if page == PAGE_SCAN:
+            return self.result is not None
+        return False
+
     def _easy_mode_active(self):
         combo = getattr(self.ui, "operatorMode", None)
         text = combo.currentText() if combo is not None else OPERATOR_MODE_EASY
@@ -1190,26 +2001,50 @@ class EMIMapWizard(QtCore.QObject):
     def _apply_operator_mode_ui(self):
         pcb = self._mode() == MODE_PCB
         easy = self._easy_mode_active()
+        missing_vertical = not self._easy_vertical_calibrated()
         self._set_widget_visible("operatorMode", pcb)
-        # Easy has a dedicated Z page; Advanced keeps the full CAD/Z controls
-        # on the Board page.
+        # Easy Z setup lives on Step 2. Advanced CAD height stays on the Board page.
         self._set_widget_visible("grpScanHeight", pcb and not easy)
+        height_setup = set(self._EASY_HEIGHT_SETUP_WIDGETS)
         for name in self._EASY_HIDDEN_WIDGETS:
             if name == "chkAdvanced":
+                self._set_widget_visible(name, pcb and not easy)
+                continue
+            if name in height_setup:
                 self._set_widget_visible(name, pcb and not easy)
                 continue
             self._set_widget_visible(name, pcb and not easy)
         for name in self._EASY_SHOWN_WIDGETS:
             self._set_widget_visible(name, easy)
+        for name in EASY_MANUAL_HEIGHT_BUTTONS:
+            self._set_widget_visible(name, easy and missing_vertical)
+        self._set_widget_visible("grpEasyManualHeight", easy and missing_vertical)
         self._set_easy_adjust_visible(self._easy_adjust_open and easy)
         home = getattr(self.ui, "btnHomeXy", None)
-        setter = getattr(home, "setText", None)
-        if callable(setter):
-            setter("HOME & MOVE TO GLASSBOARD" if easy else "Home X/Y")
+        if home is not None:
+            self._refresh_home_button_copy()
         if easy:
             self._set_advanced_visible(False)
         self._update_registration_ui()
         self._refresh_easy_height_label()
+
+    def _refresh_home_button_copy(self):
+        """Primary Home label: recalibrate when P1 exists, else teaching home."""
+        p1 = self._p1_bltouch_commanded_xy() is not None
+        easy = self._easy_mode_active()
+        fixture_home = getattr(self.ui, "btnFixtureHomeXyz", None)
+        if fixture_home is not None:
+            fixture_home.setText(
+                "HOME & SET BOARD ZERO" if p1 else "HOME XY FOR TEACHING"
+            )
+        home = getattr(self.ui, "btnHomeXy", None)
+        if home is not None:
+            if easy:
+                home.setText(
+                    "HOME & SET BOARD ZERO" if p1 else "HOME XY FOR TEACHING"
+                )
+            else:
+                home.setText("Home X/Y")
 
     _ADVANCED_WIDGETS = (
         "lblCentre",
@@ -1436,9 +2271,33 @@ class EMIMapWizard(QtCore.QObject):
             axis.setPen(pyqtgraph.mkPen("k"))
             axis.setTextPen(pyqtgraph.mkPen("k"))
         self.image = pyqtgraph.ImageItem()
-        self.image.setColorMap(pyqtgraph.colormap.get("inferno"))
+        cmap = pyqtgraph.colormap.get("inferno")
+        self.image.setColorMap(cmap)
+        # Explicitly keep the raster nearest-neighbour.  Smooth interpolation is
+        # attractive for photos, but misleading for a measurement grid because
+        # it invents values between probe locations.
+        if callable(getattr(self.image, "setAutoDownsample", None)):
+            self.image.setAutoDownsample(False)
+        self.image.setZValue(1)
         pw.addItem(self.image)
         pw.setAspectLocked(True)
+        pw.setTitle("Live map — waiting for first measured cell")
+
+        # A real colour scale belongs next to the heatmap.  ColorBarItem is
+        # available in current pyqtgraph; the guarded fallback keeps older/headless
+        # builds functional rather than making the wizard fail at startup.
+        try:
+            bar = pyqtgraph.ColorBarItem(
+                values=PLACEHOLDER_LEVELS,
+                colorMap=cmap,
+                label="Level (dBm)",
+                interactive=False,
+                width=16,
+            )
+            bar.setImageItem(self.image, insert_in=pw.getPlotItem())
+            self._live_colorbar = bar
+        except Exception:
+            self._live_colorbar = None
         live = getattr(self.ui, "liveSpectrum", None)
         if live is None or not callable(getattr(live, "plot", None)):
             return
@@ -1748,6 +2607,7 @@ class EMIMapWizard(QtCore.QObject):
             set_current_xy_as_origin=False,
             manage_z=self.ui.chkAllowSetupZ.isChecked(),
             z_max_mm=LOGICAL_Z_MAX_MM,
+            z_travel_speed_mm_min=1200.0,
             # Drop X/Y holding after each move so stepper PWM is off during
             # settle + sweeps. Z stays held so the probe cannot sag (INV-Z-007).
             disable_steppers_during_measure=True,
@@ -1860,10 +2720,21 @@ class EMIMapWizard(QtCore.QObject):
     def _invalidate_plan(self):
         """A geometry change: the frozen grid is stale, the fit above it is not."""
         self._plan = None
+        self._approved_scan_fingerprint = None
+        self._refresh_scan_preview()
 
     def _invalidate_board_alignment(self):
         """The board-to-machine fit is no longer trustworthy, so its plan goes too."""
         self._registration = None
+        self._stl_board_placement = None
+        placement_status = getattr(self.ui, "glassboardPlacementStatus", None)
+        if placement_status is not None:
+            placement_status.setText(
+                "Choose which board face is up, then place it in the middle holder."
+            )
+            placement_status.setStyleSheet(
+                "padding:8px;background:#EFF8FF;color:#175CD3;border-radius:6px"
+            )
         self._invalidate_plan()
         self._bump_registration()
         self._update_registration_ui()
@@ -1959,8 +2830,11 @@ class EMIMapWizard(QtCore.QObject):
         """The machine frame moved, so every recorded machine position is a claim
         about a frame that no longer exists."""
         self._pcb_xy_homed = False
+        self._fixture_xyz_homed = False
+        self._fixture_verified_session = False
         self._machine_xy = None
         self.ui.posLabel.setText("Not homed.")
+        self._clear_board_zero()
         self._clear_landmarks_and_alignment()
 
     # ------------------------------------------------------------------ board
@@ -2250,9 +3124,14 @@ class EMIMapWizard(QtCore.QObject):
         for widget in (u.btnJogZUp, u.btnJogZDown, u.btnMoveToScanHeight):
             widget.setEnabled(allow_z)
         self._refresh_easy_height_label()
+        reported_z = (
+            self._easy_verified_scan_z
+            if self._easy_mode_active()
+            else self._reported_z()
+        )
         try:
             plan = self._scan_height_plan()
-            block = self._height_snapshot(self._reported_z())
+            block = self._height_snapshot(reported_z)
         except engine_height.HeightError as exc:
             u.heightCadLabel.setText(str(exc))
             u.chkAtScanPlane.setChecked(False)
@@ -2344,7 +3223,9 @@ class EMIMapWizard(QtCore.QObject):
             QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
             return
         self._pcb_surface_z = reported_z - gap
+        self._pcb_surface_from_fixture = False
         self._last_commanded_scan_z = None
+        self._invalidate_easy_verified_height()
         self._refresh_height_ui()
 
     def _jog_z(self, direction):
@@ -2451,18 +3332,2065 @@ class EMIMapWizard(QtCore.QObject):
         self.ui.chkBoardReseated.setChecked(False)
         self._refresh_height_ui()
 
+    def _clear_board_zero(self):
+        """Every Home invalidates board zero; this does not recalibrate it."""
+        if self._board_zero_committed() or self._easy_verified_scan_z is not None:
+            self._easy_height_lost_to_reset = True
+        self._bltouch_board_zero_z = None
+        self._bltouch_board_zero_frame = None
+        if self._pcb_surface_from_fixture:
+            self._pcb_surface_z = None
+            self._pcb_surface_from_fixture = False
+        self._last_commanded_scan_z = None
+        self._invalidate_easy_verified_height()
+
+    def _board_zero_committed(self):
+        return self._bltouch_board_zero_z is not None
+
+    def _invalidate_easy_verified_height(self):
+        self._easy_verified_scan_z = None
+        self._easy_height_identity = None
+
+    def _bind_printer_frame(self, printer):
+        """Copy this session's logical-Z generation onto a (possibly new) Printer."""
+        printer.z_logical_frame = int(self._z_logical_frame)
+        return printer
+
+    def _capture_printer_frame(self, printer):
+        """Persist G92/home frame changes and drop a stale board-zero millimetre."""
+        self._z_logical_frame = int(getattr(printer, "z_logical_frame", self._z_logical_frame))
+        if (
+            self._bltouch_board_zero_z is not None
+            and self._bltouch_board_zero_frame is not None
+            and int(self._z_logical_frame) != int(self._bltouch_board_zero_frame)
+        ):
+            self._clear_board_zero()
+
+    def _apply_emi_surface_from_board_zero(self):
+        """PCB top from P1 contact, support ledge, thickness, and vertical E-probe cal."""
+        if self._bltouch_board_zero_z is None:
+            return
+        if engine_glassboard_fixture is None:
+            self._pcb_surface_z = None
+            self._pcb_surface_from_fixture = False
+            return
+        document = self._machine_fixture_document() or {}
+        cals = engine_machine_fixtures.fixture_calibrations(document)
+        surface = engine_glassboard_fixture.pcb_surface_from_p1_contact_mm(
+            self._bltouch_board_zero_z,
+            pcb_thickness_mm=cals.get("pcb_thickness_mm"),
+            e_probe_tip_z_minus_g30_contact_mm=cals.get(
+                "e_probe_tip_z_minus_g30_contact_mm"
+            ),
+        )
+        if surface is None:
+            if self._pcb_surface_from_fixture:
+                self._pcb_surface_z = None
+                self._pcb_surface_from_fixture = False
+            return
+        self._pcb_surface_z = surface
+        self._pcb_surface_from_fixture = True
+
+    def _commit_board_zero(self, result):
+        self._bltouch_board_zero_z = float(result.board_zero_logical_z_mm)
+        self._bltouch_board_zero_frame = int(result.z_logical_frame)
+        self._z_logical_frame = int(result.z_logical_frame)
+        self._apply_emi_surface_from_board_zero()
+
     def _clear_height_datum(self):
+        had_datum = (
+            self._pcb_surface_z is not None
+            or self._board_zero_committed()
+            or self._easy_verified_scan_z is not None
+        )
         self._pcb_surface_z = None
+        self._pcb_surface_from_fixture = False
         self._last_commanded_scan_z = None
         self._easy_touch_logical_z = None
+        self._bltouch_board_zero_z = None
+        self._bltouch_board_zero_frame = None
+        self._invalidate_easy_verified_height()
+        if had_datum:
+            self._easy_height_lost_to_reset = True
+
+    def _easy_scan_height_set_text(self):
+        gap = self._default_probe_gap_mm()
+        return f"Scan height set: {gap:.2f} mm above PCB"
+
+    def _easy_scan_height_clearance_acknowledged(self):
+        """Operator tick only. CAD boxes and emi_probe_offset never authorize Z."""
+        clear = getattr(self.ui, "chkFixtureProbeClear", None)
+        return clear is not None and bool(clear.isChecked())
+
+    def _easy_resolved_z_calibrations(self):
+        error = getattr(self, "_fixture_config_error", "") or ""
+        if error:
+            return {
+                "pcb_thickness_mm": None,
+                "e_probe_tip_z_minus_g30_contact_mm": None,
+                "error": error,
+            }
+        document = self._machine_fixture_document() or {}
+        cals = engine_machine_fixtures.fixture_calibrations(document)
+        cals["error"] = document.get("yaml_calibration_error") or ""
+        return cals
+
+    def _easy_height_identity_now(self):
+        cals = self._easy_resolved_z_calibrations()
+        ledge = None
+        if engine_glassboard_fixture is not None:
+            ledge = float(engine_glassboard_fixture.PCB_BOTTOM_ABOVE_HOLDER_TOP_MM)
+        contact = self._bltouch_board_zero_z
+        return (
+            cals.get("pcb_thickness_mm"),
+            cals.get("e_probe_tip_z_minus_g30_contact_mm"),
+            ledge,
+            float(self._default_probe_gap_mm()),
+            self._fixture_profile_name(),
+            None if contact is None else round(float(contact), 4),
+            self._bltouch_board_zero_frame,
+            int(self._z_logical_frame),
+        )
+
+    def _easy_verified_height_applies(self):
+        if self._easy_verified_scan_z is None or self._pcb_surface_z is None:
+            return False
+        if self._easy_height_identity != self._easy_height_identity_now():
+            return False
+        target = self._easy_scan_target_z()
+        if target is None:
+            return False
+        return engine_height.logical_position_matches(
+            self._easy_verified_scan_z, target
+        )
+
+    def _easy_p1_in_current_frame(self):
+        return (
+            self._bltouch_board_zero_z is not None
+            and self._bltouch_board_zero_frame is not None
+            and int(self._z_logical_frame) == int(self._bltouch_board_zero_frame)
+        )
+
+    def _easy_invalid_yaml_reason(self):
+        if not self._easy_mode_active():
+            return ""
+        cals = self._easy_resolved_z_calibrations()
+        error = cals.get("error") or getattr(self, "_fixture_config_error", "") or ""
+        if not error:
+            return ""
+        return (
+            "Step 2 incomplete: config.yaml fixture calibration is invalid "
+            f"({error})."
+        )
+
+    def _easy_vertical_calibrated(self):
+        """True only when a finite vertical offset exists. Unset is not 0."""
+        cals = self._easy_resolved_z_calibrations()
+        return cals.get("e_probe_tip_z_minus_g30_contact_mm") is not None
+
+    def _easy_height_ready(self):
+        return not self._easy_height_block_reason()
+
+    def _easy_height_block_reason(self):
+        """Easy Step 2 Next/banner/tooltip. Never talks to the printer."""
+        yaml_reason = self._easy_invalid_yaml_reason()
+        if yaml_reason:
+            return yaml_reason
+        cals = self._easy_resolved_z_calibrations()
+        if cals.get("pcb_thickness_mm") is None:
+            return EASY_HEIGHT_MISSING_THICKNESS
+        if self._easy_scan_plane_cached():
+            return ""
+        if self._easy_height_lost_to_reset:
+            return EASY_HEIGHT_RESET
+        if self._p1_bltouch_commanded_xy() is None:
+            return EASY_HEIGHT_MISSING_P1
+        if not self._easy_vertical_calibrated():
+            if self._pcb_xy_homed:
+                return EASY_HEIGHT_NEED_MANUAL_PLANE
+            return EASY_HEIGHT_NEED_BOARD_ZERO
+        if not self._easy_p1_in_current_frame():
+            if (
+                self._bltouch_board_zero_z is None
+                or self._bltouch_board_zero_frame is None
+            ):
+                return EASY_HEIGHT_NEED_BOARD_ZERO
+            return EASY_HEIGHT_RESET
+        if not self._easy_scan_height_clearance_acknowledged():
+            return EASY_HEIGHT_CLEARANCE
+        return EASY_HEIGHT_NOT_REACHED
+
+    def _easy_scan_plane_cached(self):
+        """True when this session already commanded/verified a scan Z. No M114."""
+        if self._easy_verified_height_applies():
+            return True
+        target = self._easy_scan_target_z()
+        commanded = self._last_commanded_scan_z
+        return (
+            target is not None
+            and commanded is not None
+            and engine_height.logical_position_matches(commanded, target)
+        )
+
+    def _try_finish_easy_scan_height(self, printer):
+        """Move to scan Z at P1 after contact+retract. Caller owns the job."""
+        self._invalidate_easy_verified_height()
+        if not self._easy_mode_active():
+            return
+        if self._easy_invalid_yaml_reason():
+            return
+        if not self._easy_vertical_calibrated():
+            return
+        if not self._easy_scan_height_clearance_acknowledged():
+            return
+        self._apply_emi_surface_from_board_zero()
+        target = self._easy_scan_target_z()
+        if target is None:
+            return
+        try:
+            printer.move_z(target)
+        except engine_printer.PrinterReset:
+            raise
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError):
+            return
+        reported = printer.get_xyz()[2]
+        if engine_height.logical_position_matches(reported, target):
+            self._last_commanded_scan_z = target
+            self._easy_verified_scan_z = float(reported)
+            self._easy_height_identity = self._easy_height_identity_now()
+            self._easy_height_lost_to_reset = False
+
+    def _step2_status_text(self):
+        if self._easy_mode_active():
+            if not self._easy_height_ready():
+                return self._easy_height_block_reason()
+            if self._easy_scan_plane_cached():
+                return self._easy_scan_height_set_text()
+            return BOARD_ZERO_COMPLETE_TEXT
+        if self._board_zero_committed():
+            return BOARD_ZERO_COMPLETE_TEXT
+        return EASY_HEIGHT_MISSING_P1
+
+    # ------------------------------------------------ fixture XYZ teaching
+    def _fixture_profile_name(self):
+        combo = getattr(self.ui, "machineFixtureProfile", None)
+        if combo is not None:
+            text = combo.currentText().strip()
+            if text:
+                return text
+        return str(getattr(self, "_active_machine_fixture_name", "") or "").strip()
+
+    def _raw_machine_fixture_document(self):
+        name = self._fixture_profile_name()
+        if not name:
+            return None
+        try:
+            return engine_machine_fixtures.read_fixture(name)
+        except (engine_profiles.ProfileError, OSError):
+            return None
+
+    def _fixture_config(self):
+        """Carriage/PCB constants from ``EMI_Mapper/config.yaml``, cached.
+
+        Step 2 no longer types these in, so the config file is the only YAML
+        source. Blank keys do not override a saved fixture document. Invalid
+        values are an error and do not fall back to saved calibration. A
+        missing file is treated as blank keys.
+        """
+        cached = getattr(self, "_fixture_config_cache", None)
+        if cached is not None:
+            return cached
+        config = engine_config.FixtureConfig()
+        self._fixture_config_error = ""
+        try:
+            from EMI_Mapper.emi_mapper import DEFAULT_CONFIG, load_config
+
+            config = load_config(DEFAULT_CONFIG).fixture
+        except FileNotFoundError:
+            config = engine_config.FixtureConfig()
+        except Exception as exc:  # unreadable yaml or invalid values
+            self._fixture_config_error = str(exc)
+            config = engine_config.FixtureConfig()
+        self._fixture_config_cache = config
+        return config
+
+    def _machine_fixture_document(self):
+        document = self._raw_machine_fixture_document()
+        if document is None:
+            return None
+        return self._overlay_fixture_config(document)
+
+    def _overlay_fixture_config(self, document):
+        """Apply config.yaml as optional overrides onto a stored fixture.
+
+        Blank YAML keys leave saved thickness/vertical calibration in place.
+        Explicit finite YAML values (including 0) win. Invalid YAML clears Z
+        calibrations rather than falling back to the saved document. The
+        E-probe XY offset may be shown as a diagnostic; it does not authorize
+        scan-height motion and is not A/B registration.
+        """
+        if not isinstance(document, dict):
+            return document
+        fixture = self._fixture_config()
+        return engine_machine_fixtures.overlay_yaml_fixture_values(
+            document,
+            pcb_thickness_mm=fixture.pcb_thickness_mm,
+            e_probe_tip_z_minus_g30_contact_mm=(
+                fixture.e_probe_tip_z_minus_g30_contact_mm
+            ),
+            pcb_yaw_deg=fixture.pcb_yaw_deg,
+            emi_probe_offset_mm=fixture.emi_probe_offset_mm,
+            yaml_error=getattr(self, "_fixture_config_error", "") or "",
+        )
+
+    def _reset_fixture_z_calibrations(self):
+        """Clear saved thickness/vertical. Blank YAML is not this action."""
+        name = self._ensure_fixture_selected()
+        if not name:
+            raise RuntimeError("Select a fixture before clearing Z calibration.")
+        fixture = self._fixture_config()
+        document = engine_machine_fixtures.clear_z_calibrations(name)
+        self._invalidate_easy_verified_height()
+        self._fixture_z_calibrations_cleared = True
+        message = engine_machine_fixtures.yaml_override_after_z_calibration_clear(
+            pcb_thickness_mm=fixture.pcb_thickness_mm,
+            e_probe_tip_z_minus_g30_contact_mm=(
+                fixture.e_probe_tip_z_minus_g30_contact_mm
+            ),
+        )
+        status = "Saved fixture thickness and vertical calibration were cleared."
+        if message:
+            status = f"{status} {message}"
+            QMessageBox.warning(self.ui, DIALOG_TITLE, status)
+        fixture_status = getattr(self.ui, "fixtureTeachStatus", None)
+        if fixture_status is not None:
+            fixture_status.setText(status)
+        self._render_emi_probe_offset()
+        self._refresh_easy_height_label()
+        self._update_nav()
+        return document
+
+    def _refresh_machine_fixtures(self):
+        combo = getattr(self.ui, "machineFixtureProfile", None)
+        if combo is None:
+            return
+        summaries = [
+            item for item in engine_machine_fixtures.list_fixtures()
+            if not item.get("error")
+        ]
+        names = [item["name"] for item in summaries]
+        last = engine_machine_fixtures.last_selected_fixture_name()
+        selected = (
+            combo.currentText().strip()
+            or self._active_machine_fixture_name
+            or last
+        )
+        combo.blockSignals(True)
+        combo.clear()
+        for name in names:
+            combo.addItem(name)
+        index = combo.findText(selected) if selected else -1
+        if index < 0 and names:
+            taught = [
+                item for item in summaries
+                if item.get("taught")
+            ]
+            taught.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            preferred = taught[0]["name"] if taught else names[0]
+            index = combo.findText(preferred)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+            self._active_machine_fixture_name = combo.itemText(index)
+            engine_machine_fixtures.remember_selected_fixture(
+                self._active_machine_fixture_name
+            )
+        combo.blockSignals(False)
+        self._on_machine_fixture_changed(self._active_machine_fixture_name)
+
+    def _ensure_fixture_selected(self):
+        """Return a fixture name, selecting the only listed one if the combo is empty.
+
+        Does not re-render teaching: CAPTURE already holds P1 in memory and
+        must not have that wiped before it is written to disk.
+        """
+        name = self._fixture_profile_name() or self._active_machine_fixture_name
+        if name:
+            return name
+        combo = getattr(self.ui, "machineFixtureProfile", None)
+        if combo is None:
+            return ""
+        if combo.count() == 0:
+            for item in engine_machine_fixtures.list_fixtures():
+                if not item.get("error"):
+                    combo.addItem(item["name"])
+        if combo.count() > 0 and combo.currentIndex() < 0:
+            blocker = QtCore.QSignalBlocker(combo)
+            combo.setCurrentIndex(0)
+            del blocker
+        self._active_machine_fixture_name = (
+            combo.currentText().strip() if combo.count() else ""
+        )
+        return self._active_machine_fixture_name
+
+    def _create_machine_fixture(self):
+        name, accepted = QtWidgets.QInputDialog.getText(
+            self.ui, DIALOG_TITLE, "Name this physical fixture:"
+        )
+        if not accepted or not name.strip():
+            return
+        try:
+            engine_machine_fixtures.create_fixture(
+                name,
+                fixture_id=name,
+                machine_id=getattr(self.ui.machineId, "text", lambda: "")(),
+                probe_setup_id=getattr(self.ui.probeModel, "currentText", lambda: "")(),
+            )
+        except (engine_profiles.ProfileError, OSError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return
+        self._refresh_machine_fixtures()
+        index = self.ui.machineFixtureProfile.findText(name.strip())
+        if index >= 0:
+            self.ui.machineFixtureProfile.setCurrentIndex(index)
+
+    def _on_machine_fixture_changed(self, _name=None):
+        selected = self._fixture_profile_name()
+        if (
+            self._active_machine_fixture_name
+            and selected != self._active_machine_fixture_name
+        ):
+            self._clear_landmarks_and_alignment()
+            self.ui.chkBoardSeated.setChecked(False)
+            self._clear_board_zero()
+        self._active_machine_fixture_name = selected
+        if selected:
+            engine_machine_fixtures.remember_selected_fixture(selected)
+        self._fixture_teaching_points = {}
+        self._fixture_verified_session = False
+        document = self._machine_fixture_document()
+        self._render_fixture_teaching(
+            document.get("fixture_teaching") if document else None
+        )
+        self._sync_board_profile_to_fixture()
+        self._refresh_scan_setup_summary()
+        self._update_nav()
+
+    def _sync_board_profile_to_fixture(self):
+        """Select the saved board alignment with the same fixture name when present."""
+        combo = getattr(self.ui, "fixtureProfile", None)
+        name = self._fixture_profile_name()
+        if combo is None or not name:
+            return False
+        linked = ""
+        document = self._machine_fixture_document()
+        if document is not None and self._board_view is not None:
+            linked = engine_machine_fixtures.board_alignment(
+                document, self._board_view.geometry_hash
+            )
+        index = combo.findText(linked or name)
+        if index < 0:
+            return False
+        combo.setCurrentIndex(index)
+        return True
+
+    def _glassboard_fixture_selected(self):
+        document = self._machine_fixture_document() or {}
+        identity = " ".join(
+            (str(document.get("profile_name", "")), str(document.get("fixture_id", "")))
+        ).lower()
+        return "glass" in identity
+
+    def _fixture_gate_ready(self):
+        """Step 2 Next: Easy height ready, or Advanced board-zero contact."""
+        if self._easy_mode_active():
+            return self._easy_height_ready()
+        return self._board_zero_committed()
+
+    def _fixture_scan_ready(self):
+        """Taught P1 XY may be reused; Fast Verify is optional. Session Z is not."""
+        document = self._machine_fixture_document() or {}
+        if not document.get("fixture_teaching"):
+            return True
+        return self._p1_bltouch_commanded_xy() is not None
+
+    def _fixture_home_xyz_clicked(self):
+        if self._printer_halted:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, PRINTER_HALTED_TEXT)
+            return
+        if not self.ui.chkFixtureProbeClear.isChecked():
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                "Confirm Z-lift, X/Y travel, P1 scan-height, and P1-to-A/B "
+                "clearance first.",
+            )
+            return
+        if self._p1_bltouch_commanded_xy() is not None:
+            blocked = self._easy_invalid_yaml_reason()
+            if blocked:
+                QMessageBox.warning(self.ui, DIALOG_TITLE, blocked)
+                return
+        self._clear_board_zero()
+        self._update_nav()
+        p1 = self._p1_bltouch_commanded_xy() is not None
+        status = (
+            "Homing X/Y, probing P1, then setting board zero…"
+            if p1
+            else "Lifting Z, then homing X/Y for teaching…"
+        )
+        self._start_printer_job(
+            self._do_home_xy,
+            self._on_home_ok,
+            self._on_home_failed,
+            self.ui.fixtureTeachStatus,
+            status,
+        )
+
+    def _fixture_probe_selected_clicked(self):
+        if not self._fixture_xyz_homed:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Home XY for Teaching on this page first.")
+            return
+        if not self.ui.chkFixtureProbeClear.isChecked():
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Confirm probing clearance first.")
+            return
+        row = self.ui.fixtureTeachTable.currentRow()
+        if row < 0:
+            row = 0
+        name = TEACHING_POINT_NAMES[row]
+        work = partial(self._do_fixture_probe_point, name)
+        self._start_printer_job(
+            work,
+            self._on_fixture_probe_ok,
+            self._on_fixture_operation_failed,
+            self.ui.fixtureTeachStatus,
+            f"Probing {name}…",
+        )
+
+    def _on_fixture_point_selected(self, row, _column=0, *_args):
+        if 0 <= row < len(TEACHING_POINT_NAMES):
+            name = TEACHING_POINT_NAMES[row]
+            self.ui.btnFixtureProbePoint.setText(f"CAPTURE {name} — PROBE AND SAVE XYZ")
+
+    def _fixture_jog(self, dx, dy):
+        if not self._fixture_xyz_homed:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Lift Z and home X/Y before jogging.")
+            return
+        try:
+            printer = self._printer(manage_z=True)
+            x, y = printer.get_xy()
+            step = self.ui.fixtureJogStep.value()
+            printer.move_xy(x + dx * step, y + dy * step)
+            self._bump_motion()
+            self._show_position(printer.get_xy())
+        except engine_printer.PrinterReset as exc:
+            self._on_fixture_operation_failed(exc)
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+
+    def _do_fixture_probe_point(self, name):
+        printer = self._bind_printer_frame(self._printer(manage_z=True))
+        retract_mm = self._printer_config().probe_clearance_mm
+        try:
+            commanded_x, commanded_y, _current_z = printer.get_xyz()
+            result = printer.probe_pin_until_contact(retract_mm=retract_mm)
+            fixture_x, fixture_y = engine_glassboard_fixture.REFERENCE_FIXTURE_XY[name]
+            point = engine_fixture_teaching.FixtureReferencePoint(
+                name, fixture_x, fixture_y,
+                commanded_x, commanded_y,
+                result.probe_x_mm, result.probe_y_mm,
+                result.touch_z_raw_mm, result.touch_z_raw_mm,
+                z_datum=engine_fixture_teaching.Z_DATUM_M119_Z_PROBE,
+            )
+            board_zero = None
+            if result.logical_surface_z_mm is not None:
+                try:
+                    board_zero = engine_printer.board_zero_from_pin_contact(
+                        printer,
+                        (commanded_x, commanded_y),
+                        result,
+                        retract_mm=retract_mm,
+                    )
+                except (engine_printer.ProbeFailed, engine_printer.PrinterError):
+                    board_zero = None
+            if board_zero is not None:
+                self._commit_board_zero(board_zero)
+                self._try_finish_easy_scan_height(printer)
+            return {"point": point, "board_zero": board_zero}
+        finally:
+            self._capture_printer_frame(printer)
+
+    def _on_fixture_probe_ok(self, payload):
+        if isinstance(payload, engine_fixture_teaching.FixtureReferencePoint):
+            point, board_zero = payload, None
+        else:
+            point = payload["point"]
+            board_zero = payload.get("board_zero")
+        self._fixture_teaching_points[point.name] = point
+        row = TEACHING_POINT_NAMES.index(point.name)
+        table = getattr(self.ui, "fixtureTeachTable", None)
+        if table is not None:
+            for column, value in enumerate(
+                (point.commanded_machine_x, point.commanded_machine_y, point.touch_z_raw), start=1
+            ):
+                table.setItem(row, column, QtWidgets.QTableWidgetItem(f"{value:.3f}"))
+            table.setItem(row, 4, QtWidgets.QTableWidgetItem("Not checked"))
+        status = (
+            f"{point.name} captured at machine X {point.commanded_machine_x:.3f}, "
+            f"Y {point.commanded_machine_y:.3f}, contact Z {point.touch_z_raw:.3f}."
+        )
+        if board_zero is not None:
+            self._commit_board_zero(board_zero)
+            status = f"{status}\n{self._step2_status_text()}"
+        else:
+            status = (
+                f"{status}\nP1 XY is captured, but board zero is unset "
+                "(M114 did not follow the pin)."
+            )
+        self.ui.fixtureTeachStatus.setText(status)
+        if self._persist_taught_p1():
+            self.ui.fixtureTeachStatus.setText(
+                f"{self.ui.fixtureTeachStatus.text()}\n"
+                "P1 saved on this fixture for the next measurement."
+            )
+        else:
+            self.ui.fixtureTeachStatus.setText(
+                f"{self.ui.fixtureTeachStatus.text()}\n"
+                "P1 is not saved on the fixture yet."
+            )
+        self._easy_try_load_profile()
+        self._update_easy_status()
+        self._refresh_height_ui()
+        self._update_nav()
+
+    def _persist_taught_p1(self):
+        """Write captured P1 to the fixture file. Capture already means save."""
+        profile_name = self._ensure_fixture_selected()
+        if not profile_name:
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE,
+                "Select a fixture on Step 2 so P1 can be reused next time.",
+            )
+            return False
+        try:
+            points = [self._fixture_teaching_points[name] for name in TEACHING_POINT_NAMES]
+        except KeyError:
+            return False
+        try:
+            teaching = engine_fixture_teaching.build_fixture_teaching(
+                points,
+                max_z_change_mm=self.ui.fixtureMaxZChange.value(),
+                max_plane_residual_mm=self.ui.fixtureMaxResidual.value(),
+                firmware="Marlin M119 z_probe", probe="BLTouch",
+            )
+            engine_machine_fixtures.save_teaching(
+                profile_name, teaching, overwrite=True
+            )
+        except (engine_profiles.ProfileError, engine_fixture_teaching.FixtureTeachingError, OSError) as exc:
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE,
+                f"P1 is usable now, but could not be saved for next time: {exc}",
+            )
+            return False
+        engine_machine_fixtures.remember_selected_fixture(profile_name)
+        return True
+
+    def _fixture_save_plane(self):
+        if not self._persist_taught_p1():
+            if "P1" not in self._fixture_teaching_points:
+                QMessageBox.warning(self.ui, DIALOG_TITLE, "Capture P1 first.")
+            return False
+        document = self._machine_fixture_document() or {}
+        self._render_fixture_teaching(
+            document.get("fixture_teaching"),
+            "PASS — P1 saved on this fixture",
+        )
+        self._update_nav()
+        return True
+
+    def _fixture_verify_clicked(self):
+        if not self.ui.chkFixtureProbeClear.isChecked():
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "Confirm Z-lift and X/Y probing clearance first.")
+            return
+        document = self._machine_fixture_document() or {}
+        if not document.get("fixture_teaching"):
+            QMessageBox.warning(self.ui, DIALOG_TITLE, "This fixture has not been taught.")
+            return
+        work = partial(
+            self._do_fixture_verify,
+            self.ui.fixtureMaxZChange.value(),
+            self.ui.fixtureMaxResidual.value(),
+        )
+        status = (
+            "Re-probing saved P1…"
+            if self._fixture_xyz_homed
+            else "Lifting Z once, homing X/Y, then re-probing P1…"
+        )
+        self._start_printer_job(
+            work,
+            self._on_fixture_verify_ok,
+            self._on_fixture_operation_failed,
+            self.ui.fixtureTeachStatus,
+            status,
+        )
+
+    def _do_fixture_verify(self, max_z_change_mm, max_plane_residual_mm):
+        profile_name = self._fixture_profile_name()
+        document = engine_machine_fixtures.read_fixture(profile_name)
+        teaching = document["fixture_teaching"]
+        printer = self._bind_printer_frame(self._printer(manage_z=True))
+        printer.drain()
+        printer.prepare()
+        try:
+            if not self._fixture_xyz_homed:
+                printer.home_xyz(self._safe_home_lift_mm())
+            current = []
+            for data in teaching["points"]:
+                saved = engine_fixture_teaching.FixtureReferencePoint.from_dict(data)
+                printer.move_xy(saved.commanded_machine_x, saved.commanded_machine_y)
+                result = printer.probe_pin_until_contact(
+                    retract_mm=self._printer_config().probe_clearance_mm,
+                )
+                current.append(engine_fixture_teaching.FixtureReferencePoint(
+                    saved.name, saved.fixture_x, saved.fixture_y,
+                    saved.commanded_machine_x, saved.commanded_machine_y,
+                    result.probe_x_mm, result.probe_y_mm,
+                    result.touch_z_raw_mm, result.touch_z_raw_mm,
+                    z_datum=engine_fixture_teaching.Z_DATUM_M119_Z_PROBE,
+                ))
+            document = engine_machine_fixtures.save_verification(
+                profile_name,
+                current,
+                max_z_change_mm=max_z_change_mm,
+                max_plane_residual_mm=max_plane_residual_mm,
+            )
+            return document, document["fixture_teaching"]["latest_verification"]
+        finally:
+            self._capture_printer_frame(printer)
+
+    def _on_fixture_verify_ok(self, payload):
+        document, result = payload
+        self._fixture_xyz_homed = True
+        self._pcb_xy_homed = True
+        self._fixture_verified_session = bool(result["passed"])
+        verdict = (
+            "PASS — P1 re-probed"
+            if result["passed"]
+            else f"BLOCKED — {result.get('failure_reason') or 'fixture moved or tilted'}"
+        )
+        self._render_fixture_teaching(document["fixture_teaching"], verdict)
+        self._update_nav()
+
+    def _render_fixture_teaching(self, teaching, verdict=None):
+        if not hasattr(self.ui, "fixtureTeachStatus"):
+            return
+        if not hasattr(self.ui, "fixtureTeachTable"):
+            return
+        if not teaching:
+            self._fixture_teaching_points = {}
+            for row in range(len(TEACHING_POINT_NAMES)):
+                for column in range(1, 5):
+                    item = QtWidgets.QTableWidgetItem("Pending")
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+                    self.ui.fixtureTeachTable.setItem(row, column, item)
+            self.ui.fixtureMaxZChange.setValue(
+                engine_fixture_teaching.DEFAULT_MAX_Z_CHANGE_MM
+            )
+            self.ui.fixtureMaxResidual.setValue(
+                engine_fixture_teaching.DEFAULT_MAX_PLANE_RESIDUAL_MM
+            )
+            self.ui.fixtureTeachStatus.setText("Fixture not taught.")
+            self.ui.fixtureTeachStatus.setStyleSheet(
+                "padding:8px;border-radius:6px;background:#F2F4F7"
+            )
+            self._refresh_fixture_page_summary()
+            self._render_emi_probe_offset()
+            return
+        self._hydrate_teaching_points(teaching)
+        plane = teaching["plane"]
+        points = teaching["points"]
+        by_name = {
+            item.get("name"): item
+            for item in points
+            if isinstance(item, dict)
+        }
+        for row, name in enumerate(TEACHING_POINT_NAMES):
+            data = by_name.get(name)
+            if data is None:
+                continue
+            for column, key in (
+                (1, "commanded_machine_x"), (2, "commanded_machine_y"),
+                (3, "touch_z_raw"),
+            ):
+                self.ui.fixtureTeachTable.setItem(
+                    row, column, QtWidgets.QTableWidgetItem(f"{float(data[key]):.3f}")
+                )
+        verification = teaching.get("latest_verification") or {}
+        differences = {
+            item.get("name"): item
+            for item in verification.get("differences", ())
+            if isinstance(item, dict)
+        }
+        for row, name in enumerate(TEACHING_POINT_NAMES):
+            data = by_name.get(name)
+            if data is None:
+                continue
+            difference = differences.get(name)
+            if difference:
+                delta = float(
+                    difference.get(
+                        "relative_z_change_mm", difference.get("z_change_mm", 0.0)
+                    )
+                )
+                current = float(difference.get("current_touch_z_raw", 0.0))
+                item = QtWidgets.QTableWidgetItem(f"{current:.3f}  /  {delta:+.3f}")
+                item.setToolTip(
+                    "Latest contact Z / point change after removing the "
+                    "common session Z-reference shift"
+                )
+            else:
+                item = QtWidgets.QTableWidgetItem("Not checked")
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.ui.fixtureTeachTable.setItem(row, 4, item)
+        tolerances = teaching.get("verification_tolerances_mm", {})
+        saved_z_limit = float(tolerances.get("max_z_change", 0.20))
+        # An early Step 2 build could persist the spin-box floor (0.010 mm),
+        # which is below useful fixture/probe repeatability. Show the documented
+        # recommendation; the next Verify persists this visible value.
+        if saved_z_limit < 0.05:
+            saved_z_limit = engine_fixture_teaching.DEFAULT_MAX_Z_CHANGE_MM
+        self.ui.fixtureMaxZChange.setValue(saved_z_limit)
+        self.ui.fixtureMaxResidual.setValue(float(tolerances.get("max_plane_residual", 0.10)))
+        layout = " · ".join(
+            f"{p['name']} ({p['commanded_machine_x']:.2f},{p['commanded_machine_y']:.2f})"
+            for p in points
+        )
+        verification_text = ""
+        if verification:
+            verification_text = (
+                f"\nLatest check: common Z reference shift "
+                f"{verification.get('surface_shift_mm', 0.0):+.3f} mm; "
+                f"max point / tilt change "
+                f"{verification.get('max_relative_z_change_mm', verification.get('max_z_change_mm', 0.0)):.3f} mm; "
+                f"residual {verification.get('plane', {}).get('max_residual_mm', 0.0):.3f} mm"
+            )
+        self.ui.fixtureTeachStatus.setText(
+            f"{verdict or 'Fixture taught'}\nReference map: {layout}\n"
+            f"Z = {plane['a']:.6f}X + {plane['b']:.6f}Y + {plane['c']:.6f}; "
+            f"max residual {plane['max_residual_mm']:.3f} mm"
+            f"{verification_text}"
+        )
+        if verdict and verdict.startswith("PASS"):
+            self.ui.fixtureTeachStatus.setStyleSheet(
+                "padding:10px;border:1px solid #12B76A;border-radius:6px;"
+                "background:#ECFDF3;color:#05603A"
+            )
+        elif verdict and verdict.startswith("BLOCKED"):
+            self.ui.fixtureTeachStatus.setStyleSheet(
+                "padding:10px;border:1px solid #F04438;border-radius:6px;"
+                "background:#FEF3F2;color:#912018"
+            )
+        else:
+            self.ui.fixtureTeachStatus.setStyleSheet(
+                "padding:8px;border-radius:6px;background:#F2F4F7"
+            )
+        self._refresh_fixture_page_summary()
+        self._render_emi_probe_offset()
+
+    def _hydrate_teaching_points(self, teaching):
+        """Reload in-memory P1 from the fixture file so the next session has it."""
+        loaded = {}
+        for item in (teaching or {}).get("points") or ():
+            if not isinstance(item, dict):
+                continue
+            try:
+                point = engine_fixture_teaching.FixtureReferencePoint.from_dict(item)
+            except engine_fixture_teaching.FixtureTeachingError:
+                continue
+            if point.name in TEACHING_POINT_NAMES:
+                loaded[point.name] = point
+        if loaded:
+            self._fixture_teaching_points = loaded
+
+    def _p1_bltouch_commanded_xy(self):
+        point = self._fixture_teaching_points.get("P1")
+        if point is not None:
+            return float(point.commanded_machine_x), float(point.commanded_machine_y)
+        document = self._machine_fixture_document() or {}
+        for item in (document.get("fixture_teaching") or {}).get("points") or ():
+            if item.get("name") == "P1":
+                return (
+                    float(item["commanded_machine_x"]),
+                    float(item["commanded_machine_y"]),
+                )
+        return None
+
+    def _on_fixture_motion_failed(self, exc):
+        """Refusals are operator-correctable; anything else resets fixture state."""
+        if isinstance(exc, engine_printer.PrinterReset):
+            self._on_fixture_operation_failed(exc)
+            return
+        if isinstance(exc, _FixtureMotionRefused):
+            self.ui.fixtureTeachStatus.setText(str(exc))
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return
+        self._on_fixture_operation_failed(exc)
+
+    def _fixture_clear_point_clicked(self):
+        """Forget taught P1 so it can be re-jogged and captured again.
+
+        Board zero and the calculated scan height are both derived from P1, so
+        clearing it must invalidate them rather than leave a datum pointing at
+        a point the operator has discarded. No motion is commanded.
+        """
+        name = self._fixture_profile_name()
+        stored = bool((self._machine_fixture_document() or {}).get("fixture_teaching"))
+        if not self._fixture_teaching_points and not stored:
+            QMessageBox.information(
+                self.ui, DIALOG_TITLE, "There is no taught P1 to clear."
+            )
+            return
+        if (
+            QMessageBox.question(
+                self.ui,
+                DIALOG_TITLE,
+                "Forget taught P1?\n\n"
+                "Board zero and the calculated scan height are derived from it, "
+                "so both are cleared and Step 2 becomes incomplete.",
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        self._fixture_teaching_points = {}
+        self._fixture_verified_session = False
+        self._clear_board_zero()
+        self._clear_height_datum()
+        self._stl_board_placement = None
+        self._invalidate_plan()
+        if stored and name:
+            try:
+                engine_machine_fixtures.clear_teaching(name)
+            except (engine_profiles.ProfileError, OSError, ValueError) as exc:
+                QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+        self._render_fixture_teaching(None)
+        self.ui.fixtureTeachStatus.setText(
+            "P1 cleared. Home XY for Teaching, jog the BLTouch to the mark, "
+            "then CAPTURE P1."
+        )
+        self._update_nav()
+
+    def _render_emi_probe_offset(self):
+        """Show the config-supplied constants Step 2 no longer edits.
+
+        Read-only on purpose: these describe the carriage and the seated board,
+        so a per-fixture edit here would silently disagree with config.yaml.
+        """
+        note = getattr(self.ui, "fixtureConfigNote", None)
+        if note is None:
+            return
+        fixture = self._fixture_config()
+        dx, dy = fixture.emi_probe_offset_mm
+        lines = [
+            f"From EMI_Mapper/config.yaml — E-probe offset {dx:+.3f}, {dy:+.3f} mm "
+            "(diagnostic only; not A/B registration and not Z clearance). "
+            f"PCB yaw {float(fixture.pcb_yaw_deg):g}°."
+        ]
+        error = getattr(self, "_fixture_config_error", "")
+        if error:
+            lines.append(
+                f"config.yaml fixture calibration is invalid ({error}); "
+                "saved thickness/vertical values are not used."
+            )
+        else:
+            lines.extend(self._effective_z_calibration_lines())
+        if getattr(self, "_fixture_z_calibrations_cleared", False):
+            remaining = engine_machine_fixtures.yaml_override_after_z_calibration_clear(
+                pcb_thickness_mm=fixture.pcb_thickness_mm,
+                e_probe_tip_z_minus_g30_contact_mm=(
+                    fixture.e_probe_tip_z_minus_g30_contact_mm
+                ),
+            )
+            if remaining:
+                lines.append(remaining)
+        note.setText(" ".join(lines))
+
+    def _effective_z_calibration_lines(self):
+        yaml_cfg = self._fixture_config()
+        stored = engine_machine_fixtures.fixture_calibrations(
+            self._raw_machine_fixture_document()
+        )
+        return [
+            self._z_calibration_line(
+                "PCB thickness",
+                yaml_cfg.pcb_thickness_mm,
+                stored.get("pcb_thickness_mm"),
+            ),
+            (
+                self._z_calibration_line(
+                    "Vertical E-probe calibration",
+                    yaml_cfg.e_probe_tip_z_minus_g30_contact_mm,
+                    stored.get("e_probe_tip_z_minus_g30_contact_mm"),
+                )
+                if (
+                    yaml_cfg.e_probe_tip_z_minus_g30_contact_mm is not None
+                    or stored.get("e_probe_tip_z_minus_g30_contact_mm") is not None
+                )
+                else EASY_VERTICAL_UNCALIBRATED
+            ),
+        ]
+
+    def _z_calibration_line(self, label, yaml_value, stored_value):
+        if yaml_value is not None:
+            return f"{label} {float(yaml_value):.3f} mm (config.yaml override)."
+        if stored_value is not None:
+            return f"{label} {float(stored_value):.3f} mm (saved fixture)."
+        return f"{label} is missing from config.yaml and the saved fixture."
+
+    def _refresh_fixture_page_summary(self):
+        if not hasattr(self.ui, "fixtureBoardSummary"):
+            return
+        document = self._machine_fixture_document() or {}
+        profile = document.get("fixture_name") or self._fixture_profile_name() or "not selected"
+        p1 = self._p1_bltouch_commanded_xy()
+        persisted = bool((self._raw_machine_fixture_document() or {}).get("fixture_teaching"))
+        if p1 is not None and persisted:
+            p1_text = f"P1 XY saved ({p1[0]:.2f}, {p1[1]:.2f})"
+        elif p1 is not None:
+            p1_text = f"P1 XY captured, not saved ({p1[0]:.2f}, {p1[1]:.2f})"
+        else:
+            p1_text = "P1 XY not saved"
+        self.ui.fixtureBoardSummary.setText(
+            f"Fixture: {profile}  •  Machine: {document.get('machine_id') or 'current machine'} "
+            f" •  Probe: {document.get('probe_setup_id') or 'BLTouch'}\n{p1_text}"
+        )
+        ready = self._fixture_gate_ready()
+        if self.thread is not None or self._printer_job is not None:
+            ready = False
+            reason = "Wait for the current printer or scan job to finish."
+        elif not ready:
+            reason = self._fixture_step2_block_reason()
+        else:
+            reason = (
+                self._easy_scan_height_set_text()
+                if self._easy_mode_active() and self._easy_scan_plane_cached()
+                else BOARD_ZERO_COMPLETE_TEXT
+            )
+        self.ui.fixtureReadySummary.setText(
+            ("FIXTURE READY — " if ready else "Complete Step 2 — ") + reason
+        )
+        self.ui.fixtureReadySummary.setStyleSheet(
+            "padding:10px;border-radius:6px;font-weight:600;"
+            + (
+                "background:#ECFDF3;color:#05603A;border:1px solid #12B76A"
+                if ready
+                else "background:#FFFAEB;color:#7A2E0E;border:1px solid #F79009"
+            )
+        )
+        self._render_emi_probe_offset()
+
+    def _refresh_scan_setup_summary(self):
+        if not hasattr(self.ui, "scanSetupBoardSummary"):
+            return
+        source = Path(self.ui.boardPath.text()).name if self.ui.boardPath.text() else "not selected"
+        side = self._board_view.side if self._board_view is not None else "—"
+        self.ui.scanSetupBoardSummary.setText(
+            f"Board file: {source}\nView: {side}  •  Fixture: {self._fixture_profile_name() or 'not selected'}"
+        )
+        self.ui.scanSetupAreaSummary.setText(f"Scan coverage: {self._grid_summary()}")
+        problems = self._registration_problems()
+        aligned = not problems
+        seated = self.ui.chkBoardSeated.isChecked()
+        measurement = "Spectrum cube" if self._cube_selected() else "Single-frequency map"
+        if self._active_taught_side is not None:
+            alignment_name = f"{self._active_taught_side} side from taught inner pocket"
+        elif self._stl_board_placement is not None:
+            alignment_name = "STL middle-holder position"
+        else:
+            alignment_name = "PCB position"
+        ready = aligned and seated
+        extra = ""
+        if not aligned and problems:
+            extra = "Blocked: " + "; ".join(problems)
+        elif ready:
+            extra = (
+                "READY — continue to Review & Measure. Taught corners are saved "
+                "on this fixture for the next measurement."
+            )
+        elif not seated:
+            extra = "Confirm that the PCB is seated."
+        self.ui.scanSetupReview.setText(
+            f"{'✓' if aligned else '○'} {alignment_name}    "
+            f"{'✓' if seated else '○'} PCB fully seated    "
+            f"Measurement: {measurement}\n"
+            + extra
+        )
+        self.ui.scanSetupReview.setStyleSheet(
+            "padding:10px;border-radius:6px;font-weight:600;"
+            + (
+                "background:#ECFDF3;color:#05603A;border:1px solid #12B76A"
+                if ready
+                else "background:#FFFAEB;color:#7A2E0E;border:1px solid #F79009"
+            )
+        )
+
+    def _refresh_scan_setup_locate_status(self):
+        label = getattr(self.ui, "scanSetupLocateStatus", None)
+        if label is None:
+            return
+        document = self._machine_fixture_document() or {}
+        lines = []
+        if self._stl_board_placement is not None:
+            lines.append("Board located from fixture")
+        if engine_machine_fixtures.emi_probe_offset_is_set(document):
+            lines.append("E-probe offset calibrated")
+        saved = [
+            side
+            for side in SCAN_SETUP_SIDES
+            if self._taught_side_complete(side)
+        ]
+        if saved:
+            lines.append(
+                "Saved insert corners: " + ", ".join(saved) + " — reused next time."
+            )
+        label.setText("\n".join(lines))
+        label.setVisible(bool(lines))
+
+    def _board_corners_eprobe_xy(self):
+        if self._board_view is None or self._registration is None:
+            return ()
+        x0, y0, x1, y1 = self._board_view.bbox_mm
+        corners = self._scan_transform().to_machine(
+            [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        )
+        return tuple((float(x), float(y)) for x, y in corners)
+
+    def _calculated_scan_height_info(self):
+        missing = {
+            "available": False,
+            "reason": getattr(
+                engine_glassboard_fixture,
+                "PROBE_HEIGHT_NOT_CALIBRATED",
+                "Probe height not calibrated",
+            ),
+            "pcb_surface_machine_z": None,
+            "target_clearance_mm": 3.0,
+            "predicted_clearance_mm": None,
+        }
+        if engine_glassboard_fixture is None:
+            return missing
+        document = self._machine_fixture_document() or {}
+        teaching = document.get("fixture_teaching")
+        if not teaching or self._registration is None:
+            return missing
+        cals = engine_machine_fixtures.fixture_calibrations(document)
+        corners = self._board_corners_eprobe_xy()
+        if not corners:
+            return missing
+        return engine_glassboard_fixture.calculated_scan_height(
+            teaching,
+            emi_probe_offset_mm=engine_machine_fixtures.emi_probe_offset_mm(document),
+            pcb_thickness_mm=cals["pcb_thickness_mm"],
+            e_probe_tip_z_minus_g30_contact_mm=cals[
+                "e_probe_tip_z_minus_g30_contact_mm"
+            ],
+            board_corners_eprobe_xy=corners,
+            min_scan_clearance_mm=cals["min_scan_clearance_mm"],
+            max_scan_clearance_mm=cals["max_scan_clearance_mm"],
+            session_verified=self._fixture_verified_session,
+        )
+
+    def _refresh_calculated_height(self):
+        info = self._calculated_scan_height_info()
+        if self._board_zero_committed():
+            self._apply_emi_surface_from_board_zero()
+        elif not self._easy_mode_active() and info.get("available"):
+            self._pcb_surface_z = info["pcb_surface_machine_z"]
+            self._pcb_surface_from_fixture = True
+        self._refresh_scan_setup_locate_status()
+        self._refresh_scan_setup_summary()
+        self._refresh_height_ui()
+        self._refresh_scan_preview()
+        self._update_nav()
+
+    def _maybe_auto_place_glassboard(self):
+        if self._easy_mode_active():
+            return False
+        if not self._glassboard_fixture_selected():
+            return False
+        if self._face_blocks_stl_fallback(self._scan_setup_side()):
+            return False
+        if self._board_model is None or not self._pcb_xy_homed:
+            return False
+        if not self._fixture_verified_session:
+            return False
+        document = self._machine_fixture_document() or {}
+        if not engine_machine_fixtures.emi_probe_offset_is_set(document):
+            return False
+        if self._stl_board_placement is not None and self._registration is not None:
+            return True
+        if self._restore_glassboard_middle_placement():
+            return True
+        side = "top"
+        combo = getattr(self.ui, "glassboardPlacementSide", None)
+        if combo is not None:
+            side = combo.currentData() or "top"
+        return self._set_glassboard_middle_placement(
+            side, persist=True, reset_seated=False, announce=False
+        )
+
+    def _preview_scan_plan(self):
+        if self._board_view is None or self._registration is None:
+            return None
+        step_mm = self.ui.stepMm.value()
+        x_start, x_end, y_start, y_end = _board_bounds(self._board_view, step_mm)
+        return engine_registration.build_plan(
+            self._board_view,
+            self._scan_transform(),
+            x_start=x_start,
+            x_end=x_end,
+            y_start=y_start,
+            y_end=y_end,
+            step_mm=step_mm,
+            clip_to_outline=True,
+            registration=self._registration,
+            selection=self._scan_selection,
+        )
+
+    def _current_scan_fingerprint(self):
+        if engine_scan_preview is None:
+            return None
+        widget = getattr(self, "_scan_preview_widget", None)
+        if widget is not None:
+            fingerprint = widget.fingerprint()
+            if fingerprint:
+                return fingerprint
+        try:
+            plan = self._plan if self._plan is not None else self._preview_scan_plan()
+        except (ValueError, RuntimeError):
+            return None
+        if plan is None:
+            return None
+        info = self._calculated_scan_height_info()
+        return engine_scan_preview.scan_plan_fingerprint(
+            plan,
+            emi_probe_offset_mm=(0.0, 0.0),
+            height_target=info.get("target_machine_z"),
+        )
+
+    def _install_scan_preview_widget(self, host):
+        if host is None or not callable(getattr(host, "layout", None)):
+            return
+        try:
+            from modules.scan_preview_widget import ScanPreviewWidget
+            widget = ScanPreviewWidget(host)
+        except Exception:
+            return
+        host.layout().addWidget(widget)
+        widget.approved.connect(self._on_scan_plan_approved)
+        self._scan_preview_widget = widget
+        # The plan lives on Step 4 alone. Repeating it on Review & Measure
+        # added a second copy of a decision already approved there.
+        self._refresh_scan_preview()
+
+    def _on_scan_plan_approved(self, fingerprint):
+        if self._registration_problems():
+            return
+        self._approved_scan_fingerprint = fingerprint
+        self._update_nav()
+
+    def _refresh_scan_preview(self):
+        widget = getattr(self, "_scan_preview_widget", None)
+        if widget is None or engine_scan_preview is None:
+            return
+        taught_xy = []
+        for slot in range(len(TAUGHT_CORNER_LABELS)):
+            point = self._taught_pcb_corners(self._scan_setup_side()).get(slot)
+            if point is not None:
+                taught_xy.append(point)
+        plan = None
+        travel_error = ""
+        problems = self._registration_problems() if self._board_view is not None else ["no board"]
+        if self._registration is not None and self._board_view is not None and not problems:
+            try:
+                plan = self._preview_scan_plan()
+                if plan is not None:
+                    try:
+                        plan.validate_machine_limits(self._printer_config())
+                    except (ValueError, RuntimeError) as exc:
+                        travel_error = str(exc)
+            except (ValueError, RuntimeError) as exc:
+                widget.set_scene(None)
+                widget.status.setText(str(exc))
+                return
+        taught_frame = None
+        placement = getattr(self, "_taught_pocket_placement", None)
+        if placement and placement.get("placement") == "taught_pocket" and placement.get("scan_frame"):
+            frame = placement["scan_frame"]
+            taught_frame = engine_registration.Transform(
+                theta_rad=float(frame["theta_rad"]),
+                x0_mm=float(frame["x0_mm"]),
+                y0_mm=float(frame["y0_mm"]),
+            )
+        if self._easy_mode_active() and self._board_zero_committed():
+            calibrated = self._pcb_surface_z is not None
+            height_info = {
+                "available": calibrated,
+                "reason": (
+                    ""
+                    if calibrated
+                    else getattr(
+                        engine_glassboard_fixture,
+                        "PROBE_HEIGHT_NOT_CALIBRATED",
+                        "Probe height not calibrated",
+                    )
+                ),
+                "pcb_surface_machine_z": self._pcb_surface_z,
+                "target_clearance_mm": self._default_probe_gap_mm(),
+                "target_machine_z": self._easy_scan_target_z() if calibrated else None,
+                "predicted_clearance_mm": None,
+            }
+        else:
+            height_info = self._calculated_scan_height_info()
+            if self._board_zero_committed() and not height_info.get("available"):
+                height_info = dict(height_info)
+                height_info["available"] = True
+                height_info["reason"] = ""
+                height_info.setdefault(
+                    "target_clearance_mm", self._default_probe_gap_mm()
+                )
+        scene = engine_scan_preview.build_scan_preview_scene(
+            plan,
+            emi_probe_offset_mm=(0.0, 0.0),
+            teaching=None,
+            height_info=height_info if plan is not None else None,
+            travel_error=travel_error,
+            taught_corners_machine_xy=taught_xy,
+            taught_scan_frame=taught_frame,
+        )
+        widget.set_scene(scene)
+        stale = (
+            self.thread is None
+            and self._machine_xy is not None
+            and (time.monotonic() - self._machine_xy_at) > 5.0
+        )
+        widget.set_reported_xy(self._machine_xy, stale=stale)
+        if self._pending_preview_cell is not None:
+            widget.set_active_cell(self._pending_preview_cell)
+
+    def _attach_scan_preview_to_current_page(self, index):
+        widget = getattr(self, "_scan_preview_widget", None)
+        if widget is None or index != PAGE_SCAN_SETUP:
+            return
+        host = getattr(self.ui, "scanPreviewHost", None)
+        if host is None or not callable(getattr(host, "layout", None)):
+            return
+        layout = host.layout()
+        if layout is not None:
+            layout.addWidget(widget)
+
+    def _on_cell_begin(self, info):
+        xy = (float(info.get("machine_x_mm", 0.0)), float(info.get("machine_y_mm", 0.0)))
+        self._pending_preview_cell = xy
+        widget = getattr(self, "_scan_preview_widget", None)
+        if widget is not None:
+            widget.set_active_cell(xy)
+
+    def _scan_setup_seated_changed(self, checked):
+        """Keep the visible Easy confirmation and the shared safety gate in sync."""
+        checked = bool(checked)
+        if self.ui.chkBoardSeated.isChecked() != checked:
+            blocker = QtCore.QSignalBlocker(self.ui.chkBoardSeated)
+            self.ui.chkBoardSeated.setChecked(checked)
+            del blocker
+        self._refresh_scan_setup_summary()
+        self._update_nav()
+
+    def _advanced_board_seated_changed(self, checked):
+        """Reflect Advanced's shared state on the Easy Scan Setup page."""
+        control = getattr(self.ui, "chkScanSetupBoardSeated", None)
+        if control is None or control.isChecked() == bool(checked):
+            return
+        blocker = QtCore.QSignalBlocker(control)
+        control.setChecked(bool(checked))
+        del blocker
+        self._refresh_scan_setup_summary()
+
+    # ------------------------------------------------ taught PCB insert edge
+    def _board_view_for_side(self, side):
+        """The un-rotated view of one board face, or None before import."""
+        if self._board_model is None:
+            return None
+        return self._board_model.view(side=str(side), rotation_deg=0)
+
+    def _pcb_corner_board_points(self, view):
+        """Fixture-local inner-pocket corners Step 4 teaches (not PCB outline)."""
+        del view
+        if engine_glassboard_fixture is None:
+            return ((0.0, 0.0), (1.0, 1.0))
+        return engine_glassboard_fixture.glassboard_support_corners()
+
+    def _taught_pcb_corners(self, side):
+        return dict(self._taught_pcb_corner_points.get(str(side)) or {})
+
+    def _taught_side_complete(self, side):
+        return len(self._taught_pcb_corners(side)) == len(TAUGHT_CORNER_LABELS)
+
+    def _scan_setup_side(self):
+        """The face Step 4 should position, preferring a completely taught one."""
+        preferred = "top"
+        combo = getattr(self.ui, "glassboardPlacementSide", None)
+        if combo is not None:
+            preferred = combo.currentData() or "top"
+        for side in (preferred, *SCAN_SETUP_SIDES):
+            if self._taught_side_complete(side):
+                return side
+        return preferred
+
+    def _sync_side_combo(self, side):
+        """Record which face is toward the probe without re-placing the board."""
+        combo = getattr(self.ui, "glassboardPlacementSide", None)
+        if combo is None:
+            return
+        index = combo.findData(str(side))
+        if index < 0:
+            return
+        self._syncing_glassboard_side = True
+        try:
+            combo.setCurrentIndex(index)
+        finally:
+            self._syncing_glassboard_side = False
+
+    def _scan_setup_jog(self, dx, dy):
+        """Relative XY jog for corner teaching; Z is never commanded."""
+        if not self._pcb_xy_homed:
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE, "Home X and Y in Step 2 before jogging."
+            )
+            return
+        step_widget = getattr(self.ui, "scanSetupJogStep", None)
+        step_mm = step_widget.value() if step_widget is not None else 1.0
+        try:
+            printer = self._printer()
+            x_mm, y_mm = printer.get_xy()
+            printer.move_xy(x_mm + dx * step_mm, y_mm + dy * step_mm)
+            self._show_position(printer.get_xy())
+            self._bump_motion()
+        except engine_printer.PrinterReset as exc:
+            self._clear_height_datum()
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+
+    def _capture_pcb_corner(self, side, slot, _checked=False):
+        """Store the probe's current machine XY as one PCB corner."""
+        view = self._board_view_for_side(side)
+        if view is None:
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE, "Import the ODB++ board in Step 3 first."
+            )
+            return False
+        if not self._pcb_xy_homed:
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE,
+                "Home X and Y in Step 2 first: a machine coordinate taught "
+                "before homing belongs to a frame that no longer exists.",
+            )
+            return False
+        try:
+            machine_x, machine_y = self._printer().get_xy()
+        except engine_printer.PrinterReset as exc:
+            self._clear_pcb_homing()
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            return False
+        points = self._taught_pcb_corners(side)
+        points[int(slot)] = (float(machine_x), float(machine_y))
+        self._taught_pcb_corner_points[str(side)] = points
+        self._show_position((machine_x, machine_y))
+        self._save_taught_pcb_corners(side, view)
+        if self._taught_side_complete(side):
+            self._apply_taught_pcb_corners(side, announce=True)
+        self._refresh_corner_teach_ui()
+        self._update_nav()
+        return True
+
+    def _use_taught_pcb_side(self, side, _checked=False):
+        if not self._taught_side_complete(side):
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE,
+                f"Capture both corners of the {side} side first.",
+            )
+            return False
+        return self._apply_taught_pcb_corners(side, announce=True)
+
+    def _clear_pcb_corners(self, side, _checked=False):
+        """Forget one face's taught corners, in memory and on disk."""
+        side = str(side)
+        self._taught_pcb_corner_points[side] = {}
+        self._pocket_pair_state[side] = "missing"
+        if self._pocket_block_reason and self._active_taught_side == side:
+            self._pocket_block_reason = ""
+        name = self._fixture_profile_name() or self._active_machine_fixture_name
+        if name:
+            try:
+                engine_machine_fixtures.clear_taught_pcb_corners(name, side)
+            except (engine_profiles.ProfileError, OSError) as exc:
+                QMessageBox.warning(
+                    self.ui, DIALOG_TITLE,
+                    f"The taught corners were cleared here but not on disk: {exc}",
+                )
+        if self._active_taught_side == side:
+            self._drop_pocket_scan_xy()
+            self._update_nav()
+        self._refresh_corner_teach_ui()
+        self._refresh_scan_setup_summary()
+        self._update_nav()
+        return True
+
+    def _set_glassboard_placement_status(self, text, stylesheet=None):
+        status = getattr(self.ui, "glassboardPlacementStatus", None)
+        if status is None:
+            return
+        status.setText(text)
+        if stylesheet is not None:
+            status.setStyleSheet(stylesheet)
+
+    def _drop_pocket_scan_xy(self):
+        """Forget taught-pocket XY, the scan path, and approval. Does not move Z."""
+        self._registration = None
+        self._landmarks.clear()
+        self._active_taught_side = None
+        self._taught_pocket_placement = None
+        self._stl_board_placement = None
+        self._invalidate_plan()
+
+    def _apply_taught_pcb_corners(self, side, *, announce=False):
+        """Seat the board from two taught E-probe inner-pocket corners."""
+        side = str(side)
+        view = self._board_view_for_side(side)
+        points = self._taught_pcb_corners(side)
+        if view is None or len(points) < len(TAUGHT_CORNER_LABELS):
+            return False
+        if engine_glassboard_fixture is None:
+            self._blocked_corner_status("EMI_Mapper engine is unavailable", announce=announce)
+            return False
+        ordered = tuple(points[slot] for slot in sorted(points))
+        document = self._machine_fixture_document() or {}
+        yaw = 0.0
+        try:
+            yaw = float(
+                engine_machine_fixtures.fixture_calibrations(document)["pcb_yaw_deg"]
+            )
+        except (engine_profiles.ProfileError, KeyError, TypeError, ValueError):
+            yaw = 0.0
+        blocker = QtCore.QSignalBlocker(self.ui.boardSide)
+        self.ui.boardSide.setCurrentText(side)
+        del blocker
+        self._apply_board_view(rotation_deg=0)
+        self._sync_side_combo(side)
+        view = self._board_view
+        try:
+            registration, placement = (
+                engine_glassboard_fixture.board_registration_from_taught_pocket(
+                    view,
+                    ordered,
+                    pcb_yaw_deg=yaw,
+                    step_mm=float(self.ui.stepMm.value()),
+                )
+            )
+            unreachable = self._reachability_problem(registration)
+            if unreachable:
+                raise engine_glassboard_fixture.GlassboardPlacementError(
+                    f"the taught pocket is outside machine travel: {unreachable}"
+                )
+        except (
+            engine_glassboard_fixture.GlassboardPlacementError,
+            engine_registration.RegistrationError,
+            ValueError,
+        ) as exc:
+            self._pocket_pair_state[side] = "rejected"
+            self._pocket_block_reason = str(exc)
+            self._drop_pocket_scan_xy()
+            self._blocked_corner_status(str(exc), announce=announce)
+            return False
+        self._landmarks[:] = list(registration.points)
+        self._registration = registration
+        self._active_taught_side = side
+        self._taught_pocket_placement = placement
+        self._pocket_pair_state[side] = "ok"
+        self._pocket_block_reason = ""
+        self._fit_error = ""
+        self._profile = None
+        self._stl_board_placement = None
+        self._offset_correction_mm = (0.0, 0.0)
+        self._verified_points = []
+        self._invalidate_plan()
+        self._bump_registration()
+        self._clear_selection()
+        width_mm, height_mm = view.size_mm
+        theta_deg = registration.transform.to_dict()["theta_deg"]
+        self.ui.glassboardPlacementStatus.setText(
+            f"{side.upper()} side seated in the taught inner pocket: "
+            f"{width_mm:.2f} × {height_mm:.2f} mm board at "
+            f"{theta_deg:.3f}° (yaw {yaw:g}° from config). "
+            "Confirm seating, then continue."
+        )
+        self.ui.glassboardPlacementStatus.setStyleSheet(
+            "padding:8px;background:#ECFDF3;color:#05603A;"
+            "border:1px solid #12B76A;border-radius:6px"
+        )
+        self._update_registration_ui()
+        self._refresh_corner_teach_ui()
+        self._refresh_calculated_height()
+        self._refresh_scan_setup_summary()
+        self._update_nav()
+        return True
+
+    def _blocked_corner_status(self, reason, *, announce):
+        self._set_glassboard_placement_status(
+            f"POSITION BLOCKED — {reason}",
+            "padding:8px;background:#FEF3F2;color:#912018;"
+            "border:1px solid #F04438;border-radius:6px",
+        )
+        if announce:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, reason)
+        self._update_nav()
+
+    def _save_taught_pcb_corners(self, side, view):
+        """Persist one face's insert corners on the fixture, not the board file."""
+        name = self._ensure_fixture_selected()
+        points = self._taught_pcb_corners(side)
+        if not points:
+            return
+        if not name:
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE,
+                "Select a fixture on Step 2 so these corners can be reused "
+                "on the next measurement.",
+            )
+            return
+        payload = [
+            {
+                "slot": int(slot),
+                "machine_x_mm": points[slot][0],
+                "machine_y_mm": points[slot][1],
+            }
+            for slot in sorted(points)
+        ]
+        try:
+            engine_machine_fixtures.save_taught_pcb_corners(name, side, payload)
+        except (engine_profiles.ProfileError, OSError) as exc:
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE,
+                f"The corner is usable now, but could not be saved: {exc}",
+            )
+
+    def _load_taught_pcb_corners(self):
+        """Restore v2 pocket corners. v1 pairs are stale and must be recaptured."""
+        document = self._machine_fixture_document()
+        if document is None:
+            return
+        for side in SCAN_SETUP_SIDES:
+            try:
+                status = engine_machine_fixtures.taught_pocket_status(document, side)
+            except engine_profiles.ProfileError:
+                status = "missing"
+            if status == "stale":
+                self._pocket_pair_state[side] = "stale"
+                self._taught_pcb_corner_points[side] = {}
+                continue
+            if status != "ok":
+                if not self._taught_pcb_corners(side):
+                    self._pocket_pair_state[side] = "missing"
+                continue
+            points = {}
+            try:
+                saved = engine_machine_fixtures.taught_pcb_corners(document, side)
+            except engine_profiles.ProfileError:
+                saved = []
+            for entry in saved:
+                points[int(entry["slot"])] = (
+                    float(entry["machine_x_mm"]),
+                    float(entry["machine_y_mm"]),
+                )
+            self._taught_pcb_corner_points[side] = points
+            if self._pocket_pair_state.get(side) != "rejected":
+                self._pocket_pair_state[side] = (
+                    "ok" if len(points) >= len(TAUGHT_CORNER_LABELS) else "missing"
+                )
+
+    def _face_blocks_stl_fallback(self, side):
+        """True when a pocket pair exists but must not be replaced by STL."""
+        side = str(side)
+        state = self._pocket_pair_state.get(side)
+        if state in ("stale", "rejected"):
+            return True
+        return self._taught_side_complete(side)
+
+    def _refresh_corner_teach_ui(self):
+        """Show what each face has taught, and which one is being measured."""
+        for side, label in (self._corner_teach_labels or {}).items():
+            points = self._taught_pcb_corners(side)
+            lines = []
+            for slot, corner_label in enumerate(TAUGHT_CORNER_LABELS):
+                position = points.get(slot)
+                lines.append(
+                    f"{corner_label}: "
+                    + (
+                        f"X {position[0]:.2f}  Y {position[1]:.2f} mm"
+                        if position is not None
+                        else "not taught"
+                    )
+                )
+            if self._active_taught_side == side:
+                lines.append("Measuring this side.")
+            state = self._pocket_pair_state.get(side)
+            if state == "stale":
+                lines.append("Saved corners are outdated — recapture A and B.")
+            elif state == "rejected" and self._pocket_block_reason:
+                lines.append(self._pocket_block_reason)
+            label.setText("\n".join(lines))
+
+    def _set_glassboard_middle_placement(
+        self, side, *, persist=True, reset_seated=True, announce=True
+    ):
+        """Place the board in the STL middle support using taught P1 and the STL."""
+        if self._board_model is None:
+            if announce:
+                QMessageBox.warning(self.ui, DIALOG_TITLE, "Import the ODB++ board first.")
+            return False
+        if not self._glassboard_fixture_selected():
+            if announce:
+                QMessageBox.warning(
+                    self.ui, DIALOG_TITLE,
+                    "The STL middle-holder placement is only available for a "
+                    "Glassboard fixture.",
+                )
+            return False
+        document = self._machine_fixture_document()
+        teaching = (document or {}).get("fixture_teaching")
+        if teaching is None:
+            if announce:
+                QMessageBox.warning(
+                    self.ui, DIALOG_TITLE,
+                    "Teach P1 for this physical fixture before placing the PCB.",
+                )
+            return False
+        if not self._fixture_verified_session or not self._pcb_xy_homed:
+            if announce:
+                QMessageBox.warning(
+                    self.ui, DIALOG_TITLE,
+                    "Verify the fixture in Step 2 first. Its current machine position "
+                    "must be confirmed before the STL placement can be used.",
+                )
+            return False
+        offset = engine_machine_fixtures.emi_probe_offset_mm(document)
+        if not engine_machine_fixtures.emi_probe_offset_is_set(document):
+            if announce:
+                QMessageBox.warning(
+                    self.ui, DIALOG_TITLE,
+                    "Set fixture.emi_probe_offset_x_mm and emi_probe_offset_y_mm "
+                    "in EMI_Mapper/config.yaml. Those are carriage constants, "
+                    "not per-fixture fields.",
+                )
+            status = getattr(self.ui, "glassboardPlacementStatus", None)
+            if status is not None:
+                status.setText(
+                    "E-probe offset is required in EMI_Mapper/config.yaml "
+                    "before locating the board."
+                )
+            return False
+        side = str(side or "top").lower()
+        if side not in ("top", "bottom"):
+            side = "top"
+        blocker = QtCore.QSignalBlocker(self.ui.boardSide)
+        self.ui.boardSide.setCurrentText(side)
+        del blocker
+        self._apply_board_view(rotation_deg=0)
+        cals = engine_machine_fixtures.fixture_calibrations(document)
+        try:
+            registration, placement = (
+                engine_glassboard_fixture.board_registration_in_middle_holder(
+                    self._board_view,
+                    teaching,
+                    emi_probe_offset_mm=offset,
+                    pcb_yaw_deg=cals["pcb_yaw_deg"],
+                )
+            )
+            unreachable = self._reachability_problem(registration)
+            if unreachable:
+                raise engine_glassboard_fixture.GlassboardPlacementError(
+                    f"middle-holder placement is outside machine travel: {unreachable}"
+                )
+        except (
+            engine_glassboard_fixture.GlassboardPlacementError,
+            engine_registration.RegistrationError,
+            ValueError,
+        ) as exc:
+            self.ui.glassboardPlacementStatus.setText(f"PLACEMENT BLOCKED — {exc}")
+            self.ui.glassboardPlacementStatus.setStyleSheet(
+                "padding:8px;background:#FEF3F2;color:#912018;"
+                "border:1px solid #F04438;border-radius:6px"
+            )
+            if announce:
+                QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
+            self._update_nav()
+            return False
+
+        self._landmarks[:] = list(registration.points)
+        self._registration = registration
+        self._fit_error = ""
+        self._profile = None
+        self._stl_board_placement = placement
+        self._offset_correction_mm = (0.0, 0.0)
+        self._verified_points = []
+        self._invalidate_plan()
+        self._bump_registration()
+        self._clear_selection()
+        if reset_seated:
+            self.ui.chkScanSetupBoardSeated.setChecked(False)
+        clearance_x, clearance_y = placement["clearance_total_mm"]
+        frame = placement["fixture_frame"]
+        center_x, center_y = placement["machine_support_center_mm"]
+        geometry_note = ""
+        placement_style = (
+            "padding:8px;background:#ECFDF3;color:#05603A;"
+            "border:1px solid #12B76A;border-radius:6px"
+        )
+        if not frame.get("span_measured", True):
+            # P1 alone fixes the origin but cannot observe rotation, so the
+            # operator needs to know the squareness is assumed, not measured.
+            geometry_note = (
+                " Located from P1 and the STL with the fixture assumed square "
+                "to X/Y; angle was not measured. Teach P1-P4 to check it."
+            )
+        elif frame["max_corner_residual_mm"] > 1.0:
+            geometry_note = (
+                f" Reference marks span {frame['observed_width_mm']:.3f} × "
+                f"{frame['observed_height_mm']:.3f} mm versus STL "
+                "106.162 × 34.000 mm; center and angle are used without scaling the PCB."
+            )
+            placement_style = (
+                "padding:8px;background:#FFFAEB;color:#7A2E0E;"
+                "border:1px solid #F79009;border-radius:6px"
+            )
+        saved_word = "Saved" if persist else "Restored"
+        offset_note = (
+            f" E-probe offset {offset[0]:+.3f}, {offset[1]:+.3f} mm "
+            "(scan XY follows the E-field probe)."
+        )
+        self.ui.glassboardPlacementStatus.setText(
+            f"{saved_word}: {side.upper()} faces the probe; PCB centered in the "
+            f"58.164 × 12.940 mm middle support. Total clearance "
+            f"X {clearance_x:.3f} mm, Y {clearance_y:.3f} mm. "
+            f"Machine center X {center_x:.3f}, Y {center_y:.3f} mm; "
+            f"fixture angle {frame['transform']['theta_deg']:.3f}°."
+            + geometry_note
+            + offset_note
+        )
+        self.ui.glassboardPlacementStatus.setStyleSheet(placement_style)
+        self._refresh_scan_setup_locate_status()
+        self._refresh_calculated_height()
+        if persist:
+            try:
+                engine_machine_fixtures.save_board_placement(
+                    self._fixture_profile_name(),
+                    self._board_view.geometry_hash,
+                    placement,
+                )
+            except (engine_profiles.ProfileError, OSError) as exc:
+                QMessageBox.warning(
+                    self.ui, DIALOG_TITLE,
+                    f"The board position is usable now, but could not be saved: {exc}",
+                )
+        self._update_registration_ui()
+        self._refresh_scan_setup_summary()
+        self._update_nav()
+        return True
+
+    def _on_glassboard_side_changed(self, _index=0):
+        """Re-apply a taught pocket pair when the recorded face changes.
+
+        Easy scan XY comes from A/B only. Missing corners drop the previous
+        placement rather than falling back to the STL/P1 holder.
+        """
+        if self._syncing_glassboard_side:
+            return
+        if not self._glassboard_fixture_selected() or self._board_model is None:
+            return
+        side = self.ui.glassboardPlacementSide.currentData() or "top"
+        if self._taught_side_complete(side):
+            self._apply_taught_pcb_corners(side, announce=False)
+            return
+        self._drop_pocket_scan_xy()
+
+    def _restore_glassboard_middle_placement(self):
+        """Restore this board/fixture association without trusting physical seating."""
+        if self._board_model is None:
+            return False
+        if not self._glassboard_fixture_selected():
+            return False
+        document = self._machine_fixture_document()
+        if document is None:
+            return False
+        preferred = self.ui.glassboardPlacementSide.currentData() or "top"
+        for side in (preferred, "bottom" if preferred == "top" else "top"):
+            view = self._board_model.view(side=side, rotation_deg=0)
+            try:
+                saved = engine_machine_fixtures.board_placement(
+                    document, view.geometry_hash
+                )
+            except engine_profiles.ProfileError as exc:
+                self.ui.glassboardPlacementStatus.setText(
+                    f"Saved middle-holder position is invalid: {exc}"
+                )
+                return False
+            if saved is None or saved.get("template_id") != engine_glassboard_fixture.TEMPLATE_ID:
+                continue
+            combo_index = self.ui.glassboardPlacementSide.findData(side)
+            if combo_index >= 0:
+                # Restoring the saved side must not look like an operator
+                # choice, or it would re-place and clear the seated flag.
+                self._syncing_glassboard_side = True
+                try:
+                    self.ui.glassboardPlacementSide.setCurrentIndex(combo_index)
+                finally:
+                    self._syncing_glassboard_side = False
+            return self._set_glassboard_middle_placement(
+                side, persist=False, reset_seated=False, announce=False
+            )
+        return False
+
+    def _on_fixture_operation_failed(self, exc):
+        if self._is_printer_halt(exc):
+            self._handle_printer_halt(exc)
+            return
+        self._close_printer()
+        self._clear_board_zero()
+        self._fixture_xyz_homed = False
+        self._fixture_verified_session = False
+        self._clear_pcb_homing()
+        self.ui.fixtureTeachStatus.setText(f"BLOCKED — {exc}")
+        connection = getattr(self.ui, "fixturePrinterConnectionStatus", None)
+        if connection is not None:
+            connection.setText(f"NOT CONNECTED — {exc}")
+            connection.setStyleSheet(
+                "padding:7px;background:#FEF3F2;color:#912018;"
+                "border:1px solid #F04438;border-radius:6px"
+            )
+        QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
 
     # ------------------------------------------------------- homing and jog
     def _printer(self, *, manage_z=None):
         """A Printer on the shared transport, carrying the form's machine limits."""
+        if self._printer_halted:
+            raise engine_printer.PrinterHalted(PRINTER_HALTED_TEXT)
         config = self._printer_config()
         if manage_z is not None:
             config = replace(config, manage_z=manage_z)
-        return engine_printer.Printer(self._open_printer(), config)
+        printer = engine_printer.Printer(self._open_printer(), config)
+        return self._bind_printer_frame(printer)
+
+    def _is_printer_halt(self, exc):
+        """Type only. Matching halt words in text also matched this app's own advice."""
+        return engine_printer is not None and isinstance(
+            exc, engine_printer.PrinterHalted
+        )
+
+    def _handle_printer_halt(self, exc):
+        """Stop talking to a killed controller. Do not retry homing."""
+        self._printer_halted = True
+        self._close_printer()
+        self._clear_height_datum()
+        self._clear_pcb_homing()
+        message = str(exc).strip() or PRINTER_HALTED_TEXT
+        if PRINTER_HALTED_TEXT not in message:
+            message = f"{PRINTER_HALTED_TEXT} {message}"
+        self.ui.posLabel.setText(PRINTER_HALTED_TEXT)
+        fixture_status = getattr(self.ui, "fixtureTeachStatus", None)
+        if fixture_status is not None:
+            fixture_status.setText(message)
+        connection = getattr(self.ui, "fixturePrinterConnectionStatus", None)
+        if connection is not None:
+            connection.setText(f"NOT CONNECTED — {PRINTER_HALTED_TEXT}")
+            connection.setStyleSheet(
+                "padding:7px;background:#FEF3F2;color:#912018;"
+                "border:1px solid #F04438;border-radius:6px"
+            )
+        QMessageBox.warning(self.ui, DIALOG_TITLE, message)
+
+    def _fixture_retry_printer_clicked(self):
+        """Reconnect and identify Marlin without moving any machine axis."""
+        port = self._printer_port()
+        configured = int(self.ui.printerBaud.value())
+        self._close_printer()
+        self._clear_height_datum()
+        self._clear_pcb_homing()
+        self._start_printer_job(
+            lambda: self._do_fixture_retry_printer(port, configured),
+            self._on_fixture_retry_printer_ok,
+            self._on_fixture_operation_failed,
+            self.ui.fixturePrinterConnectionStatus,
+            "Connecting to the selected printer port…",
+        )
+
+    def _do_fixture_retry_printer(self, port=None, configured=None):
+        port = port or self._printer_port()
+        configured = self.ui.printerBaud.value() if configured is None else configured
+        if not port:
+            raise RuntimeError("Choose the printer serial port first")
+        self._close_printer()
+        if PRINTER_BOOT_S:
+            time.sleep(PRINTER_BOOT_S)
+        attempts = tuple(dict.fromkeys((configured, 115200, 250000)))
+        failures = []
+        for index, baud in enumerate(attempts):
+            if index:
+                time.sleep(PRINTER_BAUD_SETTLE_S)
+            try:
+                handle = self._connect_printer(port, baud)
+            except engine_printer.PrinterHalted:
+                # A halt reply is an answer, not a failed baud guess. Trying
+                # further rates would only reboot a controller that needs a
+                # manual reset.
+                raise
+            except (RuntimeError, engine_printer.PrinterError) as exc:
+                failures.append(str(exc))
+                continue
+            self.printer_serial = handle
+            self._clear_height_datum()
+            return port, baud, baud != configured
+        tried = ", ".join(str(value) for value in attempts)
+        if not failures:
+            detail = "timeout (no bytes received)."
+        elif len(failures) == 1:
+            detail = failures[0]
+        else:
+            detail = (
+                failures[0]
+                + " Additional baud rates were tried after that and also did not "
+                "identify Marlin."
+            )
+        raise RuntimeError(
+            f"Could not auto-detect Marlin on {port}; tried {tried} baud. {detail}"
+        )
+
+    def _on_fixture_retry_printer_ok(self, payload):
+        port, baud, changed = payload
+        self._printer_halted = False
+        if changed:
+            self.ui.printerBaud.setValue(baud)
+        self.ui.fixturePrinterConnectionStatus.setText(
+            f"CONNECTED — Marlin answered on {port} at {baud} baud"
+            + (" (auto-detected and selected)." if changed else ".")
+        )
+        self.ui.fixturePrinterConnectionStatus.setStyleSheet(
+            "padding:7px;background:#ECFDF3;color:#05603A;"
+            "border:1px solid #12B76A;border-radius:6px"
+        )
+        self.ui.fixtureTeachStatus.setText(STEP2_AFTER_RECONNECT)
 
     def _logical_z_max_mm(self):
         return LOGICAL_Z_MAX_MM
@@ -2494,6 +5422,8 @@ class EMIMapWizard(QtCore.QObject):
         )
 
     def _easy_at_scan_plane(self, reported_z=None):
+        if self._easy_mode_active() and reported_z is None:
+            return self._easy_scan_plane_cached()
         target = self._easy_scan_target_z()
         if target is None:
             return False
@@ -2580,35 +5510,23 @@ class EMIMapWizard(QtCore.QObject):
 
     def _refresh_easy_height_label(self):
         u = self.ui
-        easy = self._easy_mode_active()
-        unknown = self._pcb_surface_z is None
-        gap = self._default_probe_gap_mm()
+        missing_vertical = not self._easy_vertical_calibrated()
+        for name in EASY_MANUAL_HEIGHT_BUTTONS:
+            self._set_widget_visible(
+                name, self._easy_mode_active() and missing_vertical
+            )
+        self._set_widget_visible(
+            "grpEasyManualHeight", self._easy_mode_active() and missing_vertical
+        )
         easy_height = getattr(u, "easyHeightLabel", None)
-        if easy_height is not None and callable(getattr(easy_height, "setText", None)):
-            if unknown:
-                easy_height.setText(
-                    "Z reference required. Use SET PCB SURFACE MANUALLY, "
-                    "then SET PROBE HEIGHT."
-                )
-            elif self._easy_at_scan_plane():
-                easy_height.setText(f"Probe is {gap:.2f} mm above PCB.")
-            else:
-                easy_height.setText(
-                    f"Probe is not at the {gap:.2f} mm measurement height. "
-                    "Use SET PROBE HEIGHT."
-                )
-        surface_btn = getattr(u, "btnEasySetPcbSurface", None)
-        if surface_btn is not None and callable(getattr(surface_btn, "setVisible", None)):
-            surface_btn.setVisible(easy and unknown)
-        reset_btn = getattr(u, "btnEasyResetPcbSurface", None)
-        if reset_btn is not None and callable(getattr(reset_btn, "setVisible", None)):
-            reset_btn.setVisible(easy and not unknown)
-        easy_set = getattr(u, "btnEasySetHeight", None)
-        if easy_set is not None:
-            if callable(getattr(easy_set, "setVisible", None)):
-                easy_set.setVisible(easy and not unknown)
-            if callable(getattr(easy_set, "setEnabled", None)):
-                easy_set.setEnabled(easy and not unknown)
+        if (
+            self._easy_mode_active()
+            and easy_height is not None
+            and callable(getattr(easy_height, "setText", None))
+        ):
+            easy_height.setText(self._step2_status_text())
+        self._refresh_fixture_page_summary()
+        self._refresh_scan_setup_summary()
 
     def _easy_move_to_reference(self):
         target = self._easy_home_landmark()
@@ -2769,6 +5687,9 @@ class EMIMapWizard(QtCore.QObject):
                     "Marlin-reported position did not reach the requested logical target"
                 )
             self._last_commanded_scan_z = target
+            self._easy_verified_scan_z = float(reported)
+            self._easy_height_identity = self._easy_height_identity_now()
+            self._easy_height_lost_to_reset = False
             self._refresh_height_ui()
             self._update_nav()
             return True
@@ -2781,13 +5702,23 @@ class EMIMapWizard(QtCore.QObject):
             QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
             return False
 
+    def _clear_easy_session_scan_plane(self):
+        """Drop the E-probe plane without forgetting taught P1 XY or XY homing."""
+        self._pcb_surface_z = None
+        self._pcb_surface_from_fixture = False
+        self._last_commanded_scan_z = None
+        self._easy_touch_logical_z = None
+        self._bltouch_board_zero_z = None
+        self._bltouch_board_zero_frame = None
+        self._invalidate_easy_verified_height()
+
     def _easy_begin_pcb_surface_touch(self):
         if not self._pcb_xy_homed:
             QMessageBox.warning(self.ui, DIALOG_TITLE, "Home X and Y before setting the PCB surface.")
             return False
         printer = self._printer(manage_z=True)
-        # Any manual Z release breaks the previous logical-to-physical datum.
-        self._clear_height_datum()
+        # Releasing Z holding invalidates BLTouch millimetres, not taught P1 XY.
+        self._clear_easy_session_scan_plane()
         landmark = self._easy_home_landmark()
         if landmark is not None:
             printer.move_xy(*landmark)
@@ -2806,21 +5737,16 @@ class EMIMapWizard(QtCore.QObject):
         if surface is None:
             surface = printer.get_xyz()[2]
         self._pcb_surface_z = float(surface)
-        target = self._easy_scan_target_z()
-        printer.move_z(target)
-        reported = printer.get_xyz()[2]
-        if not engine_height.logical_position_matches(reported, target):
-            raise engine_printer.PrinterError(
-                "Marlin-reported position did not reach the requested logical target"
-            )
-        self._last_commanded_scan_z = target
+        self._pcb_surface_from_fixture = False
+        self._last_commanded_scan_z = None
+        self._invalidate_easy_verified_height()
         self._refresh_height_ui()
         self._update_nav()
         return True
 
     def _easy_cancel_pcb_touch(self):
         self._easy_reenable_z_if_unlocked()
-        self._clear_height_datum()
+        self._clear_easy_session_scan_plane()
         return True
 
     def _easy_set_pcb_surface_manually(self):
@@ -2870,7 +5796,7 @@ class EMIMapWizard(QtCore.QObject):
             self._easy_cancel_pcb_touch()
         except (engine_printer.PrinterError, OSError, RuntimeError, ValueError) as exc:
             QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
-        self._clear_height_datum()
+        self._clear_easy_session_scan_plane()
         self._refresh_height_ui()
         self._update_nav()
         return True
@@ -2922,79 +5848,138 @@ class EMIMapWizard(QtCore.QObject):
         return None
 
     def _home_xy_clicked(self):
+        if self._printer_halted:
+            QMessageBox.warning(self.ui, DIALOG_TITLE, PRINTER_HALTED_TEXT)
+            return
         if not self.ui.chkHomeClear.isChecked():
             return
+        if self._home_kind() == "board_zero":
+            blocked = self._easy_invalid_yaml_reason()
+            if blocked:
+                QMessageBox.warning(self.ui, DIALOG_TITLE, blocked)
+                return
+        self._clear_board_zero()
+        self._update_nav()
+        kind = self._home_kind()
+        status = {
+            "board_zero": "Homing X/Y, probing P1, then setting board zero…",
+            "teaching": "Lifting Z, then homing X/Y for teaching…",
+        }.get(kind, "Homing X/Y… the window stays usable; this can take a few seconds.")
         self._start_printer_job(
             self._do_home_xy,
             self._on_home_ok,
             self._on_home_failed,
             self.ui.posLabel,
-            "Homing X/Y… the window stays usable; this can take a few seconds.",
+            status,
         )
 
+    def _home_kind(self):
+        """rectangle, teaching (no P1), or board_zero (taught P1)."""
+        if self._mode() != MODE_PCB:
+            return "rectangle"
+        if self._p1_bltouch_commanded_xy() is not None:
+            return "board_zero"
+        return "teaching"
+
     def _do_home_xy(self):
+        if self._printer_halted:
+            raise engine_printer.PrinterHalted(PRINTER_HALTED_TEXT)
+        kind = self._home_kind()
+        if kind == "board_zero":
+            blocked = self._easy_invalid_yaml_reason()
+            if blocked:
+                raise RuntimeError(blocked)
+        self._clear_board_zero()
         printer = self._printer(manage_z=self._mode() == MODE_PCB)
         printer.drain()
         printer.prepare()
         note = None
-        if self._mode() == MODE_PCB:
-            self._easy_reenable_z_if_unlocked(printer)
-            was_at_scan_plane = False
-            target = None
-            if self._easy_mode_active():
-                current_z = printer.get_xyz()[2]
-                target = self._easy_scan_target_z()
-                was_at_scan_plane = (
-                    target is not None
-                    and engine_height.logical_position_matches(current_z, target)
+        result = None
+        try:
+            if kind == "board_zero":
+                if self._easy_mode_active():
+                    self._easy_reenable_z_if_unlocked(printer)
+                result = engine_printer.home_xy_and_set_board_zero(
+                    printer,
+                    self._p1_bltouch_commanded_xy(),
+                    lift_mm=self._safe_home_lift_mm(),
+                    z_max_mm=self._logical_z_max_mm(),
+                    retract_mm=self._printer_config().probe_clearance_mm,
                 )
-            engine_printer.lift_then_home_xy(
-                printer,
-                lift_mm=self._safe_home_lift_mm(),
-                z_max_mm=self._logical_z_max_mm(),
-            )
-            landmark = self._easy_home_landmark()
-            if self._easy_mode_active() and landmark is not None:
-                printer.move_xy(*landmark)
-            elif (
-                not self._easy_mode_active()
-                and self.ui.chkAllowSetupZ.isChecked()
-                and self._pcb_surface_z is not None
-            ):
-                try:
-                    self._drive_to_agreed_plane(printer, required=False)
-                except engine_height.HeightError as exc:
-                    note = str(exc)
-                except RuntimeError as exc:
-                    note = str(exc)
-            if self._easy_mode_active() and was_at_scan_plane:
-                printer.move_z(target)
-                reported = printer.get_xyz()[2]
-                if not engine_height.logical_position_matches(reported, target):
-                    raise RuntimeError("Home could not restore the measurement height")
-                self._last_commanded_scan_z = target
-        else:
-            printer.home_xy()
-        return printer.get_xy(), note
+                if result is not None:
+                    self._commit_board_zero(result)
+                    self._try_finish_easy_scan_height(printer)
+            elif kind == "teaching":
+                self._easy_reenable_z_if_unlocked(printer)
+                engine_printer.lift_then_home_xy(
+                    printer,
+                    lift_mm=self._safe_home_lift_mm(),
+                    z_max_mm=self._logical_z_max_mm(),
+                )
+            else:
+                printer.home_xy()
+        finally:
+            self._capture_printer_frame(printer)
+        return {
+            "kind": kind,
+            "position": printer.get_xy(),
+            "result": result,
+            "note": note,
+        }
 
     def _on_home_ok(self, payload):
-        position, note = payload
+        if isinstance(payload, tuple):
+            position, note = payload
+            kind = "rectangle"
+            result = None
+        else:
+            position = payload["position"]
+            note = payload.get("note")
+            kind = payload.get("kind") or self._home_kind()
+            result = payload.get("result")
         self._pcb_xy_homed = True
+        self._easy_height_lost_to_reset = False
+        if kind in ("teaching", "board_zero"):
+            self._fixture_xyz_homed = True
         self._bump_motion()
         self._clear_landmarks_and_alignment()
         self._show_position(position)
+        if kind == "board_zero" and result is not None:
+            self._commit_board_zero(result)
+            status = self._step2_status_text()
+            self.ui.posLabel.setText(status)
+            fixture_status = getattr(self.ui, "fixtureTeachStatus", None)
+            if fixture_status is not None:
+                fixture_status.setText(status)
+        elif kind == "teaching":
+            status = (
+                "Z lifted and X/Y homed. Jog the BLTouch over a reference mark, "
+                "select its row, then probe. Step 2 is not complete until board zero is set."
+            )
+            fixture_status = getattr(self.ui, "fixtureTeachStatus", None)
+            if fixture_status is not None:
+                fixture_status.setText(status)
         self._easy_try_load_profile()
         self._update_easy_status()
         self._refresh_height_ui()
+        self._update_nav()
         if note:
             QMessageBox.warning(self.ui, DIALOG_TITLE, note)
 
     def _on_home_failed(self, exc):
+        if self._is_printer_halt(exc):
+            self._handle_printer_halt(exc)
+            return
         if isinstance(exc, engine_printer.PrinterReset):
             self._easy_z_unlocked = False
             self._clear_height_datum()
+        self._clear_board_zero()
         self._clear_pcb_homing()
-        self.ui.posLabel.setText(f"Homing failed: {exc}")
+        message = f"Homing failed: {exc}"
+        self.ui.posLabel.setText(message)
+        fixture_status = getattr(self.ui, "fixtureTeachStatus", None)
+        if fixture_status is not None:
+            fixture_status.setText(message)
         QMessageBox.warning(self.ui, DIALOG_TITLE, str(exc))
 
     def _home_xy(self):
@@ -3030,9 +6015,13 @@ class EMIMapWizard(QtCore.QObject):
 
     def _show_position(self, position):
         self._machine_xy = (float(position[0]), float(position[1]))
+        self._machine_xy_at = time.monotonic()
         self.ui.posLabel.setText(
             f"Machine X {self._machine_xy[0]:.2f}  Y {self._machine_xy[1]:.2f} mm"
         )
+        widget = getattr(self, "_scan_preview_widget", None)
+        if widget is not None:
+            widget.set_reported_xy(self._machine_xy, stale=False)
 
     # ----------------------------------------------------------- registration
     def _on_reg_plot_clicked(self, event):
@@ -3319,6 +6308,7 @@ class EMIMapWizard(QtCore.QObject):
     def _refit_registration(self):
         self._invalidate_plan()
         self._registration = None
+        self._stl_board_placement = None
         self._fit_error = ""
         self._bump_registration()
         if len(self._landmarks) >= 2:
@@ -3502,20 +6492,27 @@ class EMIMapWizard(QtCore.QObject):
 
     def _registration_problems(self):
         """Every reason the current alignment may not drive a scan."""
-        if self._board_view is None:
-            return ["no board imported"]
-        if self._registration is None:
-            return ["fewer than two landmarks recorded"]
-        return (
-            engine_registration.registration_problems(
-                self._registration,
-                diagonal_mm=self._board_view.diagonal_mm,
-                step_mm=self.ui.stepMm.value(),
+        extra = []
+        side = self._scan_setup_side()
+        state = self._pocket_pair_state.get(side)
+        if state == "stale":
+            extra.append(
+                "saved pocket corners are from an older meaning; recapture A and B"
             )
-            # A loaded profile fits perfectly by construction, so the maths
-            # alone would open the gate before anyone looked at the board.
-            + self._verification_problems()
+        if self._pocket_block_reason:
+            extra.append(self._pocket_block_reason)
+        if self._board_view is None:
+            return extra + ["no board imported"]
+        if self._registration is None:
+            if extra:
+                return extra
+            return extra + ["fewer than two landmarks recorded"]
+        problems = engine_registration.registration_problems(
+            self._registration,
+            diagonal_mm=self._board_view.diagonal_mm,
+            step_mm=self.ui.stepMm.value(),
         )
+        return extra + problems + self._verification_problems()
 
     # ------------------------------------------------------------- profiles
     def _refresh_profiles(self):
@@ -3595,6 +6592,7 @@ class EMIMapWizard(QtCore.QObject):
 
         self._landmarks[:] = list(loaded.registration.points)
         self._registration = loaded.registration
+        self._stl_board_placement = None
         self._fit_error = ""
         self._invalidate_plan()
         self._bump_registration()
@@ -3877,24 +6875,75 @@ class EMIMapWizard(QtCore.QObject):
     def _open_serial(self, port, baud):
         import serial
 
-        return serial.Serial(port, baud, timeout=ENGINE_READ_TIMEOUT_S)
+        handle = serial.Serial(
+            port,
+            baud,
+            timeout=PRINTER_SERIAL_TIMEOUT_S,
+            write_timeout=2.0,
+            # Holding DTR/RTS asserted can keep an auto-reset mainboard in
+            # reset, which reads back as a silent port on a live CH340.
+            dsrdtr=False,
+            rtscts=False,
+        )
+        self._pulse_controller_reset(handle)
+        return handle
+
+    @staticmethod
+    def _pulse_controller_reset(handle):
+        """Release the reset lines and offer one boot pulse. No G-code is sent.
+
+        A CH340 enumerates from USB 5 V while the controller is halted or held
+        in reset, so the boot window can otherwise see nothing at all. Boards
+        without DTR/RTS auto-reset simply ignore this.
+        """
+        def _set(name, value):
+            try:
+                setattr(handle, name, value)
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+
+        _set("dtr", True)
+        _set("rts", True)
+        time.sleep(0.12)
+        _set("dtr", False)
+        _set("rts", False)
+        reset_input = getattr(handle, "reset_input_buffer", None)
+        if callable(reset_input):
+            try:
+                reset_input()
+            except (OSError, ValueError):
+                pass
 
     def _open_printer(self):
+        if self._printer_halted:
+            raise engine_printer.PrinterHalted(PRINTER_HALTED_TEXT)
         if self.printer_serial is not None and self.printer_serial.is_open:
             return self.printer_serial
         port = self._printer_port()
         if not port:
             raise RuntimeError("Choose the printer serial port first")
-        handle = self._open_serial(port, self.ui.printerBaud.value())
+        baud = self.ui.printerBaud.value()
+        handle = self._connect_printer(port, baud)
+        self.printer_serial = handle
+        # Reconnect is not a verified physical origin.
+        self._clear_height_datum()
+        return handle
+
+    def _connect_printer(self, port, baud):
+        """Open and identify one exact port/baud pair, closing it on refusal."""
+        try:
+            handle = self._open_serial(port, baud)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not open {port} at {baud} baud. Close Cura, Pronterface, "
+                "Arduino Serial Monitor, or any other program using the printer, "
+                f"then click RETRY PRINTER CONNECTION. Details: {exc}"
+            ) from None
         try:
             self._greet_marlin(handle, port)
         except Exception:
-            handle.close()
+            self._release_serial_handle(handle)
             raise
-        self.printer_serial = handle
-        # Opening the serial port pulses DTR on this Marlin controller. Its
-        # logical Z can no longer be tied safely to the previous PCB touch.
-        self._clear_height_datum()
         return handle
 
     def _greet_marlin(self, handle, port):
@@ -3903,15 +6952,30 @@ class EMIMapWizard(QtCore.QObject):
         A silent port is otherwise only discovered one 30 s ok timeout at a
         time, and the operator sees a wizard that appears to have hung.
         """
-        probe = engine_printer.Printer(handle, self._printer_config())
-        probe.drain(quiet_s=PRINTER_BOOT_S)
+        greet_marlin_handle(
+            handle, port, boot_s=PRINTER_BOOT_S, greet_s=PRINTER_GREET_S
+        )
+
+    @staticmethod
+    def _release_serial_handle(handle):
+        """Close without hanging the CH340 driver on a DTR edge."""
+        if handle is None:
+            return
+        for name in ("cancel_read", "cancel_write"):
+            cancel = getattr(handle, name, None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except (AttributeError, OSError, TypeError, ValueError):
+                    pass
         try:
-            probe.send("M115", timeout_s=PRINTER_GREET_S)
-        except engine_printer.PrinterTimeout:
-            raise RuntimeError(
-                f"{port} did not answer as a Marlin printer. Choose the port the "
-                f"Ender is on, and check nothing else already has it open."
-            ) from None
+            handle.timeout = 0.1
+            handle.write_timeout = 0.1
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+        closer = getattr(handle, "close", None)
+        if callable(closer):
+            closer()
 
     def _start_printer_job(self, work, on_ok, on_fail, status_label, busy_text):
         """Run Marlin I/O off the GUI thread so the dialog cannot go 'Not Responding'."""
@@ -4020,7 +7084,7 @@ class EMIMapWizard(QtCore.QObject):
                 return RF_CHAIN_CONFIRM_HINT
             return ""
         try:
-            self._pcb_preflight()
+            self._pcb_preflight(live_height_check=False)
         except (ValueError, RuntimeError) as exc:
             return str(exc)
         if self._cube_selected() and not self._rf_confirmed():
@@ -4033,6 +7097,11 @@ class EMIMapWizard(QtCore.QObject):
         reason = "" if scanning else self._scan_block_reason()
         self.ui.btnStartScan.setEnabled(not scanning and not reason)
         self.ui.btnStartScan.setToolTip(reason or "Start the scan.")
+        start_reason = getattr(self.ui, "scanStartReason", None)
+        if start_reason is not None and callable(getattr(start_reason, "setText", None)):
+            start_reason.setText("" if scanning else reason)
+            if callable(getattr(start_reason, "setVisible", None)):
+                start_reason.setVisible(not scanning and bool(reason))
         self.ui.btnAbortScan.setEnabled(scanning)
         if scanning:
             return
@@ -4067,14 +7136,27 @@ class EMIMapWizard(QtCore.QObject):
         ):
             raise RuntimeError(RF_CHAIN_CONFIRM_HINT)
 
-    def _pcb_preflight(self):
+    def _pcb_preflight(self, *, live_height_check=True):
         if self._board_view is None:
             raise RuntimeError("Import an ODB++ board first.")
+        if not self._fixture_scan_ready():
+            raise RuntimeError(
+                "Glassboard fixture teaching/verification is BLOCKED. Teach or verify "
+                "P1 in this machine session before scanning."
+            )
         self._assert_scan_selection_ready()
         if not self._pcb_xy_homed:
             raise RuntimeError(
                 "Home X and Y before a PCB-aligned scan: the landmarks are "
                 "machine positions and only homing fixes that frame."
+            )
+        if (
+            (self._stl_board_placement is not None or self._taught_pocket_placement is not None)
+            and not self.ui.chkBoardSeated.isChecked()
+        ):
+            raise RuntimeError(
+                "Confirm that the PCB is inserted in the selected fixture holder "
+                "and fully seated before scanning."
             )
         problems = self._registration_problems()
         if problems:
@@ -4085,14 +7167,24 @@ class EMIMapWizard(QtCore.QObject):
             raise RuntimeError(
                 "Confirm the probe height and the full PCB travel area are clear."
             )
-        self._ensure_at_agreed_scan_plane()
-        try:
-            engine_height.apply_scan_height_preflight(
-                self._height_snapshot(self._reported_z()),
-                self._scan_height_plan(),
-            )
-        except engine_height.HeightError as exc:
-            raise RuntimeError(str(exc)) from exc
+        if self._easy_mode_active():
+            reason = self._easy_height_block_reason()
+            if reason:
+                raise RuntimeError(reason)
+        if live_height_check:
+            self._ensure_at_agreed_scan_plane()
+        if self._easy_mode_active() and self._glassboard_fixture_selected():
+            fingerprint = self._current_scan_fingerprint()
+            if not fingerprint or fingerprint != self._approved_scan_fingerprint:
+                raise RuntimeError("Approve the scan plan on Step 4 before START.")
+        if live_height_check and not self._easy_mode_active():
+            try:
+                engine_height.apply_scan_height_preflight(
+                    self._height_snapshot(self._reported_z()),
+                    self._scan_height_plan(),
+                )
+            except engine_height.HeightError as exc:
+                raise RuntimeError(str(exc)) from exc
 
     def _build_validated_plan(self, config):
         """Freeze the grid from current state and prevalidate every machine point.
@@ -4145,9 +7237,20 @@ class EMIMapWizard(QtCore.QObject):
         """
         if self._mode() != MODE_PCB or self._registration is None:
             return None
+        if self._stl_board_placement is not None:
+            machine_fixture = self._machine_fixture_document()
+            return {
+                "registration_source": "glassboard_stl_middle_holder",
+                "placement": dict(self._stl_board_placement),
+                "board_fully_seated_confirmed": self.ui.chkBoardSeated.isChecked(),
+                "machine_fixture_name": self._fixture_profile_name(),
+                "machine_fixture_verified_this_session": self._fixture_verified_session,
+                "machine_fixture_document": machine_fixture,
+            }
         if self._profile is None:
             return {"registration_source": "manual_landmarks"}
         dx, dy = self._offset_correction_mm
+        machine_fixture = self._machine_fixture_document()
         return {
             "registration_source": "fixture_profile",
             "fixture_profile": self._profile.name,
@@ -4162,6 +7265,9 @@ class EMIMapWizard(QtCore.QObject):
             # Embedded, so the snapshot is self-contained even if the profile
             # on disk is later overwritten or deleted.
             "profile_document": self._profile.document,
+            "machine_fixture_name": self._fixture_profile_name(),
+            "machine_fixture_verified_this_session": self._fixture_verified_session,
+            "machine_fixture_document": machine_fixture,
         }
 
     def _write_profile_copy(self, output_dir):
@@ -4171,14 +7277,19 @@ class EMIMapWizard(QtCore.QObject):
         necessarily what was loaded: a save between loading and scanning would
         silently document the wrong alignment.
         """
-        if self._profile is None:
-            return
         try:
-            target = Path(output_dir) / "fixture_profile.json"
-            target.write_text(
-                json.dumps(self._profile.document, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
+            if self._profile is not None:
+                target = Path(output_dir) / "fixture_profile.json"
+                target.write_text(
+                    json.dumps(self._profile.document, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            machine_fixture = self._machine_fixture_document()
+            if machine_fixture is not None:
+                (Path(output_dir) / "machine_fixture.json").write_text(
+                    json.dumps(machine_fixture, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
         except OSError as exc:
             logging.info(f"EMI map could not write the profile copy: {exc}")
 
@@ -4228,6 +7339,7 @@ class EMIMapWizard(QtCore.QObject):
             self.thread.started.connect(self.worker.run)
             self.worker.status.connect(self.ui.scanStatus.setText)
             self.worker.point.connect(self._on_point)
+            self.worker.cell_begin.connect(self._on_cell_begin)
             self.worker.row.connect(self._on_row)
             self.worker.spectrum.connect(self._on_spectrum)
             self.worker.prompt.connect(self._on_prompt)
@@ -4250,25 +7362,124 @@ class EMIMapWizard(QtCore.QObject):
 
     def _prepare_live_plot(self, config, plan=None):
         area = config.area
-        self._grid = np.full((area.ny, area.nx), np.nan)
+        shape = (area.ny, area.nx)
+        self._live_background_grid = np.full(shape, np.nan)
+        self._live_dut_grid = np.full(shape, np.nan)
+        self._live_delta_grid = np.full(shape, np.nan)
+        self._live_background_spectra = {}
+        self._live_background_kind = str(getattr(config, "background_kind", "xy_grid") or "xy_grid")
+        self._live_stationary_background_dbm = np.nan
+        self._live_last_pass = ""
+        self._clear_live_cell_labels()
+
+        # Background runs start by showing the measured DUT-OFF map.  The first
+        # ON cell that has a matching OFF cell switches the display to delta dB.
+        self._grid = self._live_background_grid if config.background else self._live_dut_grid
+        self._live_units = "dBm"
+        if config.background and self._live_background_kind == "stationary":
+            self._live_map_caption = "DUT OFF / stationary reference"
+        elif config.background:
+            self._live_map_caption = "DUT OFF / ambient"
+        else:
+            self._live_map_caption = "DUT ON"
+
         # Levels are mandatory for a float image: without them pyqtgraph raises
         # inside Qt's paint callback, and a raising paint repeats until the
         # process dies. The empty grid renders nothing, so any range will do
         # until the first reading replaces it.
-        self.image.setImage(self._grid.T, autoLevels=False, levels=PLACEHOLDER_LEVELS)
-        # Board-view millimetres do not start at zero, so the image rect and the
-        # ranges follow the area's origin rather than assuming it.
         origin_x, origin_y = area.origin_x_mm, area.origin_y_mm
-        self.image.setRect(
-            QtCore.QRectF(origin_x, origin_y, area.width_mm, area.height_mm)
-        )
+        image = getattr(self, "image", None)
+        if image is not None and callable(getattr(image, "setImage", None)):
+            image.setImage(self._grid.T, autoLevels=False, levels=PLACEHOLDER_LEVELS)
+            # Board-view millimetres do not start at zero, so the image rect and the
+            # ranges follow the area's origin rather than assuming it.
+            image.setRect(
+                QtCore.QRectF(origin_x, origin_y, area.width_mm, area.height_mm)
+            )
         self.ui.emiPlot.setXRange(origin_x, origin_x + max(area.width_mm, area.step_mm))
         self.ui.emiPlot.setYRange(origin_y, origin_y + max(area.height_mm, area.step_mm))
         board = plan is not None
         self.ui.emiPlot.setLabel("bottom", "Board X (mm)" if board else "X (mm from origin)")
         self.ui.emiPlot.setLabel("left", "Board Y (mm)" if board else "Y (mm from origin)")
+        self.ui.emiPlot.setTitle(f"Live map — {self._live_map_caption}")
         if board:
             self._draw_board_under_map(plan.board_view)
+
+    @staticmethod
+    def _pass_kind(info):
+        """Normalise scanner callback names without coupling Qt to scanner internals."""
+        text = str(info.get("pass", info.get("phase", ""))).strip().lower()
+        if text in ("background", "ambient", "dut off", "off") or "dut off" in text:
+            return "background"
+        if text in ("dut", "dut on", "on") or (
+            text.startswith("dut") and "off" not in text
+        ):
+            return "dut"
+        label = str(info.get("label", "")).strip().lower()
+        if label in ("hold", "preflight"):
+            return "background"
+        return text
+
+    def _store_live_background_spectrum(self, power, key=None):
+        """Keep a running per-bin max so live subtraction matches software max-hold."""
+        held = np.asarray(power, dtype=float).copy()
+        if self._live_background_kind == "stationary":
+            existing = self._live_background_spectra.get("stationary")
+            if existing is not None and existing.shape == held.shape:
+                held = np.maximum(existing, held)
+            self._live_background_spectra["stationary"] = held
+            finite = held[np.isfinite(held)]
+            if finite.size:
+                self._live_stationary_background_dbm = float(finite.max())
+            return
+        if key is None:
+            return
+        existing = self._live_background_spectra.get(key)
+        if existing is not None and existing.shape == held.shape:
+            held = np.maximum(existing, held)
+        self._live_background_spectra[key] = held
+
+    def _clear_live_cell_labels(self):
+        plot = getattr(self.ui, "emiPlot", None)
+        for item in getattr(self, "_live_label_items", {}).values():
+            try:
+                plot.removeItem(item)
+            except Exception:
+                pass
+        self._live_label_items = {}
+
+    def _update_live_cell_label(self, iy, ix):
+        """Put the actual measured/calculated number in the centre of one cell."""
+        if self._grid is None or not np.isfinite(self._grid[iy, ix]):
+            return
+        try:
+            import pyqtgraph
+
+            # Mapping through ImageItem itself guarantees the text stays centred
+            # even if the image rect is not exactly nx*step by ny*step.
+            point = self.image.mapToParent(QtCore.QPointF(ix + 0.5, iy + 0.5))
+            value = float(self._grid[iy, ix])
+            text = f"{value:+.1f}" if self._live_units == "dB" else f"{value:.1f}"
+            key = (int(iy), int(ix))
+            item = self._live_label_items.get(key)
+            if item is None:
+                item = pyqtgraph.TextItem(
+                    text=text,
+                    anchor=(0.5, 0.5),
+                    color="w",
+                    fill=pyqtgraph.mkBrush(0, 0, 0, 125),
+                    border=pyqtgraph.mkPen(255, 255, 255, 70),
+                )
+                item.setZValue(10)
+                self.ui.emiPlot.addItem(item)
+                self._live_label_items[key] = item
+            else:
+                item.setText(text)
+            item.setPos(point.x(), point.y())
+        except Exception:
+            # Labels are presentation-only.  A plotting-version mismatch must
+            # never stop or invalidate a measurement.
+            return
 
     def _draw_board_under_map(self, view):
         """Trace the outline under the live map so a hotspot is locatable at a glance."""
@@ -4284,6 +7495,7 @@ class EMIMapWizard(QtCore.QObject):
         self._board_trace = pyqtgraph.PlotCurveItem(
             xs, ys, connect=connect, pen=pyqtgraph.mkPen("k", width=2)
         )
+        self._board_trace.setZValue(20)
         self.ui.emiPlot.addItem(self._board_trace)
 
     def _set_scanning(self, scanning):
@@ -4295,10 +7507,71 @@ class EMIMapWizard(QtCore.QObject):
     def _on_point(self, info):
         self._done += 1
         self.ui.scanProgress.setValue(self._done)
-        if self._grid is not None:
-            self._grid[info["iy"], info["ix"]] = info["power_dbm"]
+        widget = getattr(self, "_scan_preview_widget", None)
+        if widget is not None:
+            widget.mark_completed(
+                (float(info.get("machine_x_mm", 0.0)), float(info.get("machine_y_mm", 0.0)))
+            )
+
+        iy, ix = int(info["iy"]), int(info["ix"])
+        value = float(info["power_dbm"])
+        pass_kind = self._pass_kind(info)
+
+        if pass_kind == "background" and self._live_background_grid is not None:
+            self._live_background_grid[iy, ix] = value
+            if self._live_background_kind == "stationary":
+                # A stationary reference is one DUT-OFF level reused for the ON
+                # map.  Keep it separate so the caption never implies an XY OFF scan.
+                self._live_stationary_background_dbm = value
+            if self._live_last_pass != "background":
+                self._grid = self._live_background_grid
+                self._live_units = "dBm"
+                self._live_map_caption = (
+                    "DUT OFF / stationary reference"
+                    if self._live_background_kind == "stationary"
+                    else "DUT OFF / ambient"
+                )
+                self._clear_live_cell_labels()
+            self._live_last_pass = "background"
+
+        elif pass_kind == "dut" and self._live_dut_grid is not None:
+            self._live_dut_grid[iy, ix] = value
+            if self._live_background_kind == "stationary":
+                background = self._live_stationary_background_dbm
+                caption = "DUT ON − stationary DUT-OFF reference"
+                state = "dut_stationary_delta"
+            else:
+                background = (
+                    self._live_background_grid[iy, ix]
+                    if self._live_background_grid is not None
+                    else np.nan
+                )
+                caption = "DUT ON − DUT OFF"
+                state = "dut_delta"
+            if np.isfinite(background):
+                self._live_delta_grid[iy, ix] = value - float(background)
+                if self._live_last_pass != state:
+                    self._grid = self._live_delta_grid
+                    self._live_units = "dB"
+                    self._live_map_caption = caption
+                    self._clear_live_cell_labels()
+                self._live_last_pass = state
+            else:
+                self._grid = self._live_dut_grid
+                self._live_units = "dBm"
+                self._live_map_caption = "DUT ON (background not available yet)"
+                self._live_last_pass = "dut_raw"
+        else:
+            # Backwards-compatible path for scanners that do not name the pass.
+            if self._live_dut_grid is not None:
+                self._live_dut_grid[iy, ix] = value
+                self._grid = self._live_dut_grid
+            self._live_units = "dBm"
+            self._live_map_caption = "Measured level"
+
+        self._update_live_cell_label(iy, ix)
+
         measured = info.get("measured_cell_s")
-        remaining = None
         if measured and self.ui.scanProgress.maximum():
             remaining = max(self.ui.scanProgress.maximum() - self._done, 0) * float(measured)
             minutes = remaining / 60.0
@@ -4318,16 +7591,66 @@ class EMIMapWizard(QtCore.QObject):
         )
 
     def _on_spectrum(self, info):
-        """Draw the latest USB scanraw. The TinySA LCD does not animate."""
+        """Draw the newest spectrum; show ON-OFF dB immediately when possible."""
         self._live_spectrum = info
-        curve = getattr(self, "_live_spectrum_curve", None)
-        if curve is None:
-            return
         freqs = np.asarray(info.get("freqs"), dtype=float)
         power = np.asarray(info.get("power_dbm"), dtype=float)
         if freqs.size < 2 or power.shape != freqs.shape:
             return
-        curve.setData(freqs / 1e6, power)
+
+        pass_kind = self._pass_kind(info)
+        if pass_kind not in ("background", "dut"):
+            label = str(info.get("label", "")).strip().lower()
+            if label == "cell":
+                if self._live_background_kind == "stationary":
+                    pass_kind = "dut"
+                elif self._live_last_pass == "background":
+                    pass_kind = "background"
+                elif str(self._live_last_pass).startswith("dut"):
+                    pass_kind = "dut"
+        iy, ix = info.get("iy"), info.get("ix")
+        key = None
+        if iy is not None and ix is not None:
+            key = (int(iy), int(ix))
+
+        shown = power
+        units = "dBm"
+        title = "Live spectrum"
+        if pass_kind == "background":
+            self._store_live_background_spectrum(power, key)
+            title = (
+                "Live spectrum — DUT OFF / stationary reference"
+                if self._live_background_kind == "stationary"
+                else "Live spectrum — DUT OFF"
+            )
+        elif pass_kind == "dut":
+            if self._live_background_kind == "stationary":
+                reference = self._live_background_spectra.get("stationary")
+                delta_title = "Live spectrum — DUT ON − stationary DUT-OFF reference"
+            else:
+                reference = (
+                    self._live_background_spectra.get(key) if key is not None else None
+                )
+                delta_title = "Live spectrum — DUT ON − DUT OFF"
+            if reference is not None and reference.shape == power.shape:
+                shown = power - reference
+                units = "dB"
+                title = delta_title
+            else:
+                title = "Live spectrum — DUT ON"
+
+        curve = getattr(self, "_live_spectrum_curve", None)
+        if curve is None:
+            return
+        curve.setData(freqs / 1e6, shown)
+        live = getattr(self.ui, "liveSpectrum", None)
+        if live is not None:
+            if callable(getattr(live, "setLabel", None)):
+                live.setLabel("left", "Difference (dB)" if units == "dB" else "Power (dBm)")
+            if callable(getattr(live, "setTitle", None)):
+                live.setTitle(title)
+            if callable(getattr(live, "enableAutoRange", None)):
+                live.enableAutoRange(axis="y", enable=True)
 
     def _refresh_image(self):
         self._pending_updates = 0
@@ -4339,7 +7662,22 @@ class EMIMapWizard(QtCore.QObject):
         low, high = float(finite.min()), float(finite.max())
         if high - low < 1e-9:  # one distinct reading so far: give it a width
             low, high = low - 0.5, high + 0.5
-        self.image.setImage(self._grid.T, autoLevels=False, levels=(low, high))
+        image = getattr(self, "image", None)
+        if image is not None and callable(getattr(image, "setImage", None)):
+            image.setImage(self._grid.T, autoLevels=False, levels=(low, high))
+        self.ui.emiPlot.setTitle(
+            f"Live map — {self._live_map_caption}   "
+            f"[{low:+.1f} to {high:+.1f} {self._live_units}]"
+        )
+        bar = getattr(self, "_live_colorbar", None)
+        if bar is not None:
+            try:
+                bar.setLevels((low, high))
+                axis = getattr(bar, "axis", None)
+                if axis is not None and callable(getattr(axis, "setLabel", None)):
+                    axis.setLabel(f"Level ({self._live_units})")
+            except Exception:
+                pass
 
     def _on_prompt(self, message=""):
         self.ui.btnContinueDut.setEnabled(True)
@@ -4396,6 +7734,20 @@ class EMIMapWizard(QtCore.QObject):
         slider.setValue(min(slider.value(), max(n_freq - 1, 0)))
         self._refresh_cube_view()
 
+    def _cube_map_kind_value(self):
+        combo = getattr(self.ui, "cubeMapKind", None)
+        if combo is None:
+            return "band_max"
+        data = combo.currentData() if callable(getattr(combo, "currentData", None)) else None
+        return str(data) if data not in (None, "") else str(combo.currentText())
+
+    def _cube_quantity_value(self):
+        combo = getattr(self.ui, "cubeQuantity", None)
+        if combo is None:
+            return "raw_dbm"
+        data = combo.currentData() if callable(getattr(combo, "currentData", None)) else None
+        return str(data) if data not in (None, "") else str(combo.currentText())
+
     def _refresh_cube_view(self, *_args):
         if self._cube_data is None:
             return
@@ -4407,41 +7759,72 @@ class EMIMapWizard(QtCore.QObject):
         )
 
         freqs = np.asarray(self._cube_data["freqs"], dtype=float)
-        cube = np.asarray(self._cube_data["dut"], dtype=float)
-        kind = self.ui.cubeMapKind.currentText()
-        if kind == "dB_above_stationary_reference":
-            reference = self._cube_data.get("background_reference")
-            if reference is None:
-                values = np.full(cube.shape[:2], np.nan)
-                self._show_array_on_results(values)
-                self.ui.cubeFreqLabel.setText("dB above stationary reference (none saved)")
-                return
-            from EMI_Mapper.processing import db_above_stationary_reference
+        dut_cube = np.asarray(self._cube_data["dut"], dtype=float)
+        cube = dut_cube
+        kind = self._cube_map_kind_value()
+        units = "dBm"
+        title = "DUT ON"
+        reference_note = ""
 
-            cube = db_above_stationary_reference(cube, reference)
+        if kind in ("dut_on_minus_dut_off", "dB_above_stationary_reference"):
+            # Prefer a true XY DUT-OFF cube when the storage format provides it.
+            # Falling back to a stationary reference is scientifically different,
+            # so that fact is kept visible in both the map title and frequency label.
+            background_cube = self._cube_data.get("background")
+            if background_cube is None:
+                background_cube = self._cube_data.get("background_cube")
+            if background_cube is not None:
+                background_cube = np.asarray(background_cube, dtype=float)
+                if background_cube.shape == dut_cube.shape:
+                    cube = dut_cube - background_cube
+                    units = "dB"
+                    title = "DUT ON − DUT OFF"
+                else:
+                    cube = np.full_like(dut_cube, np.nan)
+                    units = "dB"
+                    title = "DUT ON − DUT OFF (background shape mismatch)"
+            else:
+                reference = self._cube_data.get("background_reference")
+                if reference is None:
+                    cube = np.full_like(dut_cube, np.nan)
+                    units = "dB"
+                    title = "DUT ON − DUT OFF (no background saved)"
+                else:
+                    from EMI_Mapper.processing import db_above_stationary_reference
+
+                    cube = db_above_stationary_reference(dut_cube, reference)
+                    units = "dB"
+                    title = "DUT ON − stationary DUT-OFF reference"
+                    reference_note = "stationary reference, not a per-cell OFF scan"
+
         quantity = getattr(self.ui, "cubeQuantity", None)
         if (
             quantity is not None
-            and quantity.currentText() == "characterized"
+            and self._cube_quantity_value() == "characterized"
             and self.result is not None
+            and kind not in ("dut_on_minus_dut_off", "dB_above_stationary_reference")
         ):
             characterized = Path(self.result.output_dir) / "characterized.npz"
             if characterized.exists():
                 with np.load(characterized) as data:
                     cube = np.asarray(data["characterized_spectrum"], dtype=float)
+                characterized_meta = getattr(self.result, "characterization", None) or {}
+                units = characterized_meta.get("output_units") or "characterized"
+                title = "Characterized field"
+
         completed = np.asarray(
-            self._cube_data.get("dut_completed", np.isfinite(cube).any(axis=-1))
+            self._cube_data.get("dut_completed", np.isfinite(dut_cube).any(axis=-1))
         )
         slider = self.ui.cubeFreqSlider
         index = int(slider.value()) if freqs.size else 0
         center = float(freqs[index]) if freqs.size else 0.0
         bandwidth = float(self.ui.cubeBandwidthMhz.value()) * 1e6
-        kind = self.ui.cubeMapKind.currentText()
         start = center - bandwidth / 2.0
         stop = center + bandwidth / 2.0
+
         if bandwidth <= 0 or kind == "single_frequency":
             values, actual = single_frequency_map(cube, freqs, center)
-            self.ui.cubeFreqLabel.setText(f"{actual / 1e6:.3f} MHz")
+            freq_text = f"{actual / 1e6:.3f} MHz"
         else:
             try:
                 if kind == "sum_of_measured_bin_powers":
@@ -4450,13 +7833,13 @@ class EMIMapWizard(QtCore.QObject):
                     values = band_max_map(cube, freqs, start, stop)
             except EmptyBand:
                 values = np.full(cube.shape[:2], np.nan)
-            self.ui.cubeFreqLabel.setText(f"{center / 1e6:.3f} MHz")
-        if self.ui.cubeMapKind.currentText() == "dB_above_stationary_reference":
-            self.ui.cubeFreqLabel.setText(
-                f"{self.ui.cubeFreqLabel.text()} — dB above stationary reference, not DUT-only"
-            )
+            freq_text = f"{center / 1e6:.3f} MHz"
+
+        if reference_note:
+            freq_text += f" — {reference_note}"
+        self.ui.cubeFreqLabel.setText(freq_text)
         values = np.where(completed, values, np.nan)
-        self._show_array_on_results(values)
+        self._show_array_on_results(values, units=units, title=title)
         self._update_cube_spectrum_label()
 
     def cube_pick_cell(self, iy, ix):
@@ -4477,12 +7860,28 @@ class EMIMapWizard(QtCore.QObject):
             self._cube_picks.append(pick)
             self._cube_picks = self._cube_picks[-2:]
         self._update_cube_spectrum_label()
+        self._fit_results_image()
         return list(self._cube_picks)
 
     def cube_cell_spectrum(self, iy, ix):
         if self._cube_data is None:
             return None
-        return np.asarray(self._cube_data["dut"][iy, ix], dtype=float)
+        spectrum = np.asarray(self._cube_data["dut"][iy, ix], dtype=float)
+        kind = self._cube_map_kind_value()
+        if kind in ("dut_on_minus_dut_off", "dB_above_stationary_reference"):
+            background = self._cube_data.get("background")
+            if background is None:
+                background = self._cube_data.get("background_cube")
+            if background is not None:
+                background = np.asarray(background, dtype=float)
+                if background.shape == np.asarray(self._cube_data["dut"]).shape:
+                    return spectrum - background[iy, ix]
+            reference = self._cube_data.get("background_reference")
+            if reference is not None:
+                reference = np.asarray(reference, dtype=float)
+                if reference.shape == spectrum.shape:
+                    return spectrum - reference
+        return spectrum
 
     def _update_cube_spectrum_label(self):
         label = getattr(self.ui, "cubeSpectrumLabel", None)
@@ -4490,8 +7889,13 @@ class EMIMapWizard(QtCore.QObject):
             return
         freqs = np.asarray(self._cube_data["freqs"], dtype=float)
         if not self._cube_picks:
-            label.setText("Click a completed cell for its measured spectrum")
+            label.setText("Hover for a value; click up to two completed cells to compare spectra")
             return
+        delta_view = self._cube_map_kind_value() in (
+            "dut_on_minus_dut_off",
+            "dB_above_stationary_reference",
+        )
+        units = "dB" if delta_view else "dBm"
         parts = []
         for iy, ix in self._cube_picks:
             spectrum = self.cube_cell_spectrum(iy, ix)
@@ -4499,7 +7903,8 @@ class EMIMapWizard(QtCore.QObject):
                 continue
             peak_i = int(np.nanargmax(spectrum))
             parts.append(
-                f"({ix},{iy}) peak {spectrum[peak_i]:.1f} dBm at {freqs[peak_i] / 1e6:.3f} MHz"
+                f"({ix},{iy}) peak {spectrum[peak_i]:+.1f} {units} at "
+                f"{freqs[peak_i] / 1e6:.3f} MHz"
             )
         if len(parts) == 2:
             parts.append("Proximity to CAD is a source candidate, not a confirmed source.")
@@ -4612,30 +8017,74 @@ class EMIMapWizard(QtCore.QObject):
             "Remaining time is measured after the first complete cell."
         )
 
-    def _show_array_on_results(self, values):
+    @staticmethod
+    def _inferno_rgb(t):
+        """Small dependency-free inferno approximation shared by Qt cell drawing."""
+        stops = (
+            (0, 0, 4),
+            (40, 11, 84),
+            (101, 21, 110),
+            (159, 42, 99),
+            (212, 72, 66),
+            (245, 125, 21),
+            (250, 193, 39),
+            (252, 255, 164),
+        )
+        t = min(1.0, max(0.0, float(t)))
+        p = t * (len(stops) - 1)
+        i = min(len(stops) - 2, int(p))
+        f = p - i
+        a, b = stops[i], stops[i + 1]
+        return tuple(int(round(a[k] + (b[k] - a[k]) * f)) for k in range(3))
+
+    def _show_array_on_results(self, values, *, units=None, title=None):
+        """Show a crisp, annotated measurement grid instead of a blurred bitmap."""
         values = np.asarray(values, dtype=float)
-        finite = values[np.isfinite(values)]
-        if finite.size == 0:
-            return
-        lo, hi = float(finite.min()), float(finite.max())
-        if hi - lo < 1e-9:
-            hi = lo + 1.0
-        norm = (np.clip(values, lo, hi) - lo) / (hi - lo)
-        norm = np.where(np.isfinite(values), norm, 0.0)
-        rgb = np.zeros(values.shape + (3,), dtype=np.uint8)
-        rgb[..., 0] = np.clip(255 * np.power(norm, 0.5), 0, 255)
-        rgb[..., 1] = np.clip(80 * norm, 0, 255)
-        rgb[..., 2] = np.clip(180 * (1.0 - norm), 0, 255)
-        rgb[~np.isfinite(values)] = 240
-        flipped = np.ascontiguousarray(np.flipud(rgb))
-        height, width, _ = flipped.shape
-        image = QtGui.QImage(flipped.data, width, height, 3 * width, QtGui.QImage.Format_RGB888)
-        self._results_pixmap = QtGui.QPixmap.fromImage(image.copy())
+        self._results_values = values.copy()
+        if units:
+            self._results_units = str(units)
+        if title:
+            self._results_title = str(title)
         self._fit_results_image()
 
+    def _analyzer_html_path(self, result=None):
+        """Absolute EMI_Analyzer.html for this result, from the files map or disk."""
+        result = self.result if result is None else result
+        if result is None:
+            return None
+        files = getattr(result, "files", None) or {}
+        recorded = files.get("analyzer_html")
+        if recorded:
+            recorded_path = Path(str(recorded))
+            if recorded_path.is_file():
+                return recorded_path
+        output_dir = getattr(result, "output_dir", None)
+        if output_dir:
+            candidate = Path(output_dir) / "EMI_Analyzer.html"
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _sync_results_open_buttons(self, result=None):
+        """Enable Open scan folder / Open EMI Analyzer whenever a scan folder exists."""
+        result = self.result if result is None else result
+        output_dir = getattr(result, "output_dir", None) if result is not None else None
+        has_folder = bool(output_dir)
+        html = self._analyzer_html_path(result)
+        folder = getattr(self.ui, "btnOpenFolder", None)
+        overlay = getattr(self.ui, "btnOpenOverlay", None)
+        if folder is not None:
+            folder.setEnabled(has_folder)
+        if overlay is not None:
+            overlay.setEnabled(has_folder)
+            overlay.setToolTip(
+                ""
+                if html
+                else "Not built during the scan. Click to build it from this scan folder."
+            )
+
     def _show_board_artifacts(self, result):
-        overlay_html = result.files.get("board_html")
-        self.ui.btnOpenOverlay.setEnabled(bool(overlay_html))
+        self._sync_results_open_buttons(result)
         image_path = (
             result.files.get("board_png")
             or result.files.get("heatmap_png")
@@ -4646,62 +8095,264 @@ class EMIMapWizard(QtCore.QObject):
             self.ui.boardImage.clear()
             return
         self._results_pixmap = QtGui.QPixmap(str(image_path))
+        self._results_values = None
         self._fit_results_image()
 
     def _fit_results_image(self):
-        """Scale the heatmap to the label as it is now, not as it was at write time.
-
-        setPixmap(scaled(label.size())) during _on_succeeded runs before the
-        Results page is shown, when the label is still a few dozen pixels. That
-        is why the overview used to show a stamp-sized plot in a sea of grey.
-        """
-        pixmap = self._results_pixmap
+        """Render results at widget resolution with hard cell edges and dB labels."""
         label = getattr(self.ui, "boardImage", None)
-        if pixmap is None or label is None or not hasattr(label, "setPixmap"):
+        if label is None or not hasattr(label, "setPixmap"):
             return
         size = label.size() if hasattr(label, "size") else None
-        if size is None or not hasattr(size, "width") or size.width() < 32 or size.height() < 32:
-            label.setPixmap(pixmap)
+        if size is None or not hasattr(size, "width") or size.width() < 64 or size.height() < 64:
+            if self._results_values is None and self._results_pixmap is not None:
+                label.setPixmap(self._results_pixmap)
             return
-        label.setPixmap(
-            pixmap.scaled(
-                size,
-                QtCore.Qt.KeepAspectRatio,
-                QtCore.Qt.SmoothTransformation,
+
+        # Non-cube/static artifact fallback: if there is no numerical grid yet,
+        # at least preserve hard pixels rather than Qt's photo-style smoothing.
+        if self._results_values is None:
+            pixmap = self._results_pixmap
+            if pixmap is None:
+                return
+            label.setPixmap(
+                pixmap.scaled(size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.FastTransformation)
             )
+            return
+
+        values = np.asarray(self._results_values, dtype=float)
+        if values.ndim != 2:
+            return
+        ny, nx = values.shape
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            label.clear()
+            return
+        lo, hi = float(finite.min()), float(finite.max())
+        if hi - lo < 1e-9:
+            lo, hi = lo - 0.5, hi + 0.5
+
+        width, height = int(size.width()), int(size.height())
+        pixmap = QtGui.QPixmap(width, height)
+        pixmap.fill(QtGui.QColor("#f7f8fa"))
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+
+        left_margin, top_margin, bottom_margin, right_margin = 58, 30, 42, 112
+        available = QtCore.QRectF(
+            left_margin,
+            top_margin,
+            max(1, width - left_margin - right_margin),
+            max(1, height - top_margin - bottom_margin),
         )
+        grid_aspect = nx / max(ny, 1)
+        if available.width() / max(available.height(), 1.0) > grid_aspect:
+            map_h = available.height()
+            map_w = map_h * grid_aspect
+            map_x = available.x() + (available.width() - map_w) / 2.0
+            map_y = available.y()
+        else:
+            map_w = available.width()
+            map_h = map_w / max(grid_aspect, 1e-9)
+            map_x = available.x()
+            map_y = available.y() + (available.height() - map_h) / 2.0
+        map_rect = QtCore.QRectF(map_x, map_y, map_w, map_h)
+        self._results_map_rect = map_rect
+        cw, ch = map_rect.width() / nx, map_rect.height() / ny
+
+        # Draw every measured cell exactly once.  No interpolation: each rectangle
+        # is one physical probe location.  A subtle grid makes the sampling pitch visible.
+        grid_pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 105))
+        grid_pen.setWidthF(0.8)
+        painter.setPen(grid_pen)
+        draw_numbers = cw >= 23 and ch >= 17
+        font = QtGui.QFont(label.font())
+        font.setPointSizeF(max(6.0, min(9.0, min(cw, ch) * 0.28)))
+        font.setBold(True)
+        painter.setFont(font)
+
+        for iy in range(ny):
+            display_row = ny - 1 - iy
+            for ix in range(nx):
+                value = values[iy, ix]
+                rect = QtCore.QRectF(
+                    map_rect.left() + ix * cw,
+                    map_rect.top() + display_row * ch,
+                    cw,
+                    ch,
+                )
+                if not np.isfinite(value):
+                    painter.fillRect(rect, QtGui.QColor(238, 240, 243))
+                    painter.drawRect(rect)
+                    continue
+                t = (float(value) - lo) / (hi - lo)
+                rgb = self._inferno_rgb(t)
+                colour = QtGui.QColor(*rgb)
+                painter.fillRect(rect, colour)
+                painter.drawRect(rect)
+                if draw_numbers:
+                    # Luminance-based contrast keeps the small cell value readable
+                    # across the complete inferno scale.
+                    lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+                    painter.setPen(QtGui.QColor("#111111") if lum > 155 else QtGui.QColor("#ffffff"))
+                    text = (
+                        f"{float(value):+.1f}"
+                        if self._results_units == "dB"
+                        else f"{float(value):.1f}"
+                    )
+                    painter.drawText(rect, QtCore.Qt.AlignCenter, text)
+                    painter.setPen(grid_pen)
+
+        # Highlight up to two clicked cells; their spectra are compared below.
+        pick_pen = QtGui.QPen(QtGui.QColor("#00d4ff"))
+        pick_pen.setWidth(3)
+        painter.setPen(pick_pen)
+        for iy, ix in getattr(self, "_cube_picks", []):
+            if 0 <= iy < ny and 0 <= ix < nx:
+                display_row = ny - 1 - iy
+                rect = QtCore.QRectF(
+                    map_rect.left() + ix * cw,
+                    map_rect.top() + display_row * ch,
+                    cw,
+                    ch,
+                )
+                painter.drawRect(rect.adjusted(1.5, 1.5, -1.5, -1.5))
+
+        # Outer border + titles.
+        painter.setPen(QtGui.QPen(QtGui.QColor("#20242a"), 1.2))
+        painter.drawRect(map_rect)
+        title_font = QtGui.QFont(label.font())
+        title_font.setBold(True)
+        title_font.setPointSizeF(9.5)
+        painter.setFont(title_font)
+        painter.drawText(
+            QtCore.QRectF(map_rect.left(), 2, map_rect.width(), 24),
+            QtCore.Qt.AlignCenter,
+            self._results_title,
+        )
+
+        axis_font = QtGui.QFont(label.font())
+        axis_font.setPointSizeF(8.0)
+        painter.setFont(axis_font)
+        painter.drawText(
+            QtCore.QRectF(map_rect.left(), map_rect.bottom() + 7, map_rect.width(), 22),
+            QtCore.Qt.AlignCenter,
+            "Board X (grid cells)",
+        )
+        painter.save()
+        painter.translate(16, map_rect.center().y())
+        painter.rotate(-90)
+        painter.drawText(
+            QtCore.QRectF(-map_rect.height() / 2, -10, map_rect.height(), 20),
+            QtCore.Qt.AlignCenter,
+            "Board Y (grid cells)",
+        )
+        painter.restore()
+
+        # Vertical inferno colourbar with numeric dB/dBm ticks.  This is the
+        # requested second visual scale: colour is never left unexplained.
+        bar_x = map_rect.right() + 30
+        bar_w = 18
+        bar_rect = QtCore.QRectF(bar_x, map_rect.top(), bar_w, map_rect.height())
+        gradient = QtGui.QLinearGradient(0, bar_rect.bottom(), 0, bar_rect.top())
+        stops = (
+            (0.0, (0, 0, 4)),
+            (1 / 7, (40, 11, 84)),
+            (2 / 7, (101, 21, 110)),
+            (3 / 7, (159, 42, 99)),
+            (4 / 7, (212, 72, 66)),
+            (5 / 7, (245, 125, 21)),
+            (6 / 7, (250, 193, 39)),
+            (1.0, (252, 255, 164)),
+        )
+        for stop, rgb in stops:
+            gradient.setColorAt(stop, QtGui.QColor(*rgb))
+        painter.fillRect(bar_rect, gradient)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#20242a"), 1.0))
+        painter.drawRect(bar_rect)
+        painter.setFont(axis_font)
+        for j in range(5):
+            frac = j / 4.0
+            value = lo + frac * (hi - lo)
+            y = bar_rect.bottom() - frac * bar_rect.height()
+            painter.drawLine(QtCore.QPointF(bar_rect.right(), y), QtCore.QPointF(bar_rect.right() + 5, y))
+            tick = f"{value:+.1f}" if self._results_units == "dB" else f"{value:.1f}"
+            painter.drawText(
+                QtCore.QRectF(bar_rect.right() + 8, y - 9, 52, 18),
+                QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+                tick,
+            )
+        painter.save()
+        painter.translate(bar_rect.right() + 70, bar_rect.center().y())
+        painter.rotate(-90)
+        painter.drawText(
+            QtCore.QRectF(-bar_rect.height() / 2, -10, bar_rect.height(), 20),
+            QtCore.Qt.AlignCenter,
+            self._results_units,
+        )
+        painter.restore()
+
+        painter.end()
+        self._results_pixmap = pixmap
+        label.setPixmap(pixmap)
 
     def eventFilter(self, obj, event):
         board = getattr(self.ui, "boardImage", None)
         if obj is board and event.type() == QtCore.QEvent.Type.Resize:
             self._fit_results_image()
             return super().eventFilter(obj, event)
-        if (
-            obj is board
-            and event.type() == QtCore.QEvent.Type.MouseButtonPress
-            and self._cube_data is not None
-        ):
-            cell = self._results_cell_from_pos(event.position() if hasattr(event, "position") else event.pos())
-            if cell is not None:
-                self.cube_pick_cell(*cell)
-            return True
+        if obj is board and self._cube_data is not None:
+            if event.type() == QtCore.QEvent.Type.MouseMove:
+                pos = event.position() if hasattr(event, "position") else event.pos()
+                cell = self._results_cell_from_pos(pos)
+                if cell is None:
+                    board.setToolTip("")
+                else:
+                    iy, ix = cell
+                    value = np.nan
+                    if self._results_values is not None:
+                        value = self._results_values[iy, ix]
+                    if np.isfinite(value):
+                        shown = (
+                            f"{float(value):+.2f}"
+                            if self._results_units == "dB"
+                            else f"{float(value):.2f}"
+                        )
+                        board.setToolTip(
+                            f"Cell ({ix}, {iy})  •  {shown} {self._results_units}\n"
+                            "Click to inspect/compare its spectrum."
+                        )
+                    else:
+                        board.setToolTip(f"Cell ({ix}, {iy}) — not measured")
+                return False
+            if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+                pos = event.position() if hasattr(event, "position") else event.pos()
+                cell = self._results_cell_from_pos(pos)
+                if cell is not None:
+                    self.cube_pick_cell(*cell)
+                return True
         return super().eventFilter(obj, event)
 
     def _results_cell_from_pos(self, pos):
-        if self._cube_data is None:
+        if self._cube_data is None or self._results_map_rect is None:
             return None
-        ny, nx = np.asarray(self._cube_data["dut"]).shape[:2]
+        values = self._results_values
+        if values is None or np.asarray(values).ndim != 2:
+            return None
+        ny, nx = np.asarray(values).shape
         if nx < 1 or ny < 1:
             return None
         x = pos.x() if hasattr(pos, "x") else pos[0]
         y = pos.y() if hasattr(pos, "y") else pos[1]
-        label = getattr(self.ui, "boardImage", None)
-        if label is None or not hasattr(label, "size"):
+        rect = self._results_map_rect
+        if not rect.contains(QtCore.QPointF(float(x), float(y))):
             return None
-        width = max(label.size().width(), 1)
-        height = max(label.size().height(), 1)
-        ix = int(np.clip(x * nx / width, 0, nx - 1))
-        iy = int(np.clip((height - 1 - y) * ny / height, 0, ny - 1))
+        ix = int(np.clip((float(x) - rect.left()) / rect.width() * nx, 0, nx - 1))
+        display_row = int(
+            np.clip((float(y) - rect.top()) / rect.height() * ny, 0, ny - 1)
+        )
+        iy = ny - 1 - display_row
         return iy, ix
 
     def _on_failed(self, message):
@@ -4711,29 +8362,34 @@ class EMIMapWizard(QtCore.QObject):
     def _height_for_scan(self):
         """Freeze the current height block into scan provenance. No Z motion."""
         block = self._height_snapshot(self._reported_z())
+        if self._easy_mode_active():
+            return block
         return engine_height.apply_scan_height_preflight(block, self._scan_height_plan())
 
     def _ensure_at_agreed_scan_plane(self):
         """Refuse Easy Start unless M114 already matches the Easy target. Never move Z."""
         if self._easy_mode_active():
+            if self._printer_job is not None:
+                raise RuntimeError("Wait for the printer to finish moving.")
             if self._easy_z_unlocked:
                 self._easy_reenable_z_if_unlocked()
                 raise RuntimeError(
-                    "Z holding was released. Complete SET PCB SURFACE MANUALLY or cancel."
+                    "Z holding was released. Repeat Step 2 to restore scan height."
                 )
+            reason = self._easy_height_block_reason()
+            if reason:
+                raise RuntimeError(reason)
             target = self._easy_scan_target_z()
-            if target is None:
-                raise RuntimeError(
-                    "Z reference required. Use SET PCB SURFACE MANUALLY, then SET PROBE HEIGHT."
-                )
             reported = self._reported_z()
-            if reported is None or not engine_height.logical_position_matches(
-                reported, target
+            if (
+                target is None
+                or reported is None
+                or not engine_height.logical_position_matches(reported, target)
             ):
-                raise RuntimeError(
-                    f"Probe is not at the {self._default_probe_gap_mm():g} mm measurement height. "
-                    "Use SET PROBE HEIGHT."
-                )
+                self._invalidate_easy_verified_height()
+                raise RuntimeError(EASY_HEIGHT_NOT_REACHED)
+            self._easy_verified_scan_z = float(reported)
+            self._easy_height_identity = self._easy_height_identity_now()
             return
         try:
             plan = self._scan_height_plan()
@@ -4770,6 +8426,7 @@ class EMIMapWizard(QtCore.QObject):
         machine is homed, which is the worst of both states."""
         self._easy_z_unlocked = False
         self._clear_height_datum()
+        self._easy_height_lost_to_reset = True
         self._clear_pcb_homing()
 
     def _on_scan_ended(self):
@@ -4820,13 +8477,22 @@ class EMIMapWizard(QtCore.QObject):
             if rectangle
             else "Scan grid (extent comes from the board outline)"
         )
-        self.ui.modeHint.setText(
-            "Next opens the Origin page: mark the lower-left corner as X0 Y0, "
-            "then scan a rectangle. This path does not use a PCB file."
-            if rectangle
-            else "Next opens the Board page: import ODB++, then home X/Y and "
-            "register two landmarks by jogging the probe onto them."
-        )
+        if rectangle:
+            hint = (
+                "Next opens the Origin page: mark the lower-left corner as X0 Y0, "
+                "then scan a rectangle. This path does not use a PCB file."
+            )
+        elif self._easy_mode_active():
+            hint = (
+                "Next selects the physical fixture first. Teach its four BLTouch "
+                "points only once; the ODB++ board is imported afterward."
+            )
+        else:
+            hint = (
+                "Next opens the Board page: import ODB++, then home X/Y and "
+                "register board landmarks."
+            )
+        self.ui.modeHint.setText(hint)
         self.ui.gridInfo.setText(self._grid_summary())
         travel = getattr(self.ui, "chkTravelClearBoard", None)
         if travel is not None and hasattr(travel, "setVisible"):
@@ -4835,18 +8501,26 @@ class EMIMapWizard(QtCore.QObject):
         self._apply_operator_mode_ui()
 
     def _update_header(self):
+        self._refresh_workflow_progress()
         sequence = self._sequence()
         position = self._position()
         if self._easy_mode_active():
             titles = {
-                PAGE_SETUP: "DUT Setup",
-                PAGE_BOARD: "Select Board",
-                PAGE_REGISTER: "Home & Position (XY)",
+                PAGE_SETUP: "Measurement Setup",
+                PAGE_FIXTURE_TEACH: "Home & Set Board Zero",
+                PAGE_BOARD: "Insert Board & Import ODB++",
+                PAGE_REGISTER: "Advanced Board Alignment",
+                PAGE_SCAN_SETUP: "Scan Area & Probe Height",
                 PAGE_EASY_HEIGHT: "Probe Height (Z)",
-                PAGE_SCAN: "Scan",
+                PAGE_SCAN: "Review & Measure",
                 PAGE_RESULTS: "Results",
             }
             title = titles[sequence[position]]
+            if sequence[position] == PAGE_RESULTS:
+                self.ui.stepHeader.setText(f"Complete — {title}")
+                return
+            self.ui.stepHeader.setText(f"Step {position + 1} of 5 — {title}")
+            return
         else:
             title = STEP_TITLES[sequence[position]]
         self.ui.stepHeader.setText(
@@ -4858,6 +8532,11 @@ class EMIMapWizard(QtCore.QObject):
         gates = {
             PAGE_BOARD: lambda: self._board_view is not None,
             PAGE_REGISTER: lambda: not self._registration_problems(),
+            PAGE_FIXTURE_TEACH: self._fixture_gate_ready,
+            PAGE_SCAN_SETUP: lambda: (
+                not self._registration_problems()
+                and self.ui.chkBoardSeated.isChecked()
+            ),
             PAGE_EASY_HEIGHT: lambda: self._easy_at_scan_plane(),
             PAGE_ORIGIN: lambda: self.origin_set,
             PAGE_SCAN: lambda: self.result is not None,
@@ -4865,6 +8544,7 @@ class EMIMapWizard(QtCore.QObject):
         return gates.get(page, lambda: True)()
 
     def _update_nav(self):
+        self._refresh_home_button_copy()
         position = self._position()
         aimed = self._selected_landmark is not None and self._pcb_xy_homed
         aligned = aimed and self._registration is not None
@@ -4912,26 +8592,163 @@ class EMIMapWizard(QtCore.QObject):
         if easy_reset is not None:
             allowed[easy_reset] = self._easy_mode_active() and self._profile is not None
         easy_set = getattr(self.ui, "btnEasySetHeight", None)
+        manual_height = (
+            self._easy_mode_active() and not self._easy_vertical_calibrated()
+        )
         if easy_set is not None:
-            allowed[easy_set] = (
-                self._easy_mode_active() and self._pcb_surface_z is not None
+            allowed[easy_set] = manual_height and self._pcb_surface_z is not None
+        for name in ("btnEasySetPcbSurface", "btnEasyResetPcbSurface"):
+            button = getattr(self.ui, name, None)
+            if button is not None:
+                allowed[button] = manual_height
+        fixture_home = getattr(self.ui, "btnFixtureHomeXyz", None)
+        if fixture_home is not None:
+            allowed[fixture_home] = (
+                self._easy_mode_active()
+                and bool(self._fixture_profile_name())
+                and self.ui.chkFixtureProbeClear.isChecked()
             )
+        retry_printer = getattr(self.ui, "btnFixtureRetryPrinter", None)
+        if retry_printer is not None:
+            allowed[retry_printer] = bool(self._printer_port())
+        fixture_probe = getattr(self.ui, "btnFixtureProbePoint", None)
+        if fixture_probe is not None:
+            allowed[fixture_probe] = (
+                self._easy_mode_active()
+                and self._fixture_xyz_homed
+                and self.ui.chkFixtureProbeClear.isChecked()
+            )
+        for name in (
+            "btnFixtureJogXPlus", "btnFixtureJogXMinus",
+            "btnFixtureJogYPlus", "btnFixtureJogYMinus",
+        ):
+            button = getattr(self.ui, name, None)
+            if button is not None:
+                allowed[button] = self._easy_mode_active() and self._fixture_xyz_homed
+        fixture_save = getattr(self.ui, "btnFixtureSavePlane", None)
+        if fixture_save is not None:
+            allowed[fixture_save] = all(
+                name in self._fixture_teaching_points
+                for name in TEACHING_POINT_NAMES
+            )
+        fixture_verify = getattr(self.ui, "btnFixtureVerify", None)
+        if fixture_verify is not None:
+            document = self._machine_fixture_document() or {}
+            allowed[fixture_verify] = (
+                bool(document.get("fixture_teaching"))
+                and self.ui.chkFixtureProbeClear.isChecked()
+            )
+        clear_point = getattr(self.ui, "btnFixtureClearPoint", None)
+        if clear_point is not None:
+            allowed[clear_point] = bool(
+                self._fixture_teaching_points
+                or (self._machine_fixture_document() or {}).get("fixture_teaching")
+            )
+        # Step 4 corner teaching: capturing needs a homed frame and an
+        # imported board, because it pairs a board millimetre with a machine
+        # one. Applying and clearing are pure software.
+        teachable = self._board_model is not None and self._pcb_xy_homed
+        for name in (
+            "btnScanSetupJogXPlus", "btnScanSetupJogXMinus",
+            "btnScanSetupJogYPlus", "btnScanSetupJogYMinus",
+        ):
+            button = getattr(self.ui, name, None)
+            if button is not None:
+                allowed[button] = self._pcb_xy_homed
+        for side in SCAN_SETUP_SIDES:
+            for slot in range(len(TAUGHT_CORNER_LABELS)):
+                button = getattr(
+                    self.ui, f"btnTeach{side.capitalize()}Corner{'AB'[slot]}", None
+                )
+                if button is not None:
+                    allowed[button] = teachable
+            use_button = getattr(self.ui, f"btnUse{side.capitalize()}Side", None)
+            if use_button is not None:
+                allowed[use_button] = (
+                    self._board_model is not None and self._taught_side_complete(side)
+                )
+            clear_button = getattr(self.ui, f"btnClear{side.capitalize()}Corners", None)
+            if clear_button is not None:
+                allowed[clear_button] = bool(self._taught_pcb_corners(side))
         # Nothing that moves the machine or changes the plan stays live while a
         # scan is running, so idleness gates every one of them.
         idle = self.thread is None and self._printer_job is None
         for button, ready in allowed.items():
             button.setEnabled(idle and ready)
+        # Results open-actions are not motion gates. Keep them live even while
+        # the scan thread is still winding down, otherwise Open EMI Analyzer
+        # stays at the .ui default (disabled) on the Complete page.
+        self._sync_results_open_buttons()
         self.ui.btnNext.setText(self._next_caption())
-        self.ui.btnNext.setToolTip(self._next_block_reason())
+        self._show_next_block_reason()
+        self._refresh_fixture_page_summary()
         self._apply_scan_gate()
+
+    def _install_next_reason_label(self):
+        if getattr(self.ui, "nextBlockReason", None) is not None:
+            return
+        button = getattr(self.ui, "btnNext", None)
+        nav = getattr(self.ui, "navLayout", None)
+        find_child = getattr(self.ui, "findChild", None)
+        if nav is None and callable(find_child):
+            nav = find_child(QtWidgets.QHBoxLayout, "navLayout")
+        layout_fn = getattr(self.ui, "layout", None)
+        if nav is None and callable(layout_fn) and button is not None:
+            try:
+                nav = self._layout_containing_widget(layout_fn(), button)
+            except Exception:
+                nav = None
+        if (
+            button is None
+            or nav is None
+            or not hasattr(nav, "indexOf")
+            or not hasattr(nav, "insertWidget")
+        ):
+            return
+        index = nav.indexOf(button)
+        if index < 0:
+            return
+        label = QtWidgets.QLabel()
+        label.setObjectName("nextBlockReason")
+        label.setWordWrap(True)
+        label.setStyleSheet("color:#B42318;")
+        nav.insertWidget(index, label, 1)
+        self.ui.nextBlockReason = label
+
+    def _layout_containing_widget(self, layout, widget):
+        if layout is None:
+            return None
+        if hasattr(layout, "indexOf") and layout.indexOf(widget) >= 0:
+            return layout
+        count = layout.count() if hasattr(layout, "count") else 0
+        for index in range(count):
+            item = layout.itemAt(index)
+            child = item.layout() if item is not None else None
+            found = self._layout_containing_widget(child, widget)
+            if found is not None:
+                return found
+        return None
+
+    def _show_next_block_reason(self):
+        reason = self._next_block_reason()
+        self.ui.btnNext.setToolTip(reason)
+        label = getattr(self.ui, "nextBlockReason", None)
+        if label is None or not callable(getattr(label, "setText", None)):
+            return
+        enabled = bool(self.ui.btnNext.isEnabled())
+        label.setText("" if enabled else reason)
+        if callable(getattr(label, "setVisible", None)):
+            label.setVisible(not enabled and bool(reason))
 
     def _next_caption(self):
         page = self.ui.wizardStack.currentIndex()
         if self._easy_mode_active():
             return {
-                PAGE_SETUP: "Next: select board",
-                PAGE_BOARD: "Next: home & position",
-                PAGE_REGISTER: "Next: set probe height",
+                PAGE_SETUP: "Next: select fixture",
+                PAGE_FIXTURE_TEACH: "Next: insert board",
+                PAGE_BOARD: "Next: scan setup",
+                PAGE_REGISTER: "Next: teach fixture",
+                PAGE_SCAN_SETUP: "Next: review & measure",
                 PAGE_EASY_HEIGHT: "Next: scan",
                 PAGE_SCAN: "Next: results",
             }.get(page, "Next")
@@ -4939,6 +8756,23 @@ class EMIMapWizard(QtCore.QObject):
         if isinstance(caption, dict):
             caption = caption.get(self._mode(), "Next")
         return caption
+
+    def _fixture_step2_block_reason(self):
+        """Same Next refusal used by the Step 2 banner."""
+        if self._easy_mode_active():
+            return self._easy_height_block_reason()
+        if self._p1_bltouch_commanded_xy() is None:
+            return (
+                "Teach P1 (Home XY for Teaching if the machine is not homed), "
+                "then CAPTURE P1 to set board zero."
+            )
+        if not self._board_zero_committed():
+            return (
+                "CAPTURE P1 (or Home & Set Board Zero at the saved P1). "
+                "Pin contact and retract must both succeed, and M114 must "
+                "follow the pin."
+            )
+        return ""
 
     def _next_block_reason(self):
         """Why Next is disabled, for a tooltip rather than a silent grey button."""
@@ -4951,10 +8785,24 @@ class EMIMapWizard(QtCore.QObject):
             problems = self._registration_problems()
             if problems:
                 return "Cannot scan yet:\n- " + "\n- ".join(problems)
+        if page == PAGE_FIXTURE_TEACH:
+            return self._fixture_step2_block_reason()
+        if page == PAGE_SCAN_SETUP:
+            problems = self._registration_problems()
+            if problems:
+                side = self._scan_setup_side()
+                if not self._taught_side_complete(side):
+                    return (
+                        f"Capture both inner-pocket corners of the {side} side: "
+                        "jog the E-field probe onto the pocket, then CAPTURE A and B. "
+                        "P1 is height only; A/B are scan XY."
+                    )
+                return "Cannot position the board yet:\n- " + "\n- ".join(problems)
+            if not self.ui.chkBoardSeated.isChecked():
+                return "Confirm that the PCB is inserted in the holder and fully seated."
+            return ""
         if page == PAGE_EASY_HEIGHT:
-            if self._pcb_surface_z is None:
-                return "Set the PCB surface manually first."
-            return "Use SET PROBE HEIGHT before continuing."
+            return "Repeat Step 2 to set scan height before continuing."
         if page == PAGE_SCAN:
             return "Start the scan first. Results open when it finishes."
         if page == PAGE_BOARD:
@@ -4971,9 +8819,51 @@ class EMIMapWizard(QtCore.QObject):
         self._update_nav()
         if index == PAGE_REGISTER:
             self._layout_register_page()
+        if index == PAGE_FIXTURE_TEACH:
+            document = self._machine_fixture_document() or {}
+            teaching = document.get("fixture_teaching")
+            if teaching or not self._fixture_teaching_points:
+                self._render_fixture_teaching(teaching)
+            self._refresh_fixture_page_summary()
+        if index == PAGE_SCAN_SETUP:
+            self._sync_board_profile_to_fixture()
+            self._advanced_board_seated_changed(self.ui.chkBoardSeated.isChecked())
+            # Easy scan XY is the taught A/B pocket. Do not STL-place or
+            # restore a P1/middle-holder pose on this page.
+            self._load_taught_pcb_corners()
+            side = self._scan_setup_side()
+            applied = (
+                self._active_taught_side == side and self._registration is not None
+            )
+            # Re-fitting an unchanged face would invalidate the plan, and with
+            # it the approval, every time the operator stepped back here.
+            if not applied and not self._apply_taught_pcb_corners(side):
+                self._drop_pocket_scan_xy()
+                if self._pocket_pair_state.get(side) == "stale":
+                    self._pocket_block_reason = (
+                        self._pocket_block_reason
+                        or "saved pocket corners are from an older meaning; recapture A and B"
+                    )
+                    self._set_glassboard_placement_status(
+                        "POSITION BLOCKED — recapture the inner-pocket corners.",
+                        "padding:8px;background:#FEF3F2;color:#912018;"
+                        "border:1px solid #F04438;border-radius:6px",
+                    )
+                elif not self._taught_side_complete(side):
+                    self._set_glassboard_placement_status(
+                        "Capture inner-pocket corners A and B. P1 is height only; "
+                        "A/B are the E-probe scan XY.",
+                        "padding:8px;background:#EFF8FF;color:#175CD3;border-radius:6px",
+                    )
+            self._refresh_corner_teach_ui()
+            self._refresh_calculated_height()
+            self._refresh_scan_setup_summary()
+            self._attach_scan_preview_to_current_page(index)
+            self._refresh_scan_preview()
         if index == PAGE_SCAN:
             self._show_cube_scan_estimate()
         if index == PAGE_RESULTS:
+            self._sync_results_open_buttons()
             self._fit_results_image()
 
     def _on_back(self):
@@ -4996,18 +8886,77 @@ class EMIMapWizard(QtCore.QObject):
             self._easy_try_load_profile()
             self._update_easy_status()
 
-    def _open_folder(self):
-        if self.result is None:
-            return
-        QtGui.QDesktopServices.openUrl(
-            QtCore.QUrl.fromLocalFile(str(self.result.output_dir))
-        )
+    def _open_local_path(self, target):
+        """Open a local folder or HTML file, including OneDrive paths with spaces."""
+        path = Path(target).expanduser()
+        try:
+            path = path.resolve()
+        except OSError:
+            path = path.absolute()
+        url = QtCore.QUrl.fromLocalFile(str(path))
+        if QtGui.QDesktopServices.openUrl(url):
+            return True
+        import webbrowser
 
-    def _open_overlay(self):
-        overlay_html = None if self.result is None else self.result.files.get("board_html")
-        if not overlay_html:
+        return bool(webbrowser.open(path.as_uri()))
+
+    def _open_folder(self):
+        if self.result is None or not getattr(self.result, "output_dir", None):
             return
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(overlay_html)))
+        self._open_local_path(self.result.output_dir)
+
+    def _open_analyzer(self):
+        analyzer_html = self._analyzer_html_path()
+        if analyzer_html is None:
+            analyzer_html = self._build_analyzer()
+        if not analyzer_html:
+            return
+        if not self._open_local_path(analyzer_html):
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                f"Could not open the EMI Analyzer at {analyzer_html}",
+            )
+
+    def _build_analyzer(self):
+        """Build the dashboard from this scan's saved artifacts. Reads only.
+
+        The scan writes it too, but swallows any failure into a status line, so
+        the operator otherwise faces a dead button. Failures are named here.
+        """
+        output_dir = None if self.result is None else getattr(self.result, "output_dir", None)
+        if not output_dir:
+            QMessageBox.warning(
+                self.ui, DIALOG_TITLE, "There is no scan folder to build the EMI Analyzer from."
+            )
+            return None
+        try:
+            from EMI_Mapper.analyzer import write_analyzer
+
+            path = write_analyzer(output_dir)
+        except ImportError as exc:
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                "The EMI Analyzer needs the plotting dependency: "
+                f"{exc}. Install requirements.txt (plotly) into this "
+                "environment, then click OPEN EMI ANALYZER again.",
+            )
+            return None
+        except Exception as exc:
+            QMessageBox.warning(
+                self.ui,
+                DIALOG_TITLE,
+                f"Could not build the EMI Analyzer from {output_dir}: {exc}",
+            )
+            return None
+        files = getattr(self.result, "files", None)
+        if files is None:
+            self.result.files = {}
+            files = self.result.files
+        files["analyzer_html"] = path
+        self._sync_results_open_buttons()
+        return path
 
     def _on_close(self):
         self._last_page_by_mode[self._mode()] = self.ui.wizardStack.currentIndex()
@@ -5041,7 +8990,7 @@ class EMIMapWizard(QtCore.QObject):
         if self.printer_serial is None:
             return
         try:
-            self.printer_serial.close()
+            self._release_serial_handle(self.printer_serial)
         except OSError as exc:
             logging.info(f"EMI map could not close the printer port: {exc}")
         self.printer_serial = None

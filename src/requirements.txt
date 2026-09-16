@@ -4,4 +4,5 @@ platformdirs
 pyserial
 pyside6==6.11.0
 pyqtgraph
+plotly
 openpyxl
